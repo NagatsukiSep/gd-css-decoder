@@ -463,66 +463,74 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+    int logGF = rint(log2(GF) / log2(2));
 
-  int           tz,t,k,m,g,numB;
-  int           logGF;
-  vector<double> TMP;
-  double  Afft,Bfft,buff;
-  TMP=vector<double>(GF,0);
-  vector<double> F_TrueNoiseSynd(GF,0);
-  numB=0;
-  logGF=rint(log2(GF)/log2(2));
-  // Loop: iterate over a range/collection.
-  for(size_t m=0;m<M;m++){
+    // 各行の先頭オフセットを事前計算
+    vector<int> rowBase(M+1,0);
+    for (int m=1; m<=M; m++)
+        rowBase[m] = rowBase[m-1] + RowDegree[m-1];
 
-    // Loop: iterate over a range/collection.
-    for(g=0;g<GF;g++){F_TrueNoiseSynd[g]=0;}F_TrueNoiseSynd[TrueNoiseSynd[m]]=1;
-    // Loop: iterate over a range/collection.
-    for(k=0;k<logGF*GF/2;k++){
-      Afft=F_TrueNoiseSynd[FFTSQ[k][0]];      Bfft=F_TrueNoiseSynd[FFTSQ[k][1]];
-      F_TrueNoiseSynd[FFTSQ[k][0]]=Afft+Bfft; F_TrueNoiseSynd[FFTSQ[k][1]]=Afft-Bfft;
+    #pragma omp parallel for schedule(dynamic) 
+    for (int m=0; m<M; m++) {
+        int base = rowBase[m];
+        vector<double> TMP(GF,0.0);
+        vector<double> F_TrueNoiseSynd(GF,0.0);
+
+        // --- シンドロームを one-hot で初期化 ---
+        F_TrueNoiseSynd[TrueNoiseSynd[m]] = 1.0;
+
+        // Walsh–Hadamard変換
+        for (int k=0; k<logGF*GF/2; k++) {
+            double A = F_TrueNoiseSynd[FFTSQ[k][0]];
+            double B = F_TrueNoiseSynd[FFTSQ[k][1]];
+            F_TrueNoiseSynd[FFTSQ[k][0]] = A + B;
+            F_TrueNoiseSynd[FFTSQ[k][1]] = A - B;
+        }
+
+        // 各隣接VNの入力を座標変換＋FFT
+        for (int t=0; t<RowDegree[m]; t++) {
+            for (int g=0; g<GF; g++)
+                TMP[g] = VNtoCNxxx[base+t][ DIVGF[g][ MatValue[m][t] ] ];
+            for (int g=0; g<GF; g++)
+                VNtoCNxxx[base+t][g] = TMP[g];
+
+            for (int k=0; k<logGF*GF/2; k++) {
+                double A = VNtoCNxxx[base+t][FFTSQ[k][0]];
+                double B = VNtoCNxxx[base+t][FFTSQ[k][1]];
+                VNtoCNxxx[base+t][FFTSQ[k][0]] = A + B;
+                VNtoCNxxx[base+t][FFTSQ[k][1]] = A - B;
+            }
+        }
+
+        // 周波数領域で合成
+        for (int t=0; t<RowDegree[m]; t++) {
+            for (int g=0; g<GF; g++)
+                CNtoVNxxx[base+t][g] = F_TrueNoiseSynd[g];
+
+            for (int tz=0; tz<RowDegree[m]; tz++) {
+                if (tz==t) continue;
+                for (int g=0; g<GF; g++)
+                    CNtoVNxxx[base+t][g] *= VNtoCNxxx[base+tz][g];
+            }
+        }
+
+        // 逆FFT & 係数復元 & normalize
+        for (int t=0; t<RowDegree[m]; t++) {
+            for (int k=0; k<logGF*GF/2; k++) {
+                double A = CNtoVNxxx[base+t][FFTSQ[k][0]];
+                double B = CNtoVNxxx[base+t][FFTSQ[k][1]];
+                CNtoVNxxx[base+t][FFTSQ[k][0]] = 0.5*(A+B);
+                CNtoVNxxx[base+t][FFTSQ[k][1]] = 0.5*(A-B);
+            }
+
+            for (int g=0; g<GF; g++)
+                TMP[g] = CNtoVNxxx[base+t][ MULGF[MatValue[m][t]][g] ];
+            for (int g=0; g<GF; g++)
+                CNtoVNxxx[base+t][g] = std::max(TMP[g], 0.0);
+
+            normalize(CNtoVNxxx[base+t], GF);
+        }
     }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++){
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) TMP[g]=VNtoCNxxx[numB+t][DIVGF[g][MatValue[m][t]]];
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) VNtoCNxxx[numB+t][g]=TMP[g];
-      // Loop: iterate over a range/collection.
-      for(k=0;k<logGF*GF/2;k++){
-        Afft=VNtoCNxxx[numB+t][FFTSQ[k][0]];
-        Bfft=VNtoCNxxx[numB+t][FFTSQ[k][1]];
-        VNtoCNxxx[numB+t][FFTSQ[k][0]]=Afft+Bfft;
-        VNtoCNxxx[numB+t][FFTSQ[k][1]]=Afft-Bfft;
-      }
-    }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++)	{
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++){CNtoVNxxx[numB+t][g]=F_TrueNoiseSynd[g];}
-      // Loop: iterate over a range/collection.
-      for(tz=0;tz<RowDegree[m];tz++){if(tz!=t){for(g=0;g<GF;g++){CNtoVNxxx[numB+t][g]*=VNtoCNxxx[numB+tz][g];}}}
-    }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++){
-      // Loop: iterate over a range/collection.
-      for(k=0;k<(logGF*GF/2);k++){
-        Afft=CNtoVNxxx[numB+t][FFTSQ[k][0]];
-        Bfft=CNtoVNxxx[numB+t][FFTSQ[k][1]];
-        CNtoVNxxx[numB+t][FFTSQ[k][0]]=0.5f*(Afft+Bfft);
-        CNtoVNxxx[numB+t][FFTSQ[k][1]]=0.5f*(Afft-Bfft);
-      }
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) TMP[g]=CNtoVNxxx[numB+t][MULGF[MatValue[m][t]][g]];
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) CNtoVNxxx[numB+t][g]=std::max(TMP[g], 0.0);
-      normalize(CNtoVNxxx[numB+t],GF);
-    }
-    numB+=RowDegree[m];
-  }
 }
 // Function: calcSyndrome
 // Purpose: TODO - describe the function's responsibility succinctly.
