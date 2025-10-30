@@ -320,6 +320,68 @@ int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>
 
   return Bin2GF(BINGF0[g],GF,logGF,BINGF1);
 }
+
+static inline double safe_log(double x){
+    const double eps = 1e-300; // underflow回避
+    return std::log(std::max(x, eps));
+}
+
+// 上位Kのみ保持する sparse 畳み込み（min-plus, GF加法= XOR 前提）
+static vector<std::pair<int,double>> ems_convolve_topk(
+    const vector<std::pair<int,double>>& A,
+    const vector<std::pair<int,double>>& B,
+    int K)
+{
+    // 候補を広げてから上位Kに剪定
+    // シンボルごとの最良コストを辞書的に保持
+    // （重複シンボルは最小コストのみ残す）
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    // 期待よりだいぶ小さいのでunordered_mapでも良いが、可搬性重視でソート＋uniqueに寄せる
+    vector<std::pair<int,double>> tmp;
+    tmp.reserve(std::min((size_t)K, A.size()) * std::min((size_t)K, B.size()));
+    const int aN = (int)std::min(A.size(), (size_t)K);
+    const int bN = (int)std::min(B.size(), (size_t)K);
+    for(int i=0;i<aN;i++){
+        for(int j=0;j<bN;j++){
+            int sym = A[i].first ^ B[j].first;           // GF(2^m)加法
+            double cost = A[i].second + B[j].second;     // min-plusの和
+            tmp.emplace_back(sym, cost);
+        }
+    }
+    // 同一シンボルの最良だけを残し、上位Kに剪定
+    // 1) シンボル→コストで昇順ソート（sym, cost）
+    std::sort(tmp.begin(), tmp.end(), [](auto& x, auto& y){
+        if (x.first != y.first) return x.first < y.first;
+        return x.second < y.second;
+    });
+    // 2) 各symの先頭（最小コスト）だけ採用
+    vector<std::pair<int,double>> unique_best;
+    unique_best.reserve(tmp.size());
+    for(size_t i=0;i<tmp.size();){
+        int sym = tmp[i].first;
+        double best = tmp[i].second;
+        unique_best.emplace_back(sym, best);
+        // 同じsymはスキップ
+        size_t j=i+1;
+        while(j<tmp.size() && tmp[j].first==sym) j++;
+        i=j;
+    }
+    // 3) コスト昇順で上位Kまで
+    std::sort(unique_best.begin(), unique_best.end(),
+              [](auto& x, auto& y){ return x.second < y.second; });
+    if ((int)unique_best.size() > K) unique_best.resize(K);
+    return unique_best;
+}
+
+// スパースリスト（sym,cost）から配列（長さGF, 未定義はINF）へ
+static void list_to_dense(const vector<std::pair<int,double>>& L, vector<double>& dense){
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    std::fill(dense.begin(), dense.end(), INF);
+    for(auto &p : L) dense[p.first] = std::min(dense[p.first], p.second);
+}
+
+
+
 // Function: ComputeAPP
 // Purpose: TODO - describe the function's responsibility succinctly.
 
@@ -331,16 +393,46 @@ const std::vector<int> &Interleaver,
 const std::vector<int> &ColDeg,
 int N, int GF) {
   int numB = 0;
-  // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
-    // Loop: iterate over a range/collection.
+    // 1) log-domain 合成：L[g] = log(VNtoChN) + sum log(CNtoVN)
+    std::vector<double> L(GF);
     for (int g = 0; g < GF; ++g) {
-      ChNtoVN[n][g] = 1.0;
-      // Loop: iterate over a range/collection.
+      auto safe_logp = [](double p){
+        const double eps = 1e-300;
+        if (!std::isfinite(p) || p < eps) p = eps;
+        return std::log(p);
+      };
+      double sumlog = safe_logp(VNtoChN[n][g]);
       for (int t = numB; t < numB + ColDeg[n]; ++t) {
-        ChNtoVN[n][g] *= CNtoVNxxx[Interleaver[t]][g];
+        sumlog += safe_logp(CNtoVNxxx[Interleaver[t]][g]);
       }
-      APP[n][g] = ChNtoVN[n][g] * VNtoChN[n][g];
+      L[g] = sumlog;
+    }
+
+    // 2) Max-shift → exp で prob-domain に戻す（アンダーフロー回避）
+    double Lmax = -std::numeric_limits<double>::infinity();
+    for (int g = 0; g < GF; ++g) if (L[g] > Lmax) Lmax = L[g];
+    double sum = 0.0;
+    for (int g = 0; g < GF; ++g) {
+      double p = std::exp(L[g] - Lmax);   // 非負・相対値
+      ChNtoVN[n][g] = p;                  // ← ここで毎回上書き更新
+      APP[n][g]     = p;                  // まず同じ値を入れておく（後で正規化）
+      sum += p;
+    }
+
+    // 3) 正規化（sum==0 救済）
+    if (sum <= 0.0 || !std::isfinite(sum)) {
+      double u = 1.0 / GF;
+      for (int g = 0; g < GF; ++g) {
+        ChNtoVN[n][g] = u;
+        APP[n][g]     = u;
+      }
+    } else {
+      double inv = 1.0 / sum;
+      for (int g = 0; g < GF; ++g) {
+        ChNtoVN[n][g] *= inv;
+        APP[n][g]     *= inv;
+      }
     }
     numB += ColDeg[n];
   }
@@ -532,6 +624,172 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         }
     }
 }
+
+void CheckPass_EMS(
+  vector<vector<double>> &CNtoVNxxx,         // 出力（上書き）
+  vector<vector<double>> &VNtoCNxxx,         // 入力
+  vector<vector<int>>    &MatValue,          // 非零係数 a_{m,t}
+  int M,
+  vector<int>            &RowDegree,         // 行次数 d_m
+  vector<vector<int>>    &MULGF,
+  vector<vector<int>>    &DIVGF,
+  int GF,
+  vector<int>            &TrueNoiseSynd
+){
+    (void)FFTSQ; // 未使用
+    const int EMS_K = std::min(24, GF); // 近似度。必要に応じて変更
+    const double INF = std::numeric_limits<double>::infinity();
+
+    // 行ごとの先頭オフセット（numB互換）
+    vector<int> rowBase(M+1,0);
+    for(int m=1;m<=M;m++) rowBase[m] = rowBase[m-1] + RowDegree[m-1];
+
+    // 1行ずつ処理
+    for(int m=0; m<M; m++){
+        const int d = RowDegree[m];
+        const int base = rowBase[m];
+        const int synd = TrueNoiseSynd[m];
+
+        // ---- 入力（確率）→ z領域 (z=a*x) へ座標変換しつつ コスト = -log(p) 化、上位K抽出 ----
+        // 各エッジごとに（sym, cost）の上位Kを作る
+        vector<vector<std::pair<int,double>>> topK_lists(d);
+        {
+            // 一時配列で z領域のコスト配列をつくる
+            vector<double> cost(GF);
+            for(int t=0;t<d;t++){
+                const int a = MatValue[m][t];
+                // z = a * x  →  p_z[z] = p_x[z / a]  → indexは DIVGF[z][a]
+                for(int g=0; g<GF; g++){
+                    double p = VNtoCNxxx[base+t][ DIVGF[g][a] ];
+                    cost[g] = -safe_log(p);
+                }
+                // 上位K抽出：コスト小さい順
+                vector<int> idx(GF);
+                for(int g=0; g<GF; g++) idx[g]=g;
+                std::nth_element(idx.begin(), idx.begin()+std::min(EMS_K,GF)-1, idx.end(),
+                    [&](int i, int j){ return cost[i] < cost[j]; });
+                idx.resize(std::min(EMS_K, GF));
+                std::sort(idx.begin(), idx.end(), [&](int i, int j){ return cost[i] < cost[j]; });
+
+                auto &L = topK_lists[t];
+                L.reserve(idx.size());
+                for(int id : idx) L.emplace_back(id, cost[id]);
+            }
+        }
+
+        // ---- prefix / suffix で「t を除いた合成」の高速計算（min-plus畳み込み, 上位K維持）----
+        vector<vector<std::pair<int,double>>> pref(d), suff(d);
+        // prefix
+        {
+            // 単位元：sum=0, cost=0
+            vector<std::pair<int,double>> acc = {{0, 0.0}};
+            for(int t=0;t<d;t++){
+                acc = ems_convolve_topk(acc, topK_lists[t], EMS_K);
+                pref[t] = acc; // 0..t を合成
+            }
+        }
+        // suffix
+        {
+            vector<std::pair<int,double>> acc = {{0, 0.0}};
+            for(int t=d-1;t>=0;t--){
+                acc = ems_convolve_topk(topK_lists[t], acc, EMS_K);
+                suff[t] = acc; // t..d-1 を合成
+            }
+        }
+
+        // ---- 各 t の出力（z領域）： 他全部の合成から t を除いたものを作って syynd でシフト ----
+        // cost_other[w] を dense へ展開して使う
+        vector<double> cost_other_dense(GF);
+        vector<double> cost_out_z(GF);
+
+        for(int t=0;t<d;t++){
+            // 0..t-1 と t+1..d-1 を結合
+            vector<std::pair<int,double>> excl =
+                (t==0)     ? suff[1] :
+                (t==d-1)   ? pref[d-2] :
+                             ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
+
+            // dense に展開（未定義は INF）
+            list_to_dense(excl, cost_other_dense);
+
+            // 出力： z_t = g のコストは  other[s - g] = other[synd ^ g]
+            for(int g=0; g<GF; g++){
+                cost_out_z[g] = cost_other_dense[synd ^ g];
+            }
+
+            // for(int g=0; g<GF; g++){
+            //     printf(" m=%d t=%d g=%d cost_out_z=%f\n", m, t, g, cost_out_z[g]);
+            // }
+            // printf("\n");
+
+            // ---- x領域へ戻す（x = z / a）→ インデックスは g_x = g_z / a = DIVGF[g_z][a] ----
+            const double INF = std::numeric_limits<double>::infinity();
+            const int a = MatValue[m][t];
+            // まず確率に戻す（exp(-cost)）。INF→0。
+            double cmin = INF;
+            bool any_finite = false;
+            for (int g = 0; g < GF; ++g) {
+                double c = cost_out_z[g];
+                if (std::isfinite(c)) { 
+                    if (c < cmin) cmin = c;
+                    any_finite = true;
+                }
+            }
+            // 2) 全て INF のときの救済（exp 下駄落ち回避用の大きめ有限値）
+            if (!any_finite) {
+                const double BIG = 700.0; // exp(-700) ≈ 5e-305（double の下限より上）
+                for (int g = 0; g < GF; ++g) cost_out_z[g] = BIG;
+                cmin = BIG;
+            }
+
+            // 3) Max-shift してから指数化（最良成分 ≈ 1、他は (0,1] に収まる）
+            for (int g = 0; g < GF; ++g) {
+                double c = cost_out_z[g];
+                double p = 0.0;
+                if (std::isfinite(c)) {
+                    double d = c - cmin;          // d >= 0 のはず
+                    // 万一 d が負になっても（丸め誤差）ここでクリップしておくと安心
+                    if (d < 0.0) d = 0.0;
+                    p = std::exp(-d);             // 最良 ~ 1.0、他は <= 1.0
+                }
+                // z→x の座標戻し：gx = g_z / a
+                int gx = DIVGF[g][a];             // a は非零であること（要assert）
+                CNtoVNxxx[base + t][gx] = p;
+            }
+
+            // 4) 出力ベクトルの消毒＋正規化（sum==0 フォールバック付き）
+            double sum = 0.0;
+            for (int g = 0; g < GF; ++g) {
+                double &x = CNtoVNxxx[base + t][g];
+                if (!std::isfinite(x) || x < 0.0) x = 0.0;  // NaN/Inf/負は 0 へ
+                sum += x;
+            }
+            if (sum == 0.0) {
+                // 完全ゼロ崩壊時は一様分布でリカバリ
+                double u = 1.0 / static_cast<double>(GF);
+                for (int g = 0; g < GF; ++g) CNtoVNxxx[base + t][g] = u;
+            } else {
+                double inv = 1.0 / sum;
+                for (int g = 0; g < GF; ++g) CNtoVNxxx[base + t][g] *= inv;
+            }
+
+            // 数値安定：負値クリップ（念のため）＆正規化
+            for(int g=0; g<GF; g++)
+                CNtoVNxxx[base+t][g] = std::max(CNtoVNxxx[base+t][g], 0.0);
+            // double _sum=0;for(size_t i=0;i<GF;i++){_sum+=CNtoVNxxx[base+t][i];}
+            // printf("CheckPass_EMS sum=%f\n", sum);
+            // for (size_t i=0;i<GF;i++){
+            //   printf(" %e", CNtoVNxxx[base+t][i]);
+            // }
+            // printf("\n");
+            
+            
+            normalize(CNtoVNxxx[base+t], GF);
+        }
+    }
+}
+
+
 // Function: calcSyndrome
 // Purpose: TODO - describe the function's responsibility succinctly.
 
@@ -2817,14 +3075,38 @@ vector<int> &UpdatedDecision,
 vector<int> &EstmNoise,
 vector<vector<int>> Mat,
 vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF,
-vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
+vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ,
+bool isEMS){
 
   DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
-  CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
+  if(isEMS){
+    CheckPass_EMS(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, GF, TrueNoiseSynd);
+  }else{
+    CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
+  }
   ComputeAPP(VNtoChN, ChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
+
+  
 
   Decision(EstmNoise, UpdatedDecision, VNtoChN, N, GF);
   SyndromeIsSatisfied = IsSyndromeSatisfied(TrueNoiseSynd, Synd, USS, M, EstmNoise, MatValue, RowDeg, ADDGF, MULGF, Mat);
+
+  // for (int n = 0; n<5; n++) { 
+  //   const int K = 5; // 上位いくつ出すか
+  //   int GF = (int)APP[n].size();
+
+  //   // インデックスを確率大きい順にソート
+  //   std::vector<int> idx(GF);
+  //   std::iota(idx.begin(), idx.end(), 0);
+  //   std::partial_sort(idx.begin(), idx.begin()+std::min(K,GF), idx.end(),
+  //       [&](int a, int b){ return VNtoChN[n][a] > VNtoChN[n][b]; });
+
+  //   std::printf("APP[%d] top-%d symbols:\n", n, K);
+  //   for (int i = 0; i < std::min(K,GF); i++) {
+  //       int g = idx[i];
+  //       std::printf("  g=%d p=%e\n", g, VNtoChN[n][g]);
+  //   }
+  // }
   // Conditional branch.
   if (SyndromeIsSatisfied) {
     // Loop: iterate over a range/collection.
@@ -2833,7 +3115,9 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
       for (int g = 0; g < GF; g++) { ChNtoVN[n][g] = 0; }
       int g_hat = EstmNoise[n];
       ChNtoVN[n][g_hat] = 1;
+      // printf(" %d", g_hat);
     }
+    // printf("\n------\n");
   }
 }
 // Function: load_size
@@ -3322,6 +3606,7 @@ int main(int argc, char * argv[]){
     vector<int> Candidate_Covering_Cycle_Rows_D;
     bool stagnated = false;
     EF_LOG.clear();
+    bool isEMS = false;
     do{
       // Conditional branch.
       if(itr==0){
@@ -3331,7 +3616,11 @@ int main(int argc, char * argv[]){
       // Conditional branch.
         ChannelPass(VNtoChN_CD, ChFactorMatrix_CD, ChNtoVN_CD, N, GF);
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
-    }
+      }
+      if (!isEMS && itr > 5) {
+        isEMS = true;
+        printf("Using EMS decoding from iteration %d\n", itr);
+      }
 
     DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
                     VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
@@ -3339,14 +3628,14 @@ int main(int argc, char * argv[]){
     TrueNoiseSynd_C, EstmNoiseSynd_C,
     USSHistory_C[itr%HistoryLength],
     Updated_EstmNoise_History_C[itr%HistoryLength],
-    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
+    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ,isEMS);
     DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
                     VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
     N, M, GF, logGF, MatValue_D, RowDeg_D,
     TrueNoiseSynd_D, EstmNoiseSynd_D,
     USSHistory_D[itr%HistoryLength],
     Updated_EstmNoise_History_D[itr%HistoryLength],
-    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ,isEMS);
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
