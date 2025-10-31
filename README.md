@@ -68,12 +68,19 @@ CUDA_ARCH=sm_80 scripts/build_cuda.sh gd_css_cuda
 ## ▶️ Run Example
 
 ```
-scripts/run_example.sh
+scripts/run_example.sh [binary]
 ```
 
-Equivalent to:
+If you omit `[binary]`, the script runs the CPU build (`./gd_css`). To try the CUDA build output, pass its path explicitly:
+
 ```
-./gd_css 500   data/apm_css/QC_Gamma_J2_L6_P6500_RQ0.333333_alpha1_GF256_GIRTH12_SEED101   data/apm_css/QC_Delta_J2_L6_P6500_RQ0.333333_alpha1_GF256_GIRTH12_SEED101   QC_J2_L6_P6500   0.0640   1   101
+scripts/run_example.sh ./gd_css_cuda
+```
+
+Under the hood, the script executes:
+
+```
+./gd_css 500   data/apm_css/DEG_APM_Gamma_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   data/apm_css/DEG_APM_Delta_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   DEG_APM_J2_L6_P6500   0.0640   0   101
 ```
 
 ---
