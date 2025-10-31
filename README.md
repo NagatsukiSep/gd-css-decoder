@@ -37,7 +37,9 @@ so no manual configuration is required.
 
 ## ⚙️ Build
 
-To compile the decoder, simply run:
+### CPU build
+
+To compile the decoder for CPU execution, run:
 ```
 scripts/build.sh
 ```
@@ -45,6 +47,20 @@ scripts/build.sh
 Or manually:
 ```
 g++-14 -w -std=c++23 src/gd_css_patched.cc -o gd_css -O3 -lm   -I/opt/homebrew/Cellar/eigen/3.4.0_1/include/eigen3   -I/usr/local/include/eigen3   -D_Alignof=alignof
+```
+
+### CUDA build
+
+If you have the NVIDIA CUDA toolkit installed and would like to enable the GPU kernels,
+use the dedicated build script:
+```
+scripts/build_cuda.sh
+```
+
+By default, the script targets `sm_70`. You can override the GPU architecture and the
+output binary name via environment variables and arguments, for example:
+```
+CUDA_ARCH=sm_80 scripts/build_cuda.sh gd_css_cuda
 ```
 
 ---
