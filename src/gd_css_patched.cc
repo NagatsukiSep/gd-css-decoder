@@ -23,8 +23,28 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <exception>
+
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
+#define GD_CSS_COMPILED_WITH_NVCC 1
+#else
+#define GD_CSS_COMPILED_WITH_NVCC 0
+#endif
+
+#if defined(GD_CSS_CUDA_BUILD) && !GD_CSS_COMPILED_WITH_NVCC
+#error "GD_CSS_CUDA_BUILD requires compiling with nvcc"
+#endif
+
+#if defined(GD_CSS_ENABLE_CUDA)
+#undef GD_CSS_ENABLE_CUDA
+#endif
+
+#if defined(GD_CSS_CUDA_BUILD)
+#define GD_CSS_ENABLE_CUDA 1
+#elif GD_CSS_COMPILED_WITH_NVCC
+#define GD_CSS_ENABLE_CUDA 1
+#else
+#define GD_CSS_ENABLE_CUDA 0
 #endif
 using namespace std;
 
@@ -165,7 +185,7 @@ using LoopSet = vector<Loop>;
 using IndexList = vector<vector<int>>;
 using BitSet = unordered_set<int>;
 using NodeList = vector<int>;
-#if defined(__CUDACC__)
+#if GD_CSS_COMPILED_WITH_NVCC
 namespace cuda_kernels {
 
 __global__ void VNtoChNKernel(double* out,
@@ -291,6 +311,14 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
   f_VNtoChN_eigen=Eigen::MatrixXd(GF,GF);
   cout << "eigen done" << endl;
 
+#if !GD_CSS_ENABLE_CUDA
+  static bool compile_time_reported = false;
+  if (!compile_time_reported) {
+    cout << "VNtoChN_init compiled without CUDA support; using CPU implementation." << endl;
+    compile_time_reported = true;
+  }
+#endif
+
   auto cpu_compute = [&]() {
     for (int d = 0; d < GF; ++d) {
       for (int e = 0; e < GF; ++e) {
@@ -306,7 +334,8 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
     }
   };
 
-#if defined(__CUDACC__)
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
   bool gpu_success = false;
   std::string gpu_error;
   do {
@@ -393,6 +422,10 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
       }
 
       gpu_success = true;
+      if (!reported_cuda_success) {
+        std::cout << "VNtoChN_init executed CUDA kernel path." << std::endl;
+        reported_cuda_success = true;
+      }
     } catch (const std::exception& ex) {
       gpu_error = ex.what();
     }

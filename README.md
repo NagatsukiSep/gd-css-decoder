@@ -63,6 +63,10 @@ output binary name via environment variables and arguments, for example:
 CUDA_ARCH=sm_80 scripts/build_cuda.sh gd_css_cuda
 ```
 
+The CUDA build defines the `GD_CSS_CUDA_BUILD` macro and forces nvcc to treat
+`src/gd_css_patched.cc` as CUDA code, ensuring the `#if defined(__CUDACC__)` guarded
+paths (GPU kernels) are compiled in.
+
 ---
 
 ## ▶️ Run Example
@@ -71,11 +75,9 @@ CUDA_ARCH=sm_80 scripts/build_cuda.sh gd_css_cuda
 scripts/run_example.sh [binary]
 ```
 
-If you omit `[binary]`, the script runs the CPU build (`./gd_css`). To try the CUDA build output, pass its path explicitly:
-
-```
-scripts/run_example.sh ./gd_css_cuda
-```
+If you omit `[binary]`, the script now prefers `./gd_css_cuda` when it exists and falls
+back to the CPU build (`./gd_css`). The script also echoes the binary it is about to run,
+so you can double-check which build is being executed.
 
 Under the hood, the script executes:
 
