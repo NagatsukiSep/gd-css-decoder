@@ -214,7 +214,391 @@ __global__ void VNtoChNKernel(double* out,
   out[d * GF + e] = value;
 }
 
+__global__ void CheckPassKernel(double* CNtoVNxxx,
+                                double* VNtoCNxxx,
+                                const int* MatValue,
+                                const int* rowBase,
+                                const int* RowDegree,
+                                const int* DIVGF,
+                                const int* MULGF,
+                                const int* FFT0,
+                                const int* FFT1,
+                                const int* TrueNoiseSynd,
+                                int M,
+                                int GF,
+                                int logGF,
+                                int pairCount) {
+  const int row = blockIdx.x;
+  if (row >= M) {
+    return;
+  }
+
+  extern __shared__ double shared[];
+  double* FTrue = shared;
+  double* TMP = shared + GF;
+
+  const int tid = threadIdx.x;
+  const int degree = RowDegree[row];
+  const int base = rowBase[row];
+
+  for (int g = tid; g < GF; g += blockDim.x) {
+    FTrue[g] = (g == TrueNoiseSynd[row]) ? 1.0 : 0.0;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int k = 0; k < pairCount; ++k) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = FTrue[i];
+      const double B = FTrue[j];
+      FTrue[i] = A + B;
+      FTrue[j] = A - B;
+    }
+  }
+  __syncthreads();
+
+  for (int t = 0; t < degree; ++t) {
+    double* edgeVec = VNtoCNxxx + (base + t) * GF;
+    const int matVal = MatValue[base + t];
+    for (int g = tid; g < GF; g += blockDim.x) {
+      TMP[g] = edgeVec[DIVGF[g * GF + matVal]];
+    }
+    __syncthreads();
+    for (int g = tid; g < GF; g += blockDim.x) {
+      edgeVec[g] = TMP[g];
+    }
+    __syncthreads();
+    if (tid == 0) {
+      for (int k = 0; k < pairCount; ++k) {
+        const int i = FFT0[k];
+        const int j = FFT1[k];
+        const double A = edgeVec[i];
+        const double B = edgeVec[j];
+        edgeVec[i] = A + B;
+        edgeVec[j] = A - B;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int t = 0; t < degree; ++t) {
+    double* outVec = CNtoVNxxx + (base + t) * GF;
+    for (int g = tid; g < GF; g += blockDim.x) {
+      double value = FTrue[g];
+      for (int tz = 0; tz < degree; ++tz) {
+        if (tz == t) {
+          continue;
+        }
+        value *= VNtoCNxxx[(base + tz) * GF + g];
+      }
+      outVec[g] = value;
+    }
+    __syncthreads();
+  }
+
+  for (int t = 0; t < degree; ++t) {
+    double* outVec = CNtoVNxxx + (base + t) * GF;
+    if (tid == 0) {
+      for (int k = 0; k < pairCount; ++k) {
+        const int i = FFT0[k];
+        const int j = FFT1[k];
+        const double A = outVec[i];
+        const double B = outVec[j];
+        outVec[i] = 0.5 * (A + B);
+        outVec[j] = 0.5 * (A - B);
+      }
+    }
+    __syncthreads();
+
+    const int matVal = MatValue[base + t];
+    for (int g = tid; g < GF; g += blockDim.x) {
+      TMP[g] = outVec[MULGF[matVal * GF + g]];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      double sum = 0.0;
+      for (int g = 0; g < GF; ++g) {
+        double v = TMP[g];
+        if (v < 0.0) {
+          v = 0.0;
+        }
+        TMP[g] = v;
+        sum += v;
+      }
+      if (sum == 0.0) {
+        const double uniform = 1.0 / static_cast<double>(GF);
+        for (int g = 0; g < GF; ++g) {
+          TMP[g] = uniform;
+        }
+      } else {
+        const double inv = 1.0 / sum;
+        for (int g = 0; g < GF; ++g) {
+          TMP[g] *= inv;
+        }
+      }
+    }
+    __syncthreads();
+
+    for (int g = tid; g < GF; g += blockDim.x) {
+      outVec[g] = TMP[g];
+    }
+    __syncthreads();
+  }
+}
+
 }  // namespace cuda_kernels
+#endif
+
+#if GD_CSS_ENABLE_CUDA
+static bool RunCheckPassCUDA(const vector<int>& rowBase,
+                             const vector<int>& RowDegree,
+                             const vector<int>& MatValueFlat,
+                             vector<double>& CNtoVNFlat,
+                             vector<double>& VNtoCNFlat,
+                             const vector<int>& DIVGFFlat,
+                             const vector<int>& MULGFFlat,
+                             const vector<int>& FFT0,
+                             const vector<int>& FFT1,
+                             const vector<int>& TrueNoiseSynd,
+                             int M,
+                             int GF,
+                             int logGF,
+                             string& error) {
+  const size_t totalEdges = MatValueFlat.size();
+  if (totalEdges == 0 || M == 0) {
+    return true;
+  }
+
+  double* d_CNtoVN = nullptr;
+  double* d_VNtoCN = nullptr;
+  int* d_MatValue = nullptr;
+  int* d_rowBase = nullptr;
+  int* d_RowDegree = nullptr;
+  int* d_DIVGF = nullptr;
+  int* d_MULGF = nullptr;
+  int* d_FFT0 = nullptr;
+  int* d_FFT1 = nullptr;
+  int* d_TrueNoiseSynd = nullptr;
+
+  const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+  const size_t edgesBytes = totalEdges * sizeof(int);
+  const size_t rowBaseBytes = rowBase.size() * sizeof(int);
+  const size_t rowDegreeBytes = RowDegree.size() * sizeof(int);
+  const size_t gfSquareBytes = static_cast<size_t>(GF) * static_cast<size_t>(GF) * sizeof(int);
+  const size_t pairCount = FFT0.size();
+  const size_t pairBytes = pairCount * sizeof(int);
+  const size_t syndromeBytes = TrueNoiseSynd.size() * sizeof(int);
+
+  auto cleanup = [&]() {
+    if (d_CNtoVN) cudaFree(d_CNtoVN);
+    if (d_VNtoCN) cudaFree(d_VNtoCN);
+    if (d_MatValue) cudaFree(d_MatValue);
+    if (d_rowBase) cudaFree(d_rowBase);
+    if (d_RowDegree) cudaFree(d_RowDegree);
+    if (d_DIVGF) cudaFree(d_DIVGF);
+    if (d_MULGF) cudaFree(d_MULGF);
+    if (d_FFT0) cudaFree(d_FFT0);
+    if (d_FFT1) cudaFree(d_FFT1);
+    if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
+  };
+
+  cudaError_t status = cudaSuccess;
+  status = cudaMalloc(&d_CNtoVN, matrixBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for CNtoVN buffer";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_VNtoCN, matrixBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for VNtoCN buffer";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_MatValue, edgesBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for MatValue";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_rowBase, rowBaseBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for rowBase";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_RowDegree, rowDegreeBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for RowDegree";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_DIVGF, gfSquareBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DIVGF";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_MULGF, gfSquareBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for MULGF";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_FFT0, pairBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for FFT0";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_FFT1, pairBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for FFT1";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for TrueNoiseSynd";
+    cleanup();
+    return false;
+  }
+
+  status = cudaMemcpy(d_CNtoVN, CNtoVNFlat.data(), matrixBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for CNtoVN host->device";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_VNtoCN, VNtoCNFlat.data(), matrixBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for VNtoCN host->device";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_MatValue, MatValueFlat.data(), edgesBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for MatValue";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_rowBase, rowBase.data(), rowBaseBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for rowBase";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_RowDegree, RowDegree.data(), rowDegreeBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for RowDegree";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_DIVGF, DIVGFFlat.data(), gfSquareBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for DIVGF";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_MULGF, MULGFFlat.data(), gfSquareBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for MULGF";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_FFT0, FFT0.data(), pairBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for FFT0";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_FFT1, FFT1.data(), pairBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for FFT1";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(d_TrueNoiseSynd, TrueNoiseSynd.data(), syndromeBytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for TrueNoiseSynd";
+    cleanup();
+    return false;
+  }
+
+  int device = 0;
+  status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    error = "cudaGetDevice failed";
+    cleanup();
+    return false;
+  }
+
+  int maxSharedBytes = 0;
+  status = cudaDeviceGetAttribute(&maxSharedBytes, cudaDevAttrMaxSharedMemoryPerBlock, device);
+  if (status != cudaSuccess) {
+    error = "cudaDeviceGetAttribute failed";
+    cleanup();
+    return false;
+  }
+
+  const size_t sharedBytes = sizeof(double) * 2ULL * static_cast<size_t>(GF);
+  if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
+    error = "CheckPass CUDA kernel requires more shared memory than available";
+    cleanup();
+    return false;
+  }
+
+  const int threads = std::min(256, std::max(1, GF));
+  dim3 grid(M);
+
+  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes>>>(
+      d_CNtoVN,
+      d_VNtoCN,
+      d_MatValue,
+      d_rowBase,
+      d_RowDegree,
+      d_DIVGF,
+      d_MULGF,
+      d_FFT0,
+      d_FFT1,
+      d_TrueNoiseSynd,
+      M,
+      GF,
+      logGF,
+      static_cast<int>(pairCount));
+
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    error = "CheckPass CUDA kernel launch failed";
+    cleanup();
+    return false;
+  }
+
+  status = cudaDeviceSynchronize();
+  if (status != cudaSuccess) {
+    error = "CheckPass CUDA kernel execution failed";
+    cleanup();
+    return false;
+  }
+
+  status = cudaMemcpy(CNtoVNFlat.data(), d_CNtoVN, matrixBytes, cudaMemcpyDeviceToHost);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for CNtoVN device->host";
+    cleanup();
+    return false;
+  }
+  status = cudaMemcpy(VNtoCNFlat.data(), d_VNtoCN, matrixBytes, cudaMemcpyDeviceToHost);
+  if (status != cudaSuccess) {
+    error = "cudaMemcpy failed for VNtoCN device->host";
+    cleanup();
+    return false;
+  }
+
+  cleanup();
+  return true;
+}
 #endif
 template <typename T>
 // Function: contains
@@ -635,72 +1019,185 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
     int logGF = rint(log2(GF) / log2(2));
 
-    // 各行の先頭オフセットを事前計算
     vector<int> rowBase(M+1,0);
-    for (int m=1; m<=M; m++)
+    for (int m=1; m<=M; m++) {
         rowBase[m] = rowBase[m-1] + RowDegree[m-1];
-
-    #pragma omp parallel for schedule(dynamic) 
-    for (int m=0; m<M; m++) {
-        int base = rowBase[m];
-        vector<double> TMP(GF,0.0);
-        vector<double> F_TrueNoiseSynd(GF,0.0);
-
-        // --- シンドロームを one-hot で初期化 ---
-        F_TrueNoiseSynd[TrueNoiseSynd[m]] = 1.0;
-
-        // Walsh–Hadamard変換
-        for (int k=0; k<logGF*GF/2; k++) {
-            double A = F_TrueNoiseSynd[FFTSQ[k][0]];
-            double B = F_TrueNoiseSynd[FFTSQ[k][1]];
-            F_TrueNoiseSynd[FFTSQ[k][0]] = A + B;
-            F_TrueNoiseSynd[FFTSQ[k][1]] = A - B;
-        }
-
-        // 各隣接VNの入力を座標変換＋FFT
-        for (int t=0; t<RowDegree[m]; t++) {
-            for (int g=0; g<GF; g++)
-                TMP[g] = VNtoCNxxx[base+t][ DIVGF[g][ MatValue[m][t] ] ];
-            for (int g=0; g<GF; g++)
-                VNtoCNxxx[base+t][g] = TMP[g];
-
-            for (int k=0; k<logGF*GF/2; k++) {
-                double A = VNtoCNxxx[base+t][FFTSQ[k][0]];
-                double B = VNtoCNxxx[base+t][FFTSQ[k][1]];
-                VNtoCNxxx[base+t][FFTSQ[k][0]] = A + B;
-                VNtoCNxxx[base+t][FFTSQ[k][1]] = A - B;
-            }
-        }
-
-        // 周波数領域で合成
-        for (int t=0; t<RowDegree[m]; t++) {
-            for (int g=0; g<GF; g++)
-                CNtoVNxxx[base+t][g] = F_TrueNoiseSynd[g];
-
-            for (int tz=0; tz<RowDegree[m]; tz++) {
-                if (tz==t) continue;
-                for (int g=0; g<GF; g++)
-                    CNtoVNxxx[base+t][g] *= VNtoCNxxx[base+tz][g];
-            }
-        }
-
-        // 逆FFT & 係数復元 & normalize
-        for (int t=0; t<RowDegree[m]; t++) {
-            for (int k=0; k<logGF*GF/2; k++) {
-                double A = CNtoVNxxx[base+t][FFTSQ[k][0]];
-                double B = CNtoVNxxx[base+t][FFTSQ[k][1]];
-                CNtoVNxxx[base+t][FFTSQ[k][0]] = 0.5*(A+B);
-                CNtoVNxxx[base+t][FFTSQ[k][1]] = 0.5*(A-B);
-            }
-
-            for (int g=0; g<GF; g++)
-                TMP[g] = CNtoVNxxx[base+t][ MULGF[MatValue[m][t]][g] ];
-            for (int g=0; g<GF; g++)
-                CNtoVNxxx[base+t][g] = std::max(TMP[g], 0.0);
-
-            normalize(CNtoVNxxx[base+t], GF);
-        }
     }
+
+    auto cpu_impl = [&]() {
+        #pragma omp parallel for schedule(dynamic)
+        for (int m=0; m<M; m++) {
+            int base = rowBase[m];
+            vector<double> TMP(GF,0.0);
+            vector<double> F_TrueNoiseSynd(GF,0.0);
+
+            F_TrueNoiseSynd[TrueNoiseSynd[m]] = 1.0;
+
+            for (int k=0; k<logGF*GF/2; k++) {
+                double A = F_TrueNoiseSynd[FFTSQ[k][0]];
+                double B = F_TrueNoiseSynd[FFTSQ[k][1]];
+                F_TrueNoiseSynd[FFTSQ[k][0]] = A + B;
+                F_TrueNoiseSynd[FFTSQ[k][1]] = A - B;
+            }
+
+            for (int t=0; t<RowDegree[m]; t++) {
+                for (int g=0; g<GF; g++) {
+                    TMP[g] = VNtoCNxxx[base+t][ DIVGF[g][ MatValue[m][t] ] ];
+                }
+                for (int g=0; g<GF; g++) {
+                    VNtoCNxxx[base+t][g] = TMP[g];
+                }
+
+                for (int k=0; k<logGF*GF/2; k++) {
+                    double A = VNtoCNxxx[base+t][FFTSQ[k][0]];
+                    double B = VNtoCNxxx[base+t][FFTSQ[k][1]];
+                    VNtoCNxxx[base+t][FFTSQ[k][0]] = A + B;
+                    VNtoCNxxx[base+t][FFTSQ[k][1]] = A - B;
+                }
+            }
+
+            for (int t=0; t<RowDegree[m]; t++) {
+                for (int g=0; g<GF; g++) {
+                    CNtoVNxxx[base+t][g] = F_TrueNoiseSynd[g];
+                }
+
+                for (int tz=0; tz<RowDegree[m]; tz++) {
+                    if (tz==t) continue;
+                    for (int g=0; g<GF; g++) {
+                        CNtoVNxxx[base+t][g] *= VNtoCNxxx[base+tz][g];
+                    }
+                }
+            }
+
+            for (int t=0; t<RowDegree[m]; t++) {
+                for (int k=0; k<logGF*GF/2; k++) {
+                    double A = CNtoVNxxx[base+t][FFTSQ[k][0]];
+                    double B = CNtoVNxxx[base+t][FFTSQ[k][1]];
+                    CNtoVNxxx[base+t][FFTSQ[k][0]] = 0.5*(A+B);
+                    CNtoVNxxx[base+t][FFTSQ[k][1]] = 0.5*(A-B);
+                }
+
+                for (int g=0; g<GF; g++) {
+                    TMP[g] = CNtoVNxxx[base+t][ MULGF[MatValue[m][t]][g] ];
+                }
+                for (int g=0; g<GF; g++) {
+                    CNtoVNxxx[base+t][g] = std::max(TMP[g], 0.0);
+                }
+
+                normalize(CNtoVNxxx[base+t], GF);
+            }
+        }
+    };
+
+#if GD_CSS_ENABLE_CUDA
+    static bool reported_cuda_success = false;
+    static bool reported_cuda_failure = false;
+
+    bool gpu_success = false;
+    string gpu_error;
+
+    do {
+        const size_t totalEdges = static_cast<size_t>(rowBase.back());
+        if (CNtoVNxxx.size() < totalEdges || VNtoCNxxx.size() < totalEdges) {
+            gpu_error = "CheckPass GPU path received inconsistent edge buffers";
+            break;
+        }
+        if (MatValue.size() < static_cast<size_t>(M) || FFTSQ.size() != static_cast<size_t>(logGF) * GF / 2) {
+            gpu_error = "CheckPass GPU path received incompatible table dimensions";
+            break;
+        }
+        if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
+            gpu_error = "CheckPass GPU path requires full GF tables";
+            break;
+        }
+
+        vector<double> cnFlat(totalEdges * static_cast<size_t>(GF));
+        vector<double> vnFlat(totalEdges * static_cast<size_t>(GF));
+        for (size_t edge=0; edge<totalEdges; ++edge) {
+            if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
+                gpu_error = "GF dimension mismatch in message buffers";
+                break;
+            }
+            for (int g=0; g<GF; ++g) {
+                cnFlat[edge * GF + g] = CNtoVNxxx[edge][g];
+                vnFlat[edge * GF + g] = VNtoCNxxx[edge][g];
+            }
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+
+        vector<int> matValueFlat(totalEdges);
+        for (int mIdx=0; mIdx<M; ++mIdx) {
+            if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
+                gpu_error = "MatValue row shorter than RowDegree";
+                break;
+            }
+            for (int t=0; t<RowDegree[mIdx]; ++t) {
+                matValueFlat[rowBase[mIdx] + t] = MatValue[mIdx][t];
+            }
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+
+        vector<int> divFlat(static_cast<size_t>(GF) * GF);
+        vector<int> mulFlat(static_cast<size_t>(GF) * GF);
+        for (int i=0; i<GF; ++i) {
+            if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
+                gpu_error = "GF lookup tables are incomplete";
+                break;
+            }
+            for (int j=0; j<GF; ++j) {
+                divFlat[i * GF + j] = DIVGF[i][j];
+                mulFlat[i * GF + j] = MULGF[i][j];
+            }
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+
+        const size_t pairCount = FFTSQ.size();
+        vector<int> fft0(pairCount);
+        vector<int> fft1(pairCount);
+        for (size_t k=0; k<pairCount; ++k) {
+            if (FFTSQ[k].size() < 2) {
+                gpu_error = "FFTSQ entries must contain two indices";
+                break;
+            }
+            fft0[k] = FFTSQ[k][0];
+            fft1[k] = FFTSQ[k][1];
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+
+        gpu_success = RunCheckPassCUDA(rowBase, RowDegree, matValueFlat, cnFlat, vnFlat, divFlat, mulFlat, fft0, fft1, TrueNoiseSynd, M, GF, logGF, gpu_error);
+        if (!gpu_success) {
+            break;
+        }
+
+        for (size_t edge=0; edge<totalEdges; ++edge) {
+            for (int g=0; g<GF; ++g) {
+                CNtoVNxxx[edge][g] = cnFlat[edge * GF + g];
+                VNtoCNxxx[edge][g] = vnFlat[edge * GF + g];
+            }
+        }
+
+        if (!reported_cuda_success) {
+            std::cout << "CheckPass executed with CUDA acceleration." << std::endl;
+            reported_cuda_success = true;
+        }
+        return;
+    } while (false);
+
+    if (!gpu_error.empty() && !reported_cuda_failure) {
+        std::cerr << "CheckPass GPU path failed: " << gpu_error << ". Falling back to CPU implementation." << std::endl;
+        reported_cuda_failure = true;
+    }
+#endif
+
+    cpu_impl();
 }
 // Function: calcSyndrome
 // Purpose: TODO - describe the function's responsibility succinctly.
