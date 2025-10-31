@@ -22,6 +22,10 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <exception>
+#if defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
 using namespace std;
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -161,6 +165,37 @@ using LoopSet = vector<Loop>;
 using IndexList = vector<vector<int>>;
 using BitSet = unordered_set<int>;
 using NodeList = vector<int>;
+#if defined(__CUDACC__)
+namespace cuda_kernels {
+
+__global__ void VNtoChNKernel(double* out,
+                              const int* B0,
+                              const int* B1,
+                              int GF,
+                              int logGF,
+                              double pD) {
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  const int e = blockIdx.y * blockDim.y + threadIdx.y;
+  if (d >= GF || e >= GF) {
+    return;
+  }
+
+  double value = 1.0;
+  for (int l = 0; l < logGF; ++l) {
+    const int idx_d = d * logGF + l;
+    const int idx_e = e * logGF + l;
+    if (B0[idx_d] == 0 && B1[idx_e] == 0) {
+      value *= (1.0 - pD);
+    } else {
+      value *= (pD / 3.0);
+    }
+  }
+
+  out[d * GF + e] = value;
+}
+
+}  // namespace cuda_kernels
+#endif
 template <typename T>
 // Function: contains
 // Purpose: TODO - describe the function's responsibility succinctly.
@@ -255,24 +290,126 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
   cout << "@@@ VNtoChN_init" << endl;
   f_VNtoChN_eigen=Eigen::MatrixXd(GF,GF);
   cout << "eigen done" << endl;
-  // Loop: iterate over a range/collection.
-  for(size_t d=0;d<GF;d++){
 
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){
-      f_VNtoChN_eigen(d,e)=1.0f;
-      // Loop: iterate over a range/collection.
-      for(size_t l=0;l<logGF;l++){
-        // Conditional branch.
-        if(BINGF0[d][l]==0 && BINGF1[e][l]==0){
-          f_VNtoChN_eigen(d,e)*=1-pD;
-        }else{
-        f_VNtoChN_eigen(d,e)*=pD/3;
+  auto cpu_compute = [&]() {
+    for (int d = 0; d < GF; ++d) {
+      for (int e = 0; e < GF; ++e) {
+        f_VNtoChN_eigen(d, e) = 1.0;
+        for (int l = 0; l < logGF; ++l) {
+          if (BINGF0[d][l] == 0 && BINGF1[e][l] == 0) {
+            f_VNtoChN_eigen(d, e) *= 1 - pD;
+          } else {
+            f_VNtoChN_eigen(d, e) *= pD / 3;
+          }
+        }
       }
     }
+  };
+
+#if defined(__CUDACC__)
+  bool gpu_success = false;
+  std::string gpu_error;
+  do {
+    try {
+      std::vector<int> B0_flat(GF * logGF);
+      std::vector<int> B1_flat(GF * logGF);
+      for (int d = 0; d < GF; ++d) {
+        for (int l = 0; l < logGF; ++l) {
+          B0_flat[d * logGF + l] = BINGF0[d][l];
+          B1_flat[d * logGF + l] = BINGF1[d][l];
+        }
+      }
+
+      std::vector<double> host_result(GF * GF, 1.0);
+
+      double* d_out = nullptr;
+      int* d_B0 = nullptr;
+      int* d_B1 = nullptr;
+      auto cleanup = [&]() {
+        if (d_out) cudaFree(d_out);
+        if (d_B0) cudaFree(d_B0);
+        if (d_B1) cudaFree(d_B1);
+        d_out = nullptr;
+        d_B0 = nullptr;
+        d_B1 = nullptr;
+      };
+
+      const size_t matrix_bytes = sizeof(double) * host_result.size();
+      const size_t gf_bytes = sizeof(int) * B0_flat.size();
+
+      if (cudaMalloc(&d_out, matrix_bytes) != cudaSuccess) {
+        gpu_error = "cudaMalloc failed for output matrix";
+        cleanup();
+        break;
+      }
+      if (cudaMalloc(&d_B0, gf_bytes) != cudaSuccess) {
+        gpu_error = "cudaMalloc failed for B0";
+        cleanup();
+        break;
+      }
+      if (cudaMalloc(&d_B1, gf_bytes) != cudaSuccess) {
+        gpu_error = "cudaMalloc failed for B1";
+        cleanup();
+        break;
+      }
+
+      if (cudaMemcpy(d_B0, B0_flat.data(), gf_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_error = "cudaMemcpy failed for B0";
+        cleanup();
+        break;
+      }
+      if (cudaMemcpy(d_B1, B1_flat.data(), gf_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_error = "cudaMemcpy failed for B1";
+        cleanup();
+        break;
+      }
+
+      dim3 block(16, 16);
+      dim3 grid((GF + block.x - 1) / block.x, (GF + block.y - 1) / block.y);
+      cuda_kernels::VNtoChNKernel<<<grid, block>>>(d_out, d_B0, d_B1, GF, logGF, pD);
+      if (cudaGetLastError() != cudaSuccess) {
+        gpu_error = "Kernel launch failed";
+        cleanup();
+        break;
+      }
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        gpu_error = "Kernel execution failed";
+        cleanup();
+        break;
+      }
+
+      if (cudaMemcpy(host_result.data(), d_out, matrix_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        gpu_error = "cudaMemcpy failed for output";
+        cleanup();
+        break;
+      }
+
+      cleanup();
+
+      for (int d = 0; d < GF; ++d) {
+        for (int e = 0; e < GF; ++e) {
+          f_VNtoChN_eigen(d, e) = host_result[d * GF + e];
+        }
+      }
+
+      gpu_success = true;
+    } catch (const std::exception& ex) {
+      gpu_error = ex.what();
+    }
+  } while (false);
+
+  if (!gpu_success) {
+    if (!gpu_error.empty()) {
+      std::cerr << "VNtoChN_init GPU path failed: " << gpu_error
+                << ". Falling back to CPU implementation." << std::endl;
+    }
+    cpu_compute();
   }
-}
-cout << "*** VNtoChN_init" << endl;
+#else
+  cpu_compute();
+#endif
+
+  cout << "*** VNtoChN_init" << endl;
 }
 // Function: normalize
 // Purpose: TODO - describe the function's responsibility succinctly.
