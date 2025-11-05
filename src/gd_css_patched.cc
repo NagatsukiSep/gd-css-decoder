@@ -338,7 +338,7 @@ static double neglog_sum_exp(double a, double b){
     return -(m + std::log(sum));
 }
 
-// 上位Kのみ保持する sparse 畳み込み（log-domain sum-product, GF加法= XOR 前提）
+// 上位Kのみ保持する sparse 畳み込み（log-domain sum-product, GF加法はテーブル参照）
 static vector<std::pair<int,double>> ems_convolve_topk(
     const vector<std::pair<int,double>>& A,
     const vector<std::pair<int,double>>& B,
@@ -355,7 +355,7 @@ static vector<std::pair<int,double>> ems_convolve_topk(
     accum.reserve(aN * bN);
     for(int i=0;i<aN;i++){
         for(int j=0;j<bN;j++){
-            int sym = A[i].first ^ B[j].first;           // GF(2^m)加法
+            int sym = ADDGF[A[i].first][B[j].first];     // GF加法（添字→和）
             double cost = A[i].second + B[j].second;     // -log(p) の加算
             auto [it, inserted] = accum.emplace(sym, cost);
             if (!inserted) {
@@ -722,9 +722,9 @@ void CheckPass_EMS(
             // dense に展開（未定義は INF）
             list_to_dense(excl, cost_other_dense);
 
-            // 出力： z_t = g のコストは  other[s - g] = other[synd ^ g]
+            // 出力： z_t = g のコストは  other[s - g] = other[ADDGF[synd][g]]
             for(int g=0; g<GF; g++){
-                cost_out_z[g] = cost_other_dense[synd ^ g];
+                cost_out_z[g] = cost_other_dense[ ADDGF[synd][g] ];
             }
 
             // for(int g=0; g<GF; g++){
