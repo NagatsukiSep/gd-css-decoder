@@ -326,7 +326,19 @@ static inline double safe_log(double x){
     return std::log(std::max(x, eps));
 }
 
-// 上位Kのみ保持する sparse 畳み込み（min-plus, GF加法= XOR 前提）
+// -log(e^{-a} + e^{-b}) を安全に計算する（a,b は -log(p) 表現）
+static double neglog_sum_exp(double a, double b){
+    if (!std::isfinite(a)) return b;
+    if (!std::isfinite(b)) return a;
+    // log-domain での安定化： log(exp(x)+exp(y)) = m + log(exp(x-m)+exp(y-m))
+    double x = -a;
+    double y = -b;
+    double m = std::max(x, y);
+    double sum = std::exp(x - m) + std::exp(y - m);
+    return -(m + std::log(sum));
+}
+
+// 上位Kのみ保持する sparse 畳み込み（log-domain sum-product, GF加法= XOR 前提）
 static vector<std::pair<int,double>> ems_convolve_topk(
     const vector<std::pair<int,double>>& A,
     const vector<std::pair<int,double>>& B,
@@ -335,42 +347,33 @@ static vector<std::pair<int,double>> ems_convolve_topk(
     // 候補を広げてから上位Kに剪定
     // シンボルごとの最良コストを辞書的に保持
     // （重複シンボルは最小コストのみ残す）
-    constexpr double INF = std::numeric_limits<double>::infinity();
-    // 期待よりだいぶ小さいのでunordered_mapでも良いが、可搬性重視でソート＋uniqueに寄せる
-    vector<std::pair<int,double>> tmp;
-    tmp.reserve(std::min((size_t)K, A.size()) * std::min((size_t)K, B.size()));
     const int aN = (int)std::min(A.size(), (size_t)K);
     const int bN = (int)std::min(B.size(), (size_t)K);
+
+    // シンボルごとに log-sum-exp で確率を合算
+    std::unordered_map<int,double> accum;
+    accum.reserve(aN * bN);
     for(int i=0;i<aN;i++){
         for(int j=0;j<bN;j++){
             int sym = A[i].first ^ B[j].first;           // GF(2^m)加法
-            double cost = A[i].second + B[j].second;     // min-plusの和
-            tmp.emplace_back(sym, cost);
+            double cost = A[i].second + B[j].second;     // -log(p) の加算
+            auto [it, inserted] = accum.emplace(sym, cost);
+            if (!inserted) {
+                it->second = neglog_sum_exp(it->second, cost);
+            }
         }
     }
-    // 同一シンボルの最良だけを残し、上位Kに剪定
-    // 1) シンボル→コストで昇順ソート（sym, cost）
-    std::sort(tmp.begin(), tmp.end(), [](auto& x, auto& y){
-        if (x.first != y.first) return x.first < y.first;
-        return x.second < y.second;
-    });
-    // 2) 各symの先頭（最小コスト）だけ採用
-    vector<std::pair<int,double>> unique_best;
-    unique_best.reserve(tmp.size());
-    for(size_t i=0;i<tmp.size();){
-        int sym = tmp[i].first;
-        double best = tmp[i].second;
-        unique_best.emplace_back(sym, best);
-        // 同じsymはスキップ
-        size_t j=i+1;
-        while(j<tmp.size() && tmp[j].first==sym) j++;
-        i=j;
+
+    vector<std::pair<int,double>> merged;
+    merged.reserve(accum.size());
+    for(auto &kv : accum){
+        merged.emplace_back(kv.first, kv.second);
     }
-    // 3) コスト昇順で上位Kまで
-    std::sort(unique_best.begin(), unique_best.end(),
-              [](auto& x, auto& y){ return x.second < y.second; });
-    if ((int)unique_best.size() > K) unique_best.resize(K);
-    return unique_best;
+
+    std::sort(merged.begin(), merged.end(),
+              [](const auto& x, const auto& y){ return x.second < y.second; });
+    if ((int)merged.size() > K) merged.resize(K);
+    return merged;
 }
 
 // スパースリスト（sym,cost）から配列（長さGF, 未定義はINF）へ
@@ -702,12 +705,19 @@ void CheckPass_EMS(
         vector<double> cost_other_dense(GF);
         vector<double> cost_out_z(GF);
 
+        const std::vector<std::pair<int,double>> identity{{0, 0.0}};
         for(int t=0;t<d;t++){
             // 0..t-1 と t+1..d-1 を結合
-            vector<std::pair<int,double>> excl =
-                (t==0)     ? suff[1] :
-                (t==d-1)   ? pref[d-2] :
-                             ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
+            vector<std::pair<int,double>> excl;
+            if (d == 1) {
+                excl = identity; // 他に合成するエッジがない
+            } else if (t == 0) {
+                excl = suff[1];
+            } else if (t == d - 1) {
+                excl = pref[d-2];
+            } else {
+                excl = ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
+            }
 
             // dense に展開（未定義は INF）
             list_to_dense(excl, cost_other_dense);
