@@ -702,6 +702,7 @@ void CheckPass_EMS(
         vector<double> cost_other_dense(GF);
         vector<double> cost_out_z(GF);
 
+        assert(d >= 2);
         for(int t=0;t<d;t++){
             // 0..t-1 と t+1..d-1 を結合
             vector<std::pair<int,double>> excl =
