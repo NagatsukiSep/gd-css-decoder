@@ -702,19 +702,13 @@ void CheckPass_EMS(
         vector<double> cost_other_dense(GF);
         vector<double> cost_out_z(GF);
 
-        const std::vector<std::pair<int,double>> identity{{0, 0.0}};
+        assert(d >= 2);
         for(int t=0;t<d;t++){
             // 0..t-1 と t+1..d-1 を結合
-            vector<std::pair<int,double>> excl;
-            if (d == 1) {
-                excl = identity; // 他に合成するエッジがない
-            } else if (t == 0) {
-                excl = suff[1];
-            } else if (t == d - 1) {
-                excl = pref[d-2];
-            } else {
-                excl = ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
-            }
+            vector<std::pair<int,double>> excl =
+                (t==0)     ? suff[1] :
+                (t==d-1)   ? pref[d-2] :
+                             ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
 
             // dense に展開（未定義は INF）
             list_to_dense(excl, cost_other_dense);
