@@ -11,10 +11,12 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 #include <random>
 #include <map>
 #include <set>
 #include <iomanip>
+#include <limits>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -629,172 +631,124 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
 }
 
 void CheckPass_EMS(
-  vector<vector<double>> &CNtoVNxxx,         // 出力（上書き）
-  vector<vector<double>> &VNtoCNxxx,         // 入力
-  vector<vector<int>>    &MatValue,          // 非零係数 a_{m,t}
+  vector<vector<double>> &CNtoVNxxx,
+  vector<vector<double>> &VNtoCNxxx,
+  vector<vector<int>>    &MatValue,
   int M,
-  vector<int>            &RowDegree,         // 行次数 d_m
+  vector<int>            &RowDegree,
   vector<vector<int>>    &MULGF,
   vector<vector<int>>    &DIVGF,
   int GF,
   vector<int>            &TrueNoiseSynd
 ){
-    (void)FFTSQ; // 未使用
-    const int EMS_K = std::min(24, GF); // 近似度。必要に応じて変更
-    const double INF = std::numeric_limits<double>::infinity();
+    const int EMS_K = std::min(24, GF);
+    const int K = std::max(1, EMS_K);
+    (void)MULGF;
 
-    // 行ごとの先頭オフセット（numB互換）
-    vector<int> rowBase(M+1,0);
-    for(int m=1;m<=M;m++) rowBase[m] = rowBase[m-1] + RowDegree[m-1];
+    vector<int> rowBase(M + 1, 0);
+    for (int m = 1; m <= M; ++m) {
+        rowBase[m] = rowBase[m - 1] + RowDegree[m - 1];
+    }
 
-    // 1行ずつ処理
-    for(int m=0; m<M; m++){
+    vector<double> dense(GF);
+    vector<double> cost_out_z(GF);
+    vector<double> dest(GF);
+
+    for (int m = 0; m < M; ++m) {
         const int d = RowDegree[m];
+        if (d <= 0) continue;
+
         const int base = rowBase[m];
         const int synd = TrueNoiseSynd[m];
 
-        // ---- 入力（確率）→ z領域 (z=a*x) へ座標変換しつつ コスト = -log(p) 化、上位K抽出 ----
-        // 各エッジごとに（sym, cost）の上位Kを作る
-        vector<vector<std::pair<int,double>>> topK_lists(d);
-        {
-            // 一時配列で z領域のコスト配列をつくる
-            vector<double> cost(GF);
-            for(int t=0;t<d;t++){
-                const int a = MatValue[m][t];
-                // z = a * x  →  p_z[z] = p_x[z / a]  → indexは DIVGF[z][a]
-                for(int g=0; g<GF; g++){
-                    double p = VNtoCNxxx[base+t][ DIVGF[g][a] ];
-                    cost[g] = -safe_log(p);
-                }
-                // 上位K抽出：コスト小さい順
-                vector<int> idx(GF);
-                for(int g=0; g<GF; g++) idx[g]=g;
-                std::nth_element(idx.begin(), idx.begin()+std::min(EMS_K,GF)-1, idx.end(),
-                    [&](int i, int j){ return cost[i] < cost[j]; });
-                idx.resize(std::min(EMS_K, GF));
-                std::sort(idx.begin(), idx.end(), [&](int i, int j){ return cost[i] < cost[j]; });
+        vector<vector<std::pair<int,double>>> top_lists(d);
+        vector<double> cost(GF);
 
-                auto &L = topK_lists[t];
-                L.reserve(idx.size());
-                for(int id : idx) L.emplace_back(id, cost[id]);
-            }
-        }
-
-        // ---- prefix / suffix で「t を除いた合成」の高速計算（min-plus畳み込み, 上位K維持）----
-        vector<vector<std::pair<int,double>>> pref(d), suff(d);
-        // prefix
-        {
-            // 単位元：sum=0, cost=0
-            vector<std::pair<int,double>> acc = {{0, 0.0}};
-            for(int t=0;t<d;t++){
-                acc = ems_convolve_topk(acc, topK_lists[t], EMS_K);
-                pref[t] = acc; // 0..t を合成
-            }
-        }
-        // suffix
-        {
-            vector<std::pair<int,double>> acc = {{0, 0.0}};
-            for(int t=d-1;t>=0;t--){
-                acc = ems_convolve_topk(topK_lists[t], acc, EMS_K);
-                suff[t] = acc; // t..d-1 を合成
-            }
-        }
-
-        // ---- 各 t の出力（z領域）： 他全部の合成から t を除いたものを作って syynd でシフト ----
-        // cost_other[w] を dense へ展開して使う
-        vector<double> cost_other_dense(GF);
-        vector<double> cost_out_z(GF);
-
-        const std::vector<std::pair<int,double>> identity{{0, 0.0}};
-        for(int t=0;t<d;t++){
-            // 0..t-1 と t+1..d-1 を結合
-            vector<std::pair<int,double>> excl;
-            if (d == 1) {
-                excl = identity; // 他に合成するエッジがない
-            } else if (t == 0) {
-                excl = suff[1];
-            } else if (t == d - 1) {
-                excl = pref[d-2];
-            } else {
-                excl = ems_convolve_topk(pref[t-1], suff[t+1], EMS_K);
-            }
-
-            // dense に展開（未定義は INF）
-            list_to_dense(excl, cost_other_dense);
-
-            // 出力： z_t = g のコストは  other[s - g] = other[ADDGF[synd][g]]
-            for(int g=0; g<GF; g++){
-                cost_out_z[g] = cost_other_dense[ ADDGF[synd][g] ];
-            }
-
-            // for(int g=0; g<GF; g++){
-            //     printf(" m=%d t=%d g=%d cost_out_z=%f\n", m, t, g, cost_out_z[g]);
-            // }
-            // printf("\n");
-
-            // ---- x領域へ戻す（x = z / a）→ インデックスは g_x = g_z / a = DIVGF[g_z][a] ----
-            const double INF = std::numeric_limits<double>::infinity();
+        for (int t = 0; t < d; ++t) {
             const int a = MatValue[m][t];
-            // まず確率に戻す（exp(-cost)）。INF→0。
-            double cmin = INF;
-            bool any_finite = false;
             for (int g = 0; g < GF; ++g) {
-                double c = cost_out_z[g];
-                if (std::isfinite(c)) { 
-                    if (c < cmin) cmin = c;
-                    any_finite = true;
-                }
-            }
-            // 2) 全て INF のときの救済（exp 下駄落ち回避用の大きめ有限値）
-            if (!any_finite) {
-                const double BIG = 700.0; // exp(-700) ≈ 5e-305（double の下限より上）
-                for (int g = 0; g < GF; ++g) cost_out_z[g] = BIG;
-                cmin = BIG;
+                double p = VNtoCNxxx[base + t][ DIVGF[g][a] ];
+                cost[g] = -safe_log(p);
             }
 
-            // 3) Max-shift してから指数化（最良成分 ≈ 1、他は (0,1] に収まる）
+            std::vector<int> order(GF);
+            std::iota(order.begin(), order.end(), 0);
+            const int take = std::min(K, GF);
+            std::partial_sort(order.begin(), order.begin() + take, order.end(),
+                              [&](int lhs, int rhs){ return cost[lhs] < cost[rhs]; });
+            order.resize(take);
+
+            auto &bucket = top_lists[t];
+            bucket.reserve(order.size());
+            for (int idx : order) {
+                bucket.emplace_back(idx, cost[idx]);
+            }
+        }
+
+        vector<vector<std::pair<int,double>>> prefix(d + 1), suffix(d + 1);
+        prefix[0] = {{0, 0.0}};
+        for (int t = 0; t < d; ++t) {
+            prefix[t + 1] = ems_convolve_topk(prefix[t], top_lists[t], K);
+        }
+        suffix[d] = {{0, 0.0}};
+        for (int t = d - 1; t >= 0; --t) {
+            suffix[t] = ems_convolve_topk(top_lists[t], suffix[t + 1], K);
+        }
+
+        for (int t = 0; t < d; ++t) {
+            vector<std::pair<int,double>> excl = ems_convolve_topk(prefix[t], suffix[t + 1], K);
+            list_to_dense(excl, dense);
             for (int g = 0; g < GF; ++g) {
-                double c = cost_out_z[g];
-                double p = 0.0;
-                if (std::isfinite(c)) {
-                    double d = c - cmin;          // d >= 0 のはず
-                    // 万一 d が負になっても（丸め誤差）ここでクリップしておくと安心
-                    if (d < 0.0) d = 0.0;
-                    p = std::exp(-d);             // 最良 ~ 1.0、他は <= 1.0
-                }
-                // z→x の座標戻し：gx = g_z / a
-                int gx = DIVGF[g][a];             // a は非零であること（要assert）
-                CNtoVNxxx[base + t][gx] = p;
+                cost_out_z[g] = dense[ ADDGF[synd][g] ];
             }
 
-            // 4) 出力ベクトルの消毒＋正規化（sum==0 フォールバック付き）
+            double best = std::numeric_limits<double>::infinity();
+            for (int g = 0; g < GF; ++g) {
+                double c = cost_out_z[g];
+                if (std::isfinite(c) && c < best) {
+                    best = c;
+                }
+            }
+
+            std::fill(dest.begin(), dest.end(), 0.0);
+            if (std::isfinite(best)) {
+                const int a = MatValue[m][t];
+                for (int g = 0; g < GF; ++g) {
+                    double c = cost_out_z[g];
+                    double prob = 0.0;
+                    if (std::isfinite(c)) {
+                        double delta = c - best;
+                        if (delta < 0.0) delta = 0.0;
+                        prob = std::exp(-delta);
+                    }
+                    int gx = DIVGF[g][a];
+                    dest[gx] = prob;
+                }
+            }
+
             double sum = 0.0;
-            for (int g = 0; g < GF; ++g) {
-                double &x = CNtoVNxxx[base + t][g];
-                if (!std::isfinite(x) || x < 0.0) x = 0.0;  // NaN/Inf/負は 0 へ
-                sum += x;
+            for (double &v : dest) {
+                if (!std::isfinite(v) || v < 0.0) {
+                    v = 0.0;
+                }
+                sum += v;
             }
+
             if (sum == 0.0) {
-                // 完全ゼロ崩壊時は一様分布でリカバリ
-                double u = 1.0 / static_cast<double>(GF);
-                for (int g = 0; g < GF; ++g) CNtoVNxxx[base + t][g] = u;
+                double uniform = 1.0 / static_cast<double>(GF);
+                std::fill(dest.begin(), dest.end(), uniform);
             } else {
                 double inv = 1.0 / sum;
-                for (int g = 0; g < GF; ++g) CNtoVNxxx[base + t][g] *= inv;
+                for (double &v : dest) {
+                    v *= inv;
+                }
             }
 
-            // 数値安定：負値クリップ（念のため）＆正規化
-            for(int g=0; g<GF; g++)
-                CNtoVNxxx[base+t][g] = std::max(CNtoVNxxx[base+t][g], 0.0);
-            // double _sum=0;for(size_t i=0;i<GF;i++){_sum+=CNtoVNxxx[base+t][i];}
-            // printf("CheckPass_EMS sum=%f\n", sum);
-            // for (size_t i=0;i<GF;i++){
-            //   printf(" %e", CNtoVNxxx[base+t][i]);
-            // }
-            // printf("\n");
-            
-            
-            normalize(CNtoVNxxx[base+t], GF);
+            for (int g = 0; g < GF; ++g) {
+                CNtoVNxxx[base + t][g] = dest[g];
+            }
+
+            normalize(CNtoVNxxx[base + t], GF);
         }
     }
 }
