@@ -18,7 +18,7 @@ std::vector<std::vector<int>> DIVGF;
 
 namespace {
 
-constexpr int kGF = 4;
+constexpr int kGF = 8;
 constexpr int kNumVars = 16;
 constexpr int kRowWeight = 4;
 // 行インデックス m ごとに、接続される変数ノードの列インデックスを列挙した
@@ -35,54 +35,59 @@ constexpr std::array<std::array<int, kRowWeight>, 8> kCheckVars = {{
     {{3, 7, 11, 15}},   // チェック 7: 列方向に v3, v7, v11, v15 を束縛
 }};
 
-// 各チェック行で用いる係数 a_{m,t} を格納した行列。GF(4) の非零要素を
+// 各チェック行で用いる係数 a_{m,t} を格納した行列。GF(8) の非零要素を
 // バランスよく配置し、係数が 1 のみにならないようにしてある。
 constexpr std::array<std::array<int, kRowWeight>, 8> kCheckCoeff = {{
-    {{1, 2, 3, 1}},     // 行 0 は 1,2,3,1 を使用
-    {{2, 3, 1, 2}},     // 行 1 は 2,3,1,2 を使用
-    {{3, 1, 2, 3}},     // 行 2 は 3,1,2,3 を使用
-    {{1, 3, 2, 1}},     // 行 3 は 1,3,2,1 を使用
-    {{2, 1, 3, 2}},     // 行 4 は 2,1,3,2 を使用
-    {{3, 2, 1, 3}},     // 行 5 は 3,2,1,3 を使用
-    {{1, 2, 3, 1}},     // 行 6 は 1,2,3,1 を使用
-    {{2, 3, 1, 2}},     // 行 7 は 2,3,1,2 を使用
+    {{1, 2, 3, 4}},     // 行 0 は 1,2,3,4 を使用
+    {{5, 6, 7, 1}},     // 行 1 は 5,6,7,1 を使用
+    {{2, 4, 6, 7}},     // 行 2 は 2,4,6,7 を使用
+    {{3, 5, 1, 2}},     // 行 3 は 3,5,1,2 を使用
+    {{4, 7, 2, 5}},     // 行 4 は 4,7,2,5 を使用
+    {{6, 1, 3, 7}},     // 行 5 は 6,1,3,7 を使用
+    {{7, 3, 5, 6}},     // 行 6 は 7,3,5,6 を使用
+    {{1, 4, 6, 2}},     // 行 7 は 1,4,6,2 を使用
 }};
 
-// Walsh–Hadamard 変換の隣接ペアを列挙したテーブル (data/Tables/TENSORFFT4
-// の埋め込み版)。CheckPass_FFT の呼び出し時に使用する。
-constexpr std::array<std::array<int, 2>, 4> kTensorFFT4 = {{
-    {{0, 1}},
-    {{2, 3}},
-    {{0, 2}},
-    {{1, 3}},
-}};
+// Walsh–Hadamard 変換のバタフライペアを段ごとに列挙したテーブルを
+// 構築する。GF が 2 の累乗であることを利用し、汎用のスケジュールを
+// 生成する。
 
-void init_gf4_tables() {
-    // 既知の GF(4) 加法表を静的配列として保持。ADDGF[a][b] が a+b を返す。
+void init_gf8_tables() {
+    // GF(8) では加算がビットごとの XOR、乗算は原始多項式 x^3 + x + 1
+    // (=0b1011) を法とした多項式乗算になる。静的テーブルを埋め込む。
     static const int kAdd[kGF][kGF] = {
-        {0, 1, 2, 3},
-        {1, 0, 3, 2},
-        {2, 3, 0, 1},
-        {3, 2, 1, 0},
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {1, 0, 3, 2, 5, 4, 7, 6},
+        {2, 3, 0, 1, 6, 7, 4, 5},
+        {3, 2, 1, 0, 7, 6, 5, 4},
+        {4, 5, 6, 7, 0, 1, 2, 3},
+        {5, 4, 7, 6, 1, 0, 3, 2},
+        {6, 7, 4, 5, 2, 3, 0, 1},
+        {7, 6, 5, 4, 3, 2, 1, 0},
     };
 
-    // 既知の GF(4) 乗法表。MULGF[a][b] が a×b を返す。
     static const int kMul[kGF][kGF] = {
-        {0, 0, 0, 0},
-        {0, 1, 2, 3},
-        {0, 2, 3, 1},
-        {0, 3, 1, 2},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {0, 2, 4, 6, 3, 1, 7, 5},
+        {0, 3, 6, 5, 7, 4, 1, 2},
+        {0, 4, 3, 7, 6, 2, 5, 1},
+        {0, 5, 1, 4, 2, 7, 3, 6},
+        {0, 6, 7, 1, 5, 3, 2, 4},
+        {0, 7, 5, 2, 1, 6, 4, 3},
     };
 
-    // 既知の GF(4) 除法表。DIVGF[a][b] が a/b を返す（b=0 は未定義）。
     static const int kDiv[kGF][kGF] = {
-        {-1, 0, 0, 0},
-        {-1, 1, 3, 2},
-        {-1, 2, 1, 3},
-        {-1, 3, 2, 1},
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        {-1, 1, 5, 6, 7, 2, 3, 4},
+        {-1, 2, 1, 7, 5, 4, 6, 3},
+        {-1, 3, 4, 1, 2, 6, 5, 7},
+        {-1, 4, 2, 5, 1, 3, 7, 6},
+        {-1, 5, 7, 3, 6, 1, 4, 2},
+        {-1, 6, 3, 2, 4, 7, 1, 5},
+        {-1, 7, 6, 4, 3, 5, 2, 1},
     };
 
-    // グローバルテーブルにコピーして、CheckPass_EMS が直接参照できるようにする。
     ADDGF.assign(kGF, std::vector<int>(kGF));
     MULGF.assign(kGF, std::vector<int>(kGF));
     DIVGF.assign(kGF, std::vector<int>(kGF));
@@ -138,24 +143,32 @@ std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
 }
 
 std::vector<std::vector<int>> make_fft_schedule() {
-    std::vector<std::vector<int>> schedule(kTensorFFT4.size(),
-                                           std::vector<int>(2));
-    for (std::size_t i = 0; i < kTensorFFT4.size(); ++i) {
-        schedule[i][0] = kTensorFFT4[i][0];
-        schedule[i][1] = kTensorFFT4[i][1];
+    std::vector<std::vector<int>> schedule;
+    int stages = 0;
+    while ((1 << stages) < kGF) {
+        ++stages;
+    }
+    for (int stage = 0; stage < stages; ++stage) {
+        const int block = 1 << (stage + 1);
+        const int half = 1 << stage;
+        for (int base = 0; base < kGF; base += block) {
+            for (int offset = 0; offset < half; ++offset) {
+                schedule.push_back({base + offset, base + offset + half});
+            }
+        }
     }
     return schedule;
 }
 
-// 各変数ノードが送信したと想定する GF(4) シンボル列。2bit 語 16 個を
+// 各変数ノードが送信したと想定する GF(8) シンボル列。3bit 語 16 個を
 // 周期的に散りばめ、行方向・列方向ともに多様な参照値を持つようにする。
 constexpr std::array<int, kNumVars> kTransmittedSymbols = {{
-    0, 1, 2, 3, 1, 2, 3, 0,  // 行 0〜1 の水平制約で使われる語
-    2, 3, 0, 1, 3, 0, 1, 2   // 行 2〜3 および列制約用の語
+    0, 1, 2, 3, 4, 5, 6, 7,  // 行 0〜1 の水平制約で使われる語
+    1, 3, 5, 7, 0, 2, 4, 6   // 行 2〜3 および列制約用の語
 }};
 
 // 変数ノード 0〜15 それぞれにビット誤り率 0.1 の BSC を仮定した事前確率
-// ベクトルを生成する。2bit 語のハミング距離 d に対し、(0.9)^{2-d}(0.1)^d
+// ベクトルを生成する。bit_width ビット語のハミング距離 d に対し、(0.9)^{bit_width-d}(0.1)^d
 // を重みとして与え、全体で 1 になるよう正規化する。
 std::vector<std::vector<double>> make_soft_messages() {
     std::vector<std::vector<double>> messages(kNumVars,
@@ -303,7 +316,8 @@ void verify_extrinsic_messages(
 // 与えられたシンドローム列に対し、符号長 16・行重み 4・列重み 4 の
 // 正則行列で CheckPass_EMS を 1 回実行し、全エッジで期待値照合を行う。
 void run_length16_regular_test(const std::vector<int>& syndromes) {
-    init_gf4_tables();
+    init_gf8_tables();
+    SetCheckPassEMS_K(4);
 
     std::vector<int> RowDegree(kCheckVars.size(), kRowWeight);
     std::vector<std::vector<int>> MatValue(kCheckVars.size(), std::vector<int>(kRowWeight, 0));
@@ -339,6 +353,7 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
 
     verify_extrinsic_messages(row_base, var_messages, VNtoCN, MatValue, TrueNoiseSynd,
                               CNtoVN, &CNtoVN_fft);
+    ResetCheckPassEMS_K();
 }
 
 // シンドロームがすべて 0 のケースでは、出力外部情報は純粋に他枝からの
@@ -347,10 +362,10 @@ void test_zero_syndrome_length16() {
     run_length16_regular_test(std::vector<int>(kCheckVars.size(), 0));
 }
 
-// 異なる非零シンドロームを各行に割り当て、GF(4) の足し算によるシフトが
+// 異なる非零シンドロームを各行に割り当て、GF(8) の足し算によるシフトが
 // 正しく反映されるかを確認する。
 void test_nonzero_syndrome_length16() {
-    std::vector<int> syndromes = {1, 2, 3, 1, 2, 3, 1, 2};
+    std::vector<int> syndromes = {1, 2, 3, 4, 5, 6, 7, 1};
     run_length16_regular_test(syndromes);
 }
 

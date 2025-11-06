@@ -11,6 +11,8 @@ extern std::vector<std::vector<int>> ADDGF;
 
 namespace {
 
+int g_ems_k_override = -1;
+
 static inline double safe_log(double x) {
     const double eps = 1e-300;
     return std::log(std::max(x, eps));
@@ -91,6 +93,14 @@ static void normalize_probabilities(std::vector<double>& input) {
 
 }  // namespace
 
+void SetCheckPassEMS_K(int override_k) {
+    g_ems_k_override = override_k;
+}
+
+void ResetCheckPassEMS_K() {
+    g_ems_k_override = -1;
+}
+
 void CheckPass_EMS(
   std::vector<std::vector<double>> &CNtoVNxxx,
   std::vector<std::vector<double>> &VNtoCNxxx,
@@ -102,7 +112,9 @@ void CheckPass_EMS(
   int GF,
   std::vector<int>            &TrueNoiseSynd
 ){
-    const int EMS_K = std::min(24, GF);
+    const int EMS_K = (g_ems_k_override > 0)
+                          ? std::min(g_ems_k_override, GF)
+                          : std::min(24, GF);
     const int K = std::max(1, EMS_K);
     (void)MULGF;
 
