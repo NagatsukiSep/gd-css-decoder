@@ -97,44 +97,87 @@ std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
     return bases;
 }
 
-std::vector<int> make_var_symbols() {
-    std::vector<int> symbols(kNumVars);
+std::vector<std::vector<double>> make_soft_messages() {
+    std::vector<std::vector<double>> messages(kNumVars,
+                                              std::vector<double>(kGF, 0.0));
     for (int v = 0; v < kNumVars; ++v) {
-        symbols[v] = v % kGF;
+        double total = 0.0;
+        for (int symbol = 0; symbol < kGF; ++symbol) {
+            double raw = 1.0 + static_cast<double>((v * 3 + symbol * 5) % kGF);
+            messages[v][symbol] = raw;
+            total += raw;
+        }
+        for (double& value : messages[v]) {
+            value /= total;
+        }
     }
-    return symbols;
+    return messages;
 }
 
-void assign_one_hot_messages(const std::vector<int>& row_base,
-                             const std::vector<int>& var_symbols,
-                             std::vector<std::vector<double>>& VNtoCN) {
+void assign_soft_messages(const std::vector<int>& row_base,
+                          const std::vector<std::vector<double>>& var_messages,
+                          std::vector<std::vector<double>>& VNtoCN) {
     for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
         for (int t = 0; t < kRowWeight; ++t) {
             int edge = row_base[m] + t;
-            std::fill(VNtoCN[edge].begin(), VNtoCN[edge].end(), 0.0);
             int var = kCheckVars[m][t];
-            VNtoCN[edge][var_symbols[var]] = 1.0;
+            VNtoCN[edge] = var_messages[var];
         }
     }
 }
 
+void accumulate_expected(const std::vector<int>& other_vars,
+                         int idx,
+                         int current_sum,
+                         double prob,
+                         int syndrome,
+                         const std::vector<std::vector<double>>& var_messages,
+                         std::vector<double>& expected) {
+    if (idx == static_cast<int>(other_vars.size())) {
+        int symbol = ADDGF[syndrome][current_sum];
+        expected[symbol] += prob;
+        return;
+    }
+
+    int var = other_vars[idx];
+    const auto& message = var_messages[var];
+    for (int value = 0; value < kGF; ++value) {
+        double next_prob = prob * message[value];
+        if (next_prob == 0.0) continue;
+        int next_sum = ADDGF[current_sum][value];
+        accumulate_expected(other_vars, idx + 1, next_sum, next_prob, syndrome,
+                            var_messages, expected);
+    }
+}
+
 void verify_extrinsic_messages(const std::vector<int>& row_base,
-                               const std::vector<int>& var_symbols,
+                               const std::vector<std::vector<double>>& var_messages,
                                const std::vector<int>& syndromes,
                                const std::vector<std::vector<double>>& CNtoVN) {
     for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
         for (int t = 0; t < kRowWeight; ++t) {
-            int sum_others = 0;
+            std::vector<int> other_vars;
             for (int k = 0; k < kRowWeight; ++k) {
                 if (k == t) continue;
-                int var = kCheckVars[m][k];
-                sum_others = ADDGF[sum_others][var_symbols[var]];
+                other_vars.push_back(kCheckVars[m][k]);
             }
-            int expected_symbol = ADDGF[syndromes[m]][sum_others];
+
             std::vector<double> expected(kGF, 0.0);
-            expected[expected_symbol] = 1.0;
+            accumulate_expected(other_vars, 0, 0, 1.0, syndromes[m],
+                                var_messages, expected);
+
+            double total = 0.0;
+            for (double value : expected) {
+                total += value;
+            }
+            if (total > 0.0) {
+                for (double& value : expected) {
+                    value /= total;
+                }
+            }
+
             int edge = row_base[m] + t;
-            expect_close(CNtoVN[edge], expected);
+            expect_close(CNtoVN[edge], expected, 1e-6);
         }
     }
 }
@@ -147,17 +190,17 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     std::vector<int> row_base = make_row_bases(RowDegree);
     int total_edges = row_base.back();
 
-    std::vector<int> var_symbols = make_var_symbols();
+    std::vector<std::vector<double>> var_messages = make_soft_messages();
     std::vector<std::vector<double>> VNtoCN(total_edges, std::vector<double>(kGF, 0.0));
     std::vector<std::vector<double>> CNtoVN(total_edges, std::vector<double>(kGF, 0.0));
 
-    assign_one_hot_messages(row_base, var_symbols, VNtoCN);
+    assign_soft_messages(row_base, var_messages, VNtoCN);
 
     std::vector<int> TrueNoiseSynd = syndromes;
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, static_cast<int>(kCheckVars.size()),
                   RowDegree, MULGF, DIVGF, kGF, TrueNoiseSynd);
 
-    verify_extrinsic_messages(row_base, var_symbols, TrueNoiseSynd, CNtoVN);
+    verify_extrinsic_messages(row_base, var_messages, TrueNoiseSynd, CNtoVN);
 }
 
 void test_zero_syndrome_length16() {
