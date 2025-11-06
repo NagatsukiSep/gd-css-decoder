@@ -153,6 +153,11 @@ void CheckPass_EMS(
         bool success = false;
 
         const int initial_take = std::min(K, GF);
+        // take は EMS で保持する候補数。まず initial_take 個に絞り、
+        // その支持集合だけで全てのシンボルに有限コストが割り当てられる
+        // （= 制約を満たす組み合わせが一通り揃う）かを確認する。
+        // 足りない場合は take を 1 ずつ増やして支持集合を広げ、
+        // どのシンボルにも可算なコストが行き渡るまで繰り返す。
         for (int take = initial_take; take <= GF; ++take) {
             const int actual_take = std::min(take, GF);
             for (int t = 0; t < d; ++t) {
