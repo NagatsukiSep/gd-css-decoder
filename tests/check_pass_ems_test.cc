@@ -13,22 +13,52 @@ std::vector<std::vector<int>> DIVGF;
 
 namespace {
 
-void init_gf2_tables() {
-    ADDGF.assign(2, std::vector<int>(2));
-    MULGF.assign(2, std::vector<int>(2));
-    DIVGF.assign(2, std::vector<int>(2, 0));
+void init_gf8_tables() {
+    constexpr int GF = 8;
+    static const int kAdd[GF][GF] = {
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {1, 0, 4, 7, 2, 6, 5, 3},
+        {2, 4, 0, 5, 1, 3, 7, 6},
+        {3, 7, 5, 0, 6, 2, 4, 1},
+        {4, 2, 1, 6, 0, 7, 3, 5},
+        {5, 6, 3, 2, 7, 0, 1, 4},
+        {6, 5, 7, 4, 3, 1, 0, 2},
+        {7, 3, 6, 1, 5, 4, 2, 0},
+    };
 
-    // Addition table (XOR)
-    ADDGF[0][0] = 0; ADDGF[0][1] = 1;
-    ADDGF[1][0] = 1; ADDGF[1][1] = 0;
+    static const int kMul[GF][GF] = {
+        {0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 1, 2, 3, 4, 5, 6, 7},
+        {0, 2, 3, 4, 5, 6, 7, 1},
+        {0, 3, 4, 5, 6, 7, 1, 2},
+        {0, 4, 5, 6, 7, 1, 2, 3},
+        {0, 5, 6, 7, 1, 2, 3, 4},
+        {0, 6, 7, 1, 2, 3, 4, 5},
+        {0, 7, 1, 2, 3, 4, 5, 6},
+    };
 
-    // Multiplication table
-    MULGF[0][0] = 0; MULGF[0][1] = 0;
-    MULGF[1][0] = 0; MULGF[1][1] = 1;
+    static const int kDiv[GF][GF] = {
+        {-1, 0, 0, 0, 0, 0, 0, 0},
+        {-1, 1, 7, 6, 5, 4, 3, 2},
+        {-1, 2, 1, 7, 6, 5, 4, 3},
+        {-1, 3, 2, 1, 7, 6, 5, 4},
+        {-1, 4, 3, 2, 1, 7, 6, 5},
+        {-1, 5, 4, 3, 2, 1, 7, 6},
+        {-1, 6, 5, 4, 3, 2, 1, 7},
+        {-1, 7, 6, 5, 4, 3, 2, 1},
+    };
 
-    // Division by 1 returns the value itself. Division by 0 is unused.
-    DIVGF[0][1] = 0;
-    DIVGF[1][1] = 1;
+    ADDGF.assign(GF, std::vector<int>(GF));
+    MULGF.assign(GF, std::vector<int>(GF));
+    DIVGF.assign(GF, std::vector<int>(GF));
+
+    for (int i = 0; i < GF; ++i) {
+        for (int j = 0; j < GF; ++j) {
+            ADDGF[i][j] = kAdd[i][j];
+            MULGF[i][j] = kMul[i][j];
+            DIVGF[i][j] = kDiv[i][j];
+        }
+    }
 }
 
 void expect_close(const std::vector<double>& actual,
@@ -45,50 +75,57 @@ void expect_close(const std::vector<double>& actual,
     }
 }
 
-void test_zero_syndrome_two_variable_check() {
-    init_gf2_tables();
+void test_zero_syndrome_weight_four_gf8() {
+    init_gf8_tables();
 
-    const int GF = 2;
+    constexpr int GF = 8;
     std::vector<std::vector<double>> VNtoCN = {
-        {0.8, 0.2},
-        {0.3, 0.7}
+        {0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},  // x0 = 1
+        {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0},  // x1 = 2
+        {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0},  // x2 = 3
+        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0},  // x3 = 6
     };
-    std::vector<std::vector<double>> CNtoVN(2, std::vector<double>(GF, 0.0));
-    std::vector<std::vector<int>> MatValue = {{1, 1}};
-    std::vector<int> RowDegree = {2};
+    std::vector<std::vector<double>> CNtoVN(4, std::vector<double>(GF, 0.0));
+    std::vector<std::vector<int>> MatValue = {{1, 1, 1, 1}};
+    std::vector<int> RowDegree = {4};
     std::vector<int> TrueNoiseSynd = {0};
 
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, 1, RowDegree, MULGF, DIVGF, GF, TrueNoiseSynd);
 
-    expect_close(CNtoVN[0], std::vector<double>{0.3, 0.7});
-    expect_close(CNtoVN[1], std::vector<double>{0.8, 0.2});
+    expect_close(CNtoVN[0], std::vector<double>{0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+    expect_close(CNtoVN[1], std::vector<double>{0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+    expect_close(CNtoVN[2], std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0});
+    expect_close(CNtoVN[3], std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0});
 }
 
-void test_nonzero_syndrome_two_variable_check() {
-    init_gf2_tables();
+void test_nonzero_syndrome_weight_four_gf8() {
+    init_gf8_tables();
 
-    const int GF = 2;
+    constexpr int GF = 8;
     std::vector<std::vector<double>> VNtoCN = {
-        {0.8, 0.2},
-        {0.3, 0.7}
+        {0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},  // x0 = 1
+        {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0},  // x1 = 2
+        {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0},  // x2 = 3
+        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0},  // x3 = 6
     };
-    std::vector<std::vector<double>> CNtoVN(2, std::vector<double>(GF, 0.0));
-    std::vector<std::vector<int>> MatValue = {{1, 1}};
-    std::vector<int> RowDegree = {2};
-    std::vector<int> TrueNoiseSynd = {1};
+    std::vector<std::vector<double>> CNtoVN(4, std::vector<double>(GF, 0.0));
+    std::vector<std::vector<int>> MatValue = {{1, 1, 1, 1}};
+    std::vector<int> RowDegree = {4};
+    std::vector<int> TrueNoiseSynd = {5};
 
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, 1, RowDegree, MULGF, DIVGF, GF, TrueNoiseSynd);
 
-    expect_close(CNtoVN[0], std::vector<double>{0.7, 0.3});
-    expect_close(CNtoVN[1], std::vector<double>{0.2, 0.8});
+    expect_close(CNtoVN[0], std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0});
+    expect_close(CNtoVN[1], std::vector<double>{0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0});
+    expect_close(CNtoVN[2], std::vector<double>{0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+    expect_close(CNtoVN[3], std::vector<double>{0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
 }
 
 }  // namespace
 
 int main() {
-    test_zero_syndrome_two_variable_check();
-    test_nonzero_syndrome_two_variable_check();
+    test_zero_syndrome_weight_four_gf8();
+    test_nonzero_syndrome_weight_four_gf8();
     std::cout << "All CheckPass_EMS tests passed." << std::endl;
     return 0;
 }
-
