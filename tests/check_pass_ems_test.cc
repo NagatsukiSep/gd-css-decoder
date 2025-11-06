@@ -122,17 +122,41 @@ std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
     return bases;
 }
 
-// 変数ノード 0〜15 それぞれに滑らかな事前確率ベクトルを生成する。
-// 固定の疑似乱数式でバラつきを与え、全体を正規化して確率化する。
+// 各変数ノードが送信したと想定する GF(8) シンボル列。3bit 語 16 個を
+// 周期的に散りばめ、行方向・列方向ともに多様な参照値を持つようにする。
+constexpr std::array<int, kNumVars> kTransmittedSymbols = {{
+    0, 1, 2, 3, 4, 5, 6, 7,  // 行 0〜1 の水平制約で使われる語
+    1, 3, 5, 7, 0, 2, 4, 6   // 行 2〜3 および列制約用の語
+}};
+
+// 変数ノード 0〜15 それぞれにビット誤り率 0.1 の BSC を仮定した事前確率
+// ベクトルを生成する。3bit 語のハミング距離 d に対し、(0.9)^{3-d}(0.1)^d
+// を重みとして与え、全体で 1 になるよう正規化する。
 std::vector<std::vector<double>> make_soft_messages() {
     std::vector<std::vector<double>> messages(kNumVars,
                                               std::vector<double>(kGF, 0.0));
+    constexpr double kBitError = 0.1;
+    const double prob_table[4] = {
+        std::pow(1.0 - kBitError, 3),
+        std::pow(1.0 - kBitError, 2) * kBitError,
+        (1.0 - kBitError) * std::pow(kBitError, 2),
+        std::pow(kBitError, 3),
+    };
+
     for (int v = 0; v < kNumVars; ++v) {
+        const int transmitted = kTransmittedSymbols[v];
         double total = 0.0;
         for (int symbol = 0; symbol < kGF; ++symbol) {
-            double raw = 1.0 + static_cast<double>((v * 3 + symbol * 5) % kGF);
-            messages[v][symbol] = raw;
-            total += raw;
+            int diff = transmitted ^ symbol;
+            int distance = 0;
+            for (int bit = 0; bit < 3; ++bit) {
+                if (diff & (1 << bit)) {
+                    ++distance;
+                }
+            }
+            double prob = prob_table[distance];
+            messages[v][symbol] = prob;
+            total += prob;
         }
         for (double& value : messages[v]) {
             value /= total;
