@@ -5,7 +5,6 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <unordered_map>
 
 extern std::vector<std::vector<int>> ADDGF;
 
@@ -32,27 +31,41 @@ static std::vector<std::pair<int, double>> ems_convolve_topk(
     const std::vector<std::pair<int, double>>& A,
     const std::vector<std::pair<int, double>>& B,
     int limit,
-    int GF) {
+    int GF,
+    std::vector<double>& accum,
+    std::vector<int>& touched) {
     const int aN = static_cast<int>(std::min(A.size(), static_cast<std::size_t>(limit)));
     const int bN = static_cast<int>(std::min(B.size(), static_cast<std::size_t>(limit)));
 
-    std::unordered_map<int, double> accum;
-    accum.reserve(static_cast<std::size_t>(aN * bN));
+    constexpr double INF = std::numeric_limits<double>::infinity();
+    if (static_cast<int>(accum.size()) != GF) {
+        accum.assign(GF, INF);
+    } else {
+        for (int idx : touched) {
+            accum[idx] = INF;
+        }
+    }
+    touched.clear();
+    touched.reserve(GF);
+
     for (int i = 0; i < aN; ++i) {
         for (int j = 0; j < bN; ++j) {
             int sym = ADDGF[A[i].first][B[j].first];
             double cost = A[i].second + B[j].second;
-            auto [it, inserted] = accum.emplace(sym, cost);
-            if (!inserted) {
-                it->second = neglog_sum_exp(it->second, cost);
+            double& slot = accum[sym];
+            if (!std::isfinite(slot)) {
+                slot = cost;
+                touched.push_back(sym);
+            } else {
+                slot = neglog_sum_exp(slot, cost);
             }
         }
     }
 
     std::vector<std::pair<int, double>> merged;
-    merged.reserve(accum.size());
-    for (auto& kv : accum) {
-        merged.emplace_back(kv.first, kv.second);
+    merged.reserve(touched.size());
+    for (int sym : touched) {
+        merged.emplace_back(sym, accum[sym]);
     }
 
     std::sort(merged.begin(), merged.end(),
@@ -126,6 +139,9 @@ void CheckPass_EMS(
     std::vector<double> dense(GF);
     std::vector<double> cost_out_z(GF);
     std::vector<double> dest(GF);
+    std::vector<double> conv_accum(GF, std::numeric_limits<double>::infinity());
+    std::vector<int> conv_touched;
+    conv_touched.reserve(GF);
 
     for (int m = 0; m < M; ++m) {
         const int d = RowDegree[m];
@@ -166,7 +182,8 @@ void CheckPass_EMS(
         }
 
         std::vector<std::vector<std::pair<int, double>>> top_lists(d);
-        std::vector<std::vector<double>> final_outputs;
+        std::vector<std::vector<double>> outputs(d, std::vector<double>(GF));
+        std::vector<std::vector<double>> final_outputs(d, std::vector<double>(GF));
         bool success = false;
 
         const int initial_take = std::min(K, GF);
@@ -190,19 +207,21 @@ void CheckPass_EMS(
             std::vector<std::vector<std::pair<int,double>>> prefix(d + 1), suffix(d + 1);
             prefix[0] = {{0, 0.0}};
             for (int t = 0; t < d; ++t) {
-                prefix[t + 1] = ems_convolve_topk(prefix[t], top_lists[t], actual_take, GF);
+                prefix[t + 1] = ems_convolve_topk(prefix[t], top_lists[t], actual_take, GF,
+                                                  conv_accum, conv_touched);
             }
             suffix[d] = {{0, 0.0}};
             for (int t = d - 1; t >= 0; --t) {
-                suffix[t] = ems_convolve_topk(top_lists[t], suffix[t + 1], actual_take, GF);
+                suffix[t] = ems_convolve_topk(top_lists[t], suffix[t + 1], actual_take, GF,
+                                              conv_accum, conv_touched);
             }
 
             bool missing_symbol = false;
-            std::vector<std::vector<double>> outputs(d, std::vector<double>(GF, 0.0));
 
             for (int t = 0; t < d; ++t) {
                 std::vector<std::pair<int,double>> excl =
-                    ems_convolve_topk(prefix[t], suffix[t + 1], actual_take, GF);
+                    ems_convolve_topk(prefix[t], suffix[t + 1], actual_take, GF,
+                                      conv_accum, conv_touched);
                 list_to_dense(excl, dense);
 
                 bool edge_missing = false;
@@ -274,14 +293,19 @@ void CheckPass_EMS(
             }
 
             if (!missing_symbol) {
-                final_outputs = std::move(outputs);
+                for (int t = 0; t < d; ++t) {
+                    final_outputs[t] = outputs[t];
+                }
                 success = true;
                 break;
             }
         }
 
         if (!success) {
-            final_outputs.assign(d, std::vector<double>(GF, 1.0 / static_cast<double>(GF)));
+            for (int t = 0; t < d; ++t) {
+                double uniform = 1.0 / static_cast<double>(GF);
+                std::fill(final_outputs[t].begin(), final_outputs[t].end(), uniform);
+            }
         }
 
         for (int t = 0; t < d; ++t) {
