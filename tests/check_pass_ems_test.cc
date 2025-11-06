@@ -356,6 +356,55 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     ResetCheckPassEMS_K();
 }
 
+// 行重み 1 のチェック式 a * x = syndrome の場合、EMS は唯一の解
+// x = synd/a にデルタ分布を返すべき。ここでは係数 a=5、シンドローム 3
+// のケースを検証する。
+void test_degree1_singleton_constraint() {
+    init_gf8_tables();
+    SetCheckPassEMS_K(2);
+
+    std::vector<int> RowDegree = {1};
+    std::vector<std::vector<int>> MatValue = {{5}};
+    std::vector<std::vector<double>> VNtoCN(1, std::vector<double>(kGF, 0.0));
+    // 入力 APP は任意の分布でよいが、正規化済みの柔らかい確率を与えておく。
+    VNtoCN[0] = {0.05, 0.10, 0.15, 0.20, 0.10, 0.15, 0.15, 0.10};
+
+    std::vector<std::vector<double>> CNtoVN(1, std::vector<double>(kGF, 0.0));
+    std::vector<int> TrueNoiseSynd = {3};
+
+    CheckPass_EMS(CNtoVN, VNtoCN, MatValue, 1, RowDegree, MULGF, DIVGF, kGF,
+                  TrueNoiseSynd);
+
+    int solution = DIVGF[TrueNoiseSynd[0]][MatValue[0][0]];
+    std::vector<double> expected(kGF, 0.0);
+    expected[solution] = 1.0;
+
+    expect_close(CNtoVN[0], expected, 1e-12);
+    ResetCheckPassEMS_K();
+}
+
+// 係数 a が 0 の行重み 1 チェックでは制約が存在せず、EMS 出力は一様分布に
+// 退化することを確認する。
+void test_degree1_zero_coefficient() {
+    init_gf8_tables();
+    SetCheckPassEMS_K(2);
+
+    std::vector<int> RowDegree = {1};
+    std::vector<std::vector<int>> MatValue = {{0}};
+    std::vector<std::vector<double>> VNtoCN(1, std::vector<double>(kGF, 0.0));
+    VNtoCN[0] = {0.05, 0.05, 0.10, 0.10, 0.10, 0.20, 0.20, 0.20};
+
+    std::vector<std::vector<double>> CNtoVN(1, std::vector<double>(kGF, 0.0));
+    std::vector<int> TrueNoiseSynd = {0};
+
+    CheckPass_EMS(CNtoVN, VNtoCN, MatValue, 1, RowDegree, MULGF, DIVGF, kGF,
+                  TrueNoiseSynd);
+
+    std::vector<double> expected(kGF, 1.0 / static_cast<double>(kGF));
+    expect_close(CNtoVN[0], expected, 1e-12);
+    ResetCheckPassEMS_K();
+}
+
 // シンドロームがすべて 0 のケースでは、出力外部情報は純粋に他枝からの
 // 合成結果になるはず。全行に対して run_length16_regular_test を適用する。
 void test_zero_syndrome_length16() {
@@ -372,6 +421,8 @@ void test_nonzero_syndrome_length16() {
 }  // namespace
 
 int main() {
+    test_degree1_singleton_constraint();
+    test_degree1_zero_coefficient();
     // ゼロシンドローム・非ゼロシンドロームの 2 ケースを順に実行。
     test_zero_syndrome_length16();
     test_nonzero_syndrome_length16();

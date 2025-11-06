@@ -134,6 +134,23 @@ void CheckPass_EMS(
         const int base = rowBase[m];
         const int synd = TrueNoiseSynd[m];
 
+        if (d == 1) {
+            const int a = MatValue[m][0];
+            std::fill(dest.begin(), dest.end(), 0.0);
+            if (a == 0) {
+                double uniform = 1.0 / static_cast<double>(GF);
+                std::fill(dest.begin(), dest.end(), uniform);
+            } else {
+                int sol = DIVGF[synd][a];
+                dest[sol] = 1.0;
+            }
+            for (int g = 0; g < GF; ++g) {
+                CNtoVNxxx[base][g] = dest[g];
+            }
+            normalize_probabilities(CNtoVNxxx[base]);
+            continue;
+        }
+
         std::vector<std::vector<double>> costs(d, std::vector<double>(GF));
         std::vector<std::vector<int>> orders(d, std::vector<int>(GF));
         for (int t = 0; t < d; ++t) {
@@ -189,10 +206,20 @@ void CheckPass_EMS(
                 list_to_dense(excl, dense);
 
                 bool edge_missing = false;
+                bool any_finite = false;
+                bool truncated = false;
                 for (int g = 0; g < GF; ++g) {
                     double value = dense[ADDGF[synd][g]];
                     cost_out_z[g] = value;
-                    if (!std::isfinite(value)) {
+                    if (std::isfinite(value)) {
+                        any_finite = true;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                if (!any_finite || truncated) {
+                    edge_missing = truncated && d > 1;
+                    if (!any_finite) {
                         edge_missing = true;
                     }
                 }
