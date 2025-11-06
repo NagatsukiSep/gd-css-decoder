@@ -29,9 +29,10 @@ static double neglog_sum_exp(double a, double b) {
 static std::vector<std::pair<int, double>> ems_convolve_topk(
     const std::vector<std::pair<int, double>>& A,
     const std::vector<std::pair<int, double>>& B,
-    int K) {
-    const int aN = static_cast<int>(std::min(A.size(), static_cast<std::size_t>(K)));
-    const int bN = static_cast<int>(std::min(B.size(), static_cast<std::size_t>(K)));
+    int limit,
+    int GF) {
+    const int aN = static_cast<int>(std::min(A.size(), static_cast<std::size_t>(limit)));
+    const int bN = static_cast<int>(std::min(B.size(), static_cast<std::size_t>(limit)));
 
     std::unordered_map<int, double> accum;
     accum.reserve(static_cast<std::size_t>(aN * bN));
@@ -54,8 +55,9 @@ static std::vector<std::pair<int, double>> ems_convolve_topk(
 
     std::sort(merged.begin(), merged.end(),
               [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-    if (static_cast<int>(merged.size()) > K) {
-        merged.resize(K);
+    const int keep = std::min(limit, GF);
+    if (static_cast<int>(merged.size()) > keep) {
+        merged.resize(keep);
     }
     return merged;
 }
@@ -120,93 +122,128 @@ void CheckPass_EMS(
         const int base = rowBase[m];
         const int synd = TrueNoiseSynd[m];
 
-        std::vector<std::vector<std::pair<int,double>>> top_lists(d);
-        std::vector<double> cost(GF);
-
+        std::vector<std::vector<double>> costs(d, std::vector<double>(GF));
+        std::vector<std::vector<int>> orders(d, std::vector<int>(GF));
         for (int t = 0; t < d; ++t) {
             const int a = MatValue[m][t];
             for (int g = 0; g < GF; ++g) {
                 double p = VNtoCNxxx[base + t][DIVGF[g][a]];
-                cost[g] = -safe_log(p);
+                costs[t][g] = -safe_log(p);
             }
-
-            std::vector<int> order(GF);
+            auto& order = orders[t];
             std::iota(order.begin(), order.end(), 0);
-            const int take = std::min(K, GF);
-            std::partial_sort(order.begin(), order.begin() + take, order.end(),
-                              [&](int lhs, int rhs){ return cost[lhs] < cost[rhs]; });
-            order.resize(take);
-
-            auto &bucket = top_lists[t];
-            bucket.reserve(order.size());
-            for (int idx : order) {
-                bucket.emplace_back(idx, cost[idx]);
-            }
+            std::sort(order.begin(), order.end(),
+                      [&](int lhs, int rhs) { return costs[t][lhs] < costs[t][rhs]; });
         }
 
-        std::vector<std::vector<std::pair<int,double>>> prefix(d + 1), suffix(d + 1);
-        prefix[0] = {{0, 0.0}};
-        for (int t = 0; t < d; ++t) {
-            prefix[t + 1] = ems_convolve_topk(prefix[t], top_lists[t], K);
-        }
-        suffix[d] = {{0, 0.0}};
-        for (int t = d - 1; t >= 0; --t) {
-            suffix[t] = ems_convolve_topk(top_lists[t], suffix[t + 1], K);
-        }
+        std::vector<std::vector<std::pair<int, double>>> top_lists(d);
+        std::vector<std::vector<double>> final_outputs;
+        bool success = false;
 
-        for (int t = 0; t < d; ++t) {
-            std::vector<std::pair<int,double>> excl = ems_convolve_topk(prefix[t], suffix[t + 1], K);
-            list_to_dense(excl, dense);
-            for (int g = 0; g < GF; ++g) {
-                cost_out_z[g] = dense[ADDGF[synd][g]];
-            }
-
-            double best = std::numeric_limits<double>::infinity();
-            for (int g = 0; g < GF; ++g) {
-                double c = cost_out_z[g];
-                if (std::isfinite(c) && c < best) {
-                    best = c;
+        const int initial_take = std::min(K, GF);
+        for (int take = initial_take; take <= GF; ++take) {
+            const int actual_take = std::min(take, GF);
+            for (int t = 0; t < d; ++t) {
+                auto& bucket = top_lists[t];
+                bucket.clear();
+                bucket.reserve(actual_take);
+                for (int i = 0; i < actual_take; ++i) {
+                    int sym = orders[t][i];
+                    bucket.emplace_back(sym, costs[t][sym]);
                 }
             }
 
-            std::fill(dest.begin(), dest.end(), 0.0);
-            if (std::isfinite(best)) {
-                const int a = MatValue[m][t];
+            std::vector<std::vector<std::pair<int,double>>> prefix(d + 1), suffix(d + 1);
+            prefix[0] = {{0, 0.0}};
+            for (int t = 0; t < d; ++t) {
+                prefix[t + 1] = ems_convolve_topk(prefix[t], top_lists[t], actual_take, GF);
+            }
+            suffix[d] = {{0, 0.0}};
+            for (int t = d - 1; t >= 0; --t) {
+                suffix[t] = ems_convolve_topk(top_lists[t], suffix[t + 1], actual_take, GF);
+            }
+
+            bool missing_symbol = false;
+            std::vector<std::vector<double>> outputs(d, std::vector<double>(GF, 0.0));
+
+            for (int t = 0; t < d; ++t) {
+                std::vector<std::pair<int,double>> excl =
+                    ems_convolve_topk(prefix[t], suffix[t + 1], actual_take, GF);
+                list_to_dense(excl, dense);
+
+                bool edge_missing = false;
+                for (int g = 0; g < GF; ++g) {
+                    double value = dense[ADDGF[synd][g]];
+                    cost_out_z[g] = value;
+                    if (!std::isfinite(value)) {
+                        edge_missing = true;
+                    }
+                }
+                if (edge_missing) {
+                    missing_symbol = true;
+                    break;
+                }
+
+                double best = std::numeric_limits<double>::infinity();
                 for (int g = 0; g < GF; ++g) {
                     double c = cost_out_z[g];
-                    double prob = 0.0;
-                    if (std::isfinite(c)) {
-                        double delta = c - best;
-                        if (delta < 0.0) delta = 0.0;
-                        prob = std::exp(-delta);
+                    if (std::isfinite(c) && c < best) {
+                        best = c;
                     }
-                    int gx = DIVGF[g][a];
-                    dest[gx] = prob;
                 }
-            }
 
-            double sum = 0.0;
-            for (double &v : dest) {
-                if (!std::isfinite(v) || v < 0.0) {
-                    v = 0.0;
+                std::fill(dest.begin(), dest.end(), 0.0);
+                if (std::isfinite(best)) {
+                    const int a = MatValue[m][t];
+                    for (int g = 0; g < GF; ++g) {
+                        double c = cost_out_z[g];
+                        double prob = 0.0;
+                        if (std::isfinite(c)) {
+                            double delta = c - best;
+                            if (delta < 0.0) delta = 0.0;
+                            prob = std::exp(-delta);
+                        }
+                        int gx = DIVGF[g][a];
+                        dest[gx] = prob;
+                    }
                 }
-                sum += v;
-            }
 
-            if (sum == 0.0) {
-                double uniform = 1.0 / static_cast<double>(GF);
-                std::fill(dest.begin(), dest.end(), uniform);
-            } else {
-                double inv = 1.0 / sum;
+                double sum = 0.0;
                 for (double &v : dest) {
-                    v *= inv;
+                    if (!std::isfinite(v) || v < 0.0) {
+                        v = 0.0;
+                    }
+                    sum += v;
                 }
+
+                if (sum == 0.0) {
+                    double uniform = 1.0 / static_cast<double>(GF);
+                    std::fill(dest.begin(), dest.end(), uniform);
+                } else {
+                    double inv = 1.0 / sum;
+                    for (double &v : dest) {
+                        v *= inv;
+                    }
+                }
+
+                outputs[t] = dest;
             }
 
+            if (!missing_symbol) {
+                final_outputs = std::move(outputs);
+                success = true;
+                break;
+            }
+        }
+
+        if (!success) {
+            final_outputs.assign(d, std::vector<double>(GF, 1.0 / static_cast<double>(GF)));
+        }
+
+        for (int t = 0; t < d; ++t) {
             for (int g = 0; g < GF; ++g) {
-                CNtoVNxxx[base + t][g] = dest[g];
+                CNtoVNxxx[base + t][g] = final_outputs[t][g];
             }
-
             normalize_probabilities(CNtoVNxxx[base + t]);
         }
     }
