@@ -2,7 +2,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -112,6 +114,21 @@ void expect_close(const std::vector<double>& actual,
     }
 }
 
+// 確率ベクトルを「[シンボル:確率, ...]」形式で整形して出力する。
+std::string format_distribution(const std::vector<double>& dist) {
+    std::ostringstream oss;
+    oss << "[";
+    oss << std::fixed << std::setprecision(6);
+    for (std::size_t i = 0; i < dist.size(); ++i) {
+        if (i != 0) {
+            oss << ", ";
+        }
+        oss << i << ":" << dist[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
 // 各行の開始オフセット（row_base）を構築する。行 m のエッジが
 // CN メッセージ配列内のどこから始まるかを表す累積和。
 std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
@@ -214,10 +231,13 @@ void accumulate_expected(const std::vector<std::pair<int, int>>& other_terms,
 // トータル確率で正規化したのち expect_close で比較する。
 void verify_extrinsic_messages(const std::vector<int>& row_base,
                                const std::vector<std::vector<double>>& var_messages,
+                               const std::vector<std::vector<double>>& VNtoCN,
                                const std::vector<std::vector<int>>& MatValue,
                                const std::vector<int>& syndromes,
                                const std::vector<std::vector<double>>& CNtoVN) {
     for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
+        std::cout << "Check " << m << " update (syndrome " << syndromes[m]
+                  << ")" << std::endl;
         for (int t = 0; t < kRowWeight; ++t) {
             std::vector<std::pair<int, int>> other_terms;
             for (int k = 0; k < kRowWeight; ++k) {
@@ -249,8 +269,19 @@ void verify_extrinsic_messages(const std::vector<int>& row_base,
             }
 
             int edge = row_base[m] + t;
+            int var = kCheckVars[m][t];
+            std::cout << "  Edge to var " << var << " (coeff=" << MatValue[m][t]
+                      << ", transmitted=" << kTransmittedSymbols[var] << ")"
+                      << std::endl;
+            std::cout << "    Input  VN->CN : "
+                      << format_distribution(VNtoCN[edge]) << std::endl;
+            std::cout << "    Expect CN->VN : "
+                      << format_distribution(expected_x) << std::endl;
+            std::cout << "    Actual CN->VN : "
+                      << format_distribution(CNtoVN[edge]) << std::endl;
             expect_close(CNtoVN[edge], expected_x, 1e-6);
         }
+        std::cout << std::endl;
     }
 }
 
@@ -269,6 +300,12 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     std::vector<int> row_base = make_row_bases(RowDegree);
     int total_edges = row_base.back();
 
+    std::cout << "Running CheckPass_EMS with syndromes:";
+    for (int synd : syndromes) {
+        std::cout << ' ' << synd;
+    }
+    std::cout << std::endl;
+
     std::vector<std::vector<double>> var_messages = make_soft_messages();
     std::vector<std::vector<double>> VNtoCN(total_edges, std::vector<double>(kGF, 0.0));
     std::vector<std::vector<double>> CNtoVN(total_edges, std::vector<double>(kGF, 0.0));
@@ -279,7 +316,8 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, static_cast<int>(kCheckVars.size()),
                   RowDegree, MULGF, DIVGF, kGF, TrueNoiseSynd);
 
-    verify_extrinsic_messages(row_base, var_messages, MatValue, TrueNoiseSynd, CNtoVN);
+    verify_extrinsic_messages(row_base, var_messages, VNtoCN, MatValue, TrueNoiseSynd,
+                              CNtoVN);
 }
 
 // シンドロームがすべて 0 のケースでは、出力外部情報は純粋に他枝からの
