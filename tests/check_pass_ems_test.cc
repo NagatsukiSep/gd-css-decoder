@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "check_pass_ems.h"
+#include "check_pass_fft.h"
 
 // Global GF tables used by the EMS implementation.
 std::vector<std::vector<int>> ADDGF;
@@ -45,6 +46,23 @@ constexpr std::array<std::array<int, kRowWeight>, 8> kCheckCoeff = {{
     {{2, 5, 1, 6}},     // 行 5 は 2,5,1,6 を使用
     {{3, 6, 2, 5}},     // 行 6 は 3,6,2,5 を使用
     {{4, 7, 6, 1}},     // 行 7 は 4,7,6,1 を使用
+}};
+
+// Walsh–Hadamard 変換の隣接ペアを列挙したテーブル (data/Tables/TENSORFFT8
+// の埋め込み版)。CheckPass_FFT の呼び出し時に使用する。
+constexpr std::array<std::array<int, 2>, 12> kTensorFFT8 = {{
+    {{0, 1}},
+    {{3, 7}},
+    {{2, 4}},
+    {{5, 6}},
+    {{0, 2}},
+    {{3, 5}},
+    {{1, 4}},
+    {{7, 6}},
+    {{0, 3}},
+    {{1, 7}},
+    {{2, 5}},
+    {{4, 6}},
 }};
 
 void init_gf8_tables() {
@@ -139,6 +157,16 @@ std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
     return bases;
 }
 
+std::vector<std::vector<int>> make_fft_schedule() {
+    std::vector<std::vector<int>> schedule(kTensorFFT8.size(),
+                                           std::vector<int>(2));
+    for (std::size_t i = 0; i < kTensorFFT8.size(); ++i) {
+        schedule[i][0] = kTensorFFT8[i][0];
+        schedule[i][1] = kTensorFFT8[i][1];
+    }
+    return schedule;
+}
+
 // 各変数ノードが送信したと想定する GF(8) シンボル列。3bit 語 16 個を
 // 周期的に散りばめ、行方向・列方向ともに多様な参照値を持つようにする。
 constexpr std::array<int, kNumVars> kTransmittedSymbols = {{
@@ -229,12 +257,14 @@ void accumulate_expected(const std::vector<std::pair<int, int>>& other_terms,
 // 1 行ずつ、EMS 出力 CN→VN が解析解 expected と一致しているかを検証する。
 // 各エッジで「自分以外の変数」を列挙して accumulate_expected を呼び出し、
 // トータル確率で正規化したのち expect_close で比較する。
-void verify_extrinsic_messages(const std::vector<int>& row_base,
-                               const std::vector<std::vector<double>>& var_messages,
-                               const std::vector<std::vector<double>>& VNtoCN,
-                               const std::vector<std::vector<int>>& MatValue,
-                               const std::vector<int>& syndromes,
-                               const std::vector<std::vector<double>>& CNtoVN) {
+void verify_extrinsic_messages(
+    const std::vector<int>& row_base,
+    const std::vector<std::vector<double>>& var_messages,
+    const std::vector<std::vector<double>>& VNtoCN,
+    const std::vector<std::vector<int>>& MatValue,
+    const std::vector<int>& syndromes,
+    const std::vector<std::vector<double>>& CNtoVN,
+    const std::vector<std::vector<double>>* CNtoVN_fft) {
     for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
         std::cout << "Check " << m << " update (syndrome " << syndromes[m]
                   << ")" << std::endl;
@@ -279,6 +309,12 @@ void verify_extrinsic_messages(const std::vector<int>& row_base,
                       << format_distribution(expected_x) << std::endl;
             std::cout << "    Actual CN->VN : "
                       << format_distribution(CNtoVN[edge]) << std::endl;
+            if (CNtoVN_fft) {
+                std::cout << "    FFT    CN->VN : "
+                          << format_distribution((*CNtoVN_fft)[edge])
+                          << std::endl;
+                expect_close((*CNtoVN_fft)[edge], expected_x, 1e-6);
+            }
             expect_close(CNtoVN[edge], expected_x, 1e-6);
         }
         std::cout << std::endl;
@@ -309,6 +345,7 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     std::vector<std::vector<double>> var_messages = make_soft_messages();
     std::vector<std::vector<double>> VNtoCN(total_edges, std::vector<double>(kGF, 0.0));
     std::vector<std::vector<double>> CNtoVN(total_edges, std::vector<double>(kGF, 0.0));
+    std::vector<std::vector<double>> CNtoVN_fft(total_edges, std::vector<double>(kGF, 0.0));
 
     assign_soft_messages(row_base, var_messages, VNtoCN);
 
@@ -316,8 +353,13 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, static_cast<int>(kCheckVars.size()),
                   RowDegree, MULGF, DIVGF, kGF, TrueNoiseSynd);
 
+    auto fft_schedule = make_fft_schedule();
+    std::vector<std::vector<double>> VNtoCN_fft = VNtoCN;
+    CheckPass_FFT(CNtoVN_fft, VNtoCN_fft, MatValue, static_cast<int>(kCheckVars.size()),
+                  RowDegree, MULGF, DIVGF, fft_schedule, kGF, TrueNoiseSynd);
+
     verify_extrinsic_messages(row_base, var_messages, VNtoCN, MatValue, TrueNoiseSynd,
-                              CNtoVN);
+                              CNtoVN, &CNtoVN_fft);
 }
 
 // シンドロームがすべて 0 のケースでは、出力外部情報は純粋に他枝からの

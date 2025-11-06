@@ -20,5 +20,5 @@ for d in "$EIGEN1" "$EIGEN2" "$EIGEN3"; do
   [[ -d "$d" ]] && INC="$INC -I$d"
 done
 
-$CXX -w -std=c++23 src/gd_css_patched.cc src/check_pass_ems.cc -o gd_css -O3 -lm $INC -D_Alignof=alignof -fopenmp
+$CXX -w -std=c++23 src/gd_css_patched.cc src/check_pass_ems.cc src/check_pass_fft.cc -o gd_css -O3 -lm $INC -D_Alignof=alignof -fopenmp
 echo "✅ Build complete: ./gd_css"
