@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 #include "check_pass_ems.h"
@@ -29,6 +30,19 @@ constexpr std::array<std::array<int, kRowWeight>, 8> kCheckVars = {{
     {{1, 5, 9, 13}},    // チェック 5: 列方向に v1, v5, v9, v13 を束縛
     {{2, 6, 10, 14}},   // チェック 6: 列方向に v2, v6, v10, v14 を束縛
     {{3, 7, 11, 15}},   // チェック 7: 列方向に v3, v7, v11, v15 を束縛
+}};
+
+// 各チェック行で用いる係数 a_{m,t} を格納した行列。GF(8) の非零要素を
+// バランスよく配置し、係数が 1 のみにならないようにしてある。
+constexpr std::array<std::array<int, kRowWeight>, 8> kCheckCoeff = {{
+    {{1, 2, 3, 4}},     // 行 0 は 1,2,3,4 を使用
+    {{5, 6, 7, 1}},     // 行 1 は 5,6,7,1 を使用
+    {{2, 4, 6, 3}},     // 行 2 は 2,4,6,3 を使用
+    {{7, 5, 3, 1}},     // 行 3 は 7,5,3,1 を使用
+    {{1, 3, 5, 7}},     // 行 4 は 1,3,5,7 を使用
+    {{2, 5, 1, 6}},     // 行 5 は 2,5,1,6 を使用
+    {{3, 6, 2, 5}},     // 行 6 は 3,6,2,5 を使用
+    {{4, 7, 6, 1}},     // 行 7 は 4,7,6,1 を使用
 }};
 
 void init_gf8_tables() {
@@ -148,27 +162,26 @@ void assign_soft_messages(const std::vector<int>& row_base,
 //   prob       : その部分割り当てが成立する確率
 //   syndrome   : チェック方程式の右辺（制約値）
 //   expected   : 解析的に得られる外部情報（CN→VN）を蓄積する配列
-void accumulate_expected(const std::vector<int>& other_vars,
+void accumulate_expected(const std::vector<std::pair<int, int>>& other_terms,
                          int idx,
                          int current_sum,
                          double prob,
-                         int syndrome,
                          const std::vector<std::vector<double>>& var_messages,
-                         std::vector<double>& expected) {
-    if (idx == static_cast<int>(other_vars.size())) {
-        int symbol = ADDGF[syndrome][current_sum];
-        expected[symbol] += prob;
+                         std::vector<double>& expected_z) {
+    if (idx == static_cast<int>(other_terms.size())) {
+        expected_z[current_sum] += prob;
         return;
     }
 
-    int var = other_vars[idx];
+    const auto [var, coeff] = other_terms[idx];
     const auto& message = var_messages[var];
     for (int value = 0; value < kGF; ++value) {
         double next_prob = prob * message[value];
         if (next_prob == 0.0) continue;
-        int next_sum = ADDGF[current_sum][value];
-        accumulate_expected(other_vars, idx + 1, next_sum, next_prob, syndrome,
-                            var_messages, expected);
+        int product = MULGF[coeff][value];
+        int next_sum = ADDGF[current_sum][product];
+        accumulate_expected(other_terms, idx + 1, next_sum, next_prob,
+                            var_messages, expected_z);
     }
 }
 
@@ -177,32 +190,42 @@ void accumulate_expected(const std::vector<int>& other_vars,
 // トータル確率で正規化したのち expect_close で比較する。
 void verify_extrinsic_messages(const std::vector<int>& row_base,
                                const std::vector<std::vector<double>>& var_messages,
+                               const std::vector<std::vector<int>>& MatValue,
                                const std::vector<int>& syndromes,
                                const std::vector<std::vector<double>>& CNtoVN) {
     for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
         for (int t = 0; t < kRowWeight; ++t) {
-            std::vector<int> other_vars;
+            std::vector<std::pair<int, int>> other_terms;
             for (int k = 0; k < kRowWeight; ++k) {
                 if (k == t) continue;
-                other_vars.push_back(kCheckVars[m][k]);
+                other_terms.emplace_back(kCheckVars[m][k], MatValue[m][k]);
             }
 
-            std::vector<double> expected(kGF, 0.0);
-            accumulate_expected(other_vars, 0, 0, 1.0, syndromes[m],
-                                var_messages, expected);
+            std::vector<double> expected_z(kGF, 0.0);
+            accumulate_expected(other_terms, 0, 0, 1.0, var_messages, expected_z);
+
+            std::vector<double> expected_x(kGF, 0.0);
+            const int coeff = MatValue[m][t];
+            for (int g = 0; g < kGF; ++g) {
+                double mass = expected_z[g];
+                if (mass == 0.0) continue;
+                int z_total = ADDGF[syndromes[m]][g];
+                int x_value = DIVGF[z_total][coeff];
+                expected_x[x_value] += mass;
+            }
 
             double total = 0.0;
-            for (double value : expected) {
+            for (double value : expected_x) {
                 total += value;
             }
             if (total > 0.0) {
-                for (double& value : expected) {
+                for (double& value : expected_x) {
                     value /= total;
                 }
             }
 
             int edge = row_base[m] + t;
-            expect_close(CNtoVN[edge], expected, 1e-6);
+            expect_close(CNtoVN[edge], expected_x, 1e-6);
         }
     }
 }
@@ -213,7 +236,12 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     init_gf8_tables();
 
     std::vector<int> RowDegree(kCheckVars.size(), kRowWeight);
-    std::vector<std::vector<int>> MatValue(kCheckVars.size(), std::vector<int>(kRowWeight, 1));
+    std::vector<std::vector<int>> MatValue(kCheckVars.size(), std::vector<int>(kRowWeight, 0));
+    for (std::size_t m = 0; m < kCheckVars.size(); ++m) {
+        for (int t = 0; t < kRowWeight; ++t) {
+            MatValue[m][t] = kCheckCoeff[m][t];
+        }
+    }
     std::vector<int> row_base = make_row_bases(RowDegree);
     int total_edges = row_base.back();
 
@@ -227,7 +255,7 @@ void run_length16_regular_test(const std::vector<int>& syndromes) {
     CheckPass_EMS(CNtoVN, VNtoCN, MatValue, static_cast<int>(kCheckVars.size()),
                   RowDegree, MULGF, DIVGF, kGF, TrueNoiseSynd);
 
-    verify_extrinsic_messages(row_base, var_messages, TrueNoiseSynd, CNtoVN);
+    verify_extrinsic_messages(row_base, var_messages, MatValue, TrueNoiseSynd, CNtoVN);
 }
 
 // シンドロームがすべて 0 のケースでは、出力外部情報は純粋に他枝からの
