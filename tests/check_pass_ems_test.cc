@@ -18,7 +18,7 @@ std::vector<std::vector<int>> DIVGF;
 
 namespace {
 
-constexpr int kGF = 8;
+constexpr int kGF = 4;
 constexpr int kNumVars = 16;
 constexpr int kRowWeight = 4;
 // 行インデックス m ごとに、接続される変数ノードの列インデックスを列挙した
@@ -35,71 +35,51 @@ constexpr std::array<std::array<int, kRowWeight>, 8> kCheckVars = {{
     {{3, 7, 11, 15}},   // チェック 7: 列方向に v3, v7, v11, v15 を束縛
 }};
 
-// 各チェック行で用いる係数 a_{m,t} を格納した行列。GF(8) の非零要素を
+// 各チェック行で用いる係数 a_{m,t} を格納した行列。GF(4) の非零要素を
 // バランスよく配置し、係数が 1 のみにならないようにしてある。
 constexpr std::array<std::array<int, kRowWeight>, 8> kCheckCoeff = {{
-    {{1, 2, 3, 4}},     // 行 0 は 1,2,3,4 を使用
-    {{5, 6, 7, 1}},     // 行 1 は 5,6,7,1 を使用
-    {{2, 4, 6, 3}},     // 行 2 は 2,4,6,3 を使用
-    {{7, 5, 3, 1}},     // 行 3 は 7,5,3,1 を使用
-    {{1, 3, 5, 7}},     // 行 4 は 1,3,5,7 を使用
-    {{2, 5, 1, 6}},     // 行 5 は 2,5,1,6 を使用
-    {{3, 6, 2, 5}},     // 行 6 は 3,6,2,5 を使用
-    {{4, 7, 6, 1}},     // 行 7 は 4,7,6,1 を使用
+    {{1, 2, 3, 1}},     // 行 0 は 1,2,3,1 を使用
+    {{2, 3, 1, 2}},     // 行 1 は 2,3,1,2 を使用
+    {{3, 1, 2, 3}},     // 行 2 は 3,1,2,3 を使用
+    {{1, 3, 2, 1}},     // 行 3 は 1,3,2,1 を使用
+    {{2, 1, 3, 2}},     // 行 4 は 2,1,3,2 を使用
+    {{3, 2, 1, 3}},     // 行 5 は 3,2,1,3 を使用
+    {{1, 2, 3, 1}},     // 行 6 は 1,2,3,1 を使用
+    {{2, 3, 1, 2}},     // 行 7 は 2,3,1,2 を使用
 }};
 
-// Walsh–Hadamard 変換の隣接ペアを列挙したテーブル (data/Tables/TENSORFFT8
+// Walsh–Hadamard 変換の隣接ペアを列挙したテーブル (data/Tables/TENSORFFT4
 // の埋め込み版)。CheckPass_FFT の呼び出し時に使用する。
-constexpr std::array<std::array<int, 2>, 12> kTensorFFT8 = {{
+constexpr std::array<std::array<int, 2>, 4> kTensorFFT4 = {{
     {{0, 1}},
-    {{3, 7}},
-    {{2, 4}},
-    {{5, 6}},
+    {{2, 3}},
     {{0, 2}},
-    {{3, 5}},
-    {{1, 4}},
-    {{7, 6}},
-    {{0, 3}},
-    {{1, 7}},
-    {{2, 5}},
-    {{4, 6}},
+    {{1, 3}},
 }};
 
-void init_gf8_tables() {
-    // 既知の GF(8) 加法表を静的配列として保持。ADDGF[a][b] が a+b を返す。
+void init_gf4_tables() {
+    // 既知の GF(4) 加法表を静的配列として保持。ADDGF[a][b] が a+b を返す。
     static const int kAdd[kGF][kGF] = {
-        {0, 1, 2, 3, 4, 5, 6, 7},
-        {1, 0, 4, 7, 2, 6, 5, 3},
-        {2, 4, 0, 5, 1, 3, 7, 6},
-        {3, 7, 5, 0, 6, 2, 4, 1},
-        {4, 2, 1, 6, 0, 7, 3, 5},
-        {5, 6, 3, 2, 7, 0, 1, 4},
-        {6, 5, 7, 4, 3, 1, 0, 2},
-        {7, 3, 6, 1, 5, 4, 2, 0},
+        {0, 1, 2, 3},
+        {1, 0, 3, 2},
+        {2, 3, 0, 1},
+        {3, 2, 1, 0},
     };
 
-    // 既知の GF(8) 乗法表。MULGF[a][b] が a×b を返す。
+    // 既知の GF(4) 乗法表。MULGF[a][b] が a×b を返す。
     static const int kMul[kGF][kGF] = {
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        {0, 1, 2, 3, 4, 5, 6, 7},
-        {0, 2, 3, 4, 5, 6, 7, 1},
-        {0, 3, 4, 5, 6, 7, 1, 2},
-        {0, 4, 5, 6, 7, 1, 2, 3},
-        {0, 5, 6, 7, 1, 2, 3, 4},
-        {0, 6, 7, 1, 2, 3, 4, 5},
-        {0, 7, 1, 2, 3, 4, 5, 6},
+        {0, 0, 0, 0},
+        {0, 1, 2, 3},
+        {0, 2, 3, 1},
+        {0, 3, 1, 2},
     };
 
-    // 既知の GF(8) 除法表。DIVGF[a][b] が a/b を返す（b=0 は未定義）。
+    // 既知の GF(4) 除法表。DIVGF[a][b] が a/b を返す（b=0 は未定義）。
     static const int kDiv[kGF][kGF] = {
-        {-1, 0, 0, 0, 0, 0, 0, 0},
-        {-1, 1, 7, 6, 5, 4, 3, 2},
-        {-1, 2, 1, 7, 6, 5, 4, 3},
-        {-1, 3, 2, 1, 7, 6, 5, 4},
-        {-1, 4, 3, 2, 1, 7, 6, 5},
-        {-1, 5, 4, 3, 2, 1, 7, 6},
-        {-1, 6, 5, 4, 3, 2, 1, 7},
-        {-1, 7, 6, 5, 4, 3, 2, 1},
+        {-1, 0, 0, 0},
+        {-1, 1, 3, 2},
+        {-1, 2, 1, 3},
+        {-1, 3, 2, 1},
     };
 
     // グローバルテーブルにコピーして、CheckPass_EMS が直接参照できるようにする。
@@ -158,35 +138,33 @@ std::vector<int> make_row_bases(const std::vector<int>& row_degree) {
 }
 
 std::vector<std::vector<int>> make_fft_schedule() {
-    std::vector<std::vector<int>> schedule(kTensorFFT8.size(),
+    std::vector<std::vector<int>> schedule(kTensorFFT4.size(),
                                            std::vector<int>(2));
-    for (std::size_t i = 0; i < kTensorFFT8.size(); ++i) {
-        schedule[i][0] = kTensorFFT8[i][0];
-        schedule[i][1] = kTensorFFT8[i][1];
+    for (std::size_t i = 0; i < kTensorFFT4.size(); ++i) {
+        schedule[i][0] = kTensorFFT4[i][0];
+        schedule[i][1] = kTensorFFT4[i][1];
     }
     return schedule;
 }
 
-// 各変数ノードが送信したと想定する GF(8) シンボル列。3bit 語 16 個を
+// 各変数ノードが送信したと想定する GF(4) シンボル列。2bit 語 16 個を
 // 周期的に散りばめ、行方向・列方向ともに多様な参照値を持つようにする。
 constexpr std::array<int, kNumVars> kTransmittedSymbols = {{
-    0, 1, 2, 3, 4, 5, 6, 7,  // 行 0〜1 の水平制約で使われる語
-    1, 3, 5, 7, 0, 2, 4, 6   // 行 2〜3 および列制約用の語
+    0, 1, 2, 3, 1, 2, 3, 0,  // 行 0〜1 の水平制約で使われる語
+    2, 3, 0, 1, 3, 0, 1, 2   // 行 2〜3 および列制約用の語
 }};
 
 // 変数ノード 0〜15 それぞれにビット誤り率 0.1 の BSC を仮定した事前確率
-// ベクトルを生成する。3bit 語のハミング距離 d に対し、(0.9)^{3-d}(0.1)^d
+// ベクトルを生成する。2bit 語のハミング距離 d に対し、(0.9)^{2-d}(0.1)^d
 // を重みとして与え、全体で 1 になるよう正規化する。
 std::vector<std::vector<double>> make_soft_messages() {
     std::vector<std::vector<double>> messages(kNumVars,
                                               std::vector<double>(kGF, 0.0));
     constexpr double kBitError = 0.1;
-    const double prob_table[4] = {
-        std::pow(1.0 - kBitError, 3),
-        std::pow(1.0 - kBitError, 2) * kBitError,
-        (1.0 - kBitError) * std::pow(kBitError, 2),
-        std::pow(kBitError, 3),
-    };
+    int bit_width = 0;
+    while ((1 << bit_width) < kGF) {
+        ++bit_width;
+    }
 
     for (int v = 0; v < kNumVars; ++v) {
         const int transmitted = kTransmittedSymbols[v];
@@ -194,12 +172,13 @@ std::vector<std::vector<double>> make_soft_messages() {
         for (int symbol = 0; symbol < kGF; ++symbol) {
             int diff = transmitted ^ symbol;
             int distance = 0;
-            for (int bit = 0; bit < 3; ++bit) {
+            for (int bit = 0; bit < bit_width; ++bit) {
                 if (diff & (1 << bit)) {
                     ++distance;
                 }
             }
-            double prob = prob_table[distance];
+            double prob = std::pow(1.0 - kBitError, bit_width - distance) *
+                          std::pow(kBitError, distance);
             messages[v][symbol] = prob;
             total += prob;
         }
@@ -324,7 +303,7 @@ void verify_extrinsic_messages(
 // 与えられたシンドローム列に対し、符号長 16・行重み 4・列重み 4 の
 // 正則行列で CheckPass_EMS を 1 回実行し、全エッジで期待値照合を行う。
 void run_length16_regular_test(const std::vector<int>& syndromes) {
-    init_gf8_tables();
+    init_gf4_tables();
 
     std::vector<int> RowDegree(kCheckVars.size(), kRowWeight);
     std::vector<std::vector<int>> MatValue(kCheckVars.size(), std::vector<int>(kRowWeight, 0));
@@ -368,10 +347,10 @@ void test_zero_syndrome_length16() {
     run_length16_regular_test(std::vector<int>(kCheckVars.size(), 0));
 }
 
-// 異なる非零シンドロームを各行に割り当て、GF(8) の足し算によるシフトが
+// 異なる非零シンドロームを各行に割り当て、GF(4) の足し算によるシフトが
 // 正しく反映されるかを確認する。
 void test_nonzero_syndrome_length16() {
-    std::vector<int> syndromes = {1, 2, 3, 4, 5, 6, 7, 1};
+    std::vector<int> syndromes = {1, 2, 3, 1, 2, 3, 1, 2};
     run_length16_regular_test(syndromes);
 }
 
@@ -384,3 +363,4 @@ int main() {
     std::cout << "All CheckPass_EMS tests passed." << std::endl;
     return 0;
 }
+
