@@ -89,12 +89,23 @@ Under the hood, the script executes:
 
 ## 📊 Output
 
-During decoding, the program prints progress information such as iteration count,  
-syndrome satisfaction, and error statistics.  
+During decoding, the program prints progress information such as iteration count,
+syndrome satisfaction, and error statistics.
 Results are also written to log files in the working directory:
 
-- `LOG_*` → decoding statistics (FER/SER, iterations, etc.)  
+- `LOG_*` → decoding statistics (FER/SER, iterations, etc.)
 - `EF_LOG_*` → detailed debugging information (error-floor analysis)
+
+When the CUDA implementation of `CheckPass` is active, an additional debug line
+summarises GPU timings:
+
+- **H2D transfers** — cumulative time spent copying all inputs from host memory
+  to the GPU (CN↔VN message buffers, parity-check structure, GF tables, etc.).
+- **kernel** — time measured with CUDA events for the GPU kernel execution.
+- **D2H transfers** — cumulative time required to copy the updated message
+  buffers back from the GPU to host memory.
+- **total transfer** — `H2D + D2H`, highlighting the communication overhead
+  relative to the kernel runtime.
 
 ---
 

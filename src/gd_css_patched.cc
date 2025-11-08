@@ -682,10 +682,11 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   std::streamsize previous_precision = std::cout.precision();
   std::ios::fmtflags previous_flags = std::cout.flags();
   std::cout << std::fixed << std::setprecision(3)
-            << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
-            << " ms, kernel: " << kernel_ms
-            << " ms, D2H: " << transfer_to_host_ms
-            << " ms, total transfer: "
+            << "CheckPass CUDA timing (H2D transfers: "
+            << transfer_to_device_ms
+            << " ms [host→device inputs], kernel: " << kernel_ms
+            << " ms, D2H transfers: " << transfer_to_host_ms
+            << " ms [device→host outputs], total transfer: "
             << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
             << std::endl;
   std::cout.precision(previous_precision);
