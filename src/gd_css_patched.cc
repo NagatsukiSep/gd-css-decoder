@@ -3563,6 +3563,29 @@ int extractValueFromFilename(const std::string& filename, const std::string& pat
   }
   return value;
 }
+namespace {
+constexpr int kInitialMessagePassOnlyIterations = 50;
+}
+
+static void RunDataCheckPass(
+    vector<vector<double>>& VNtoCNxxx,
+    vector<vector<double>>& CNtoVNxxx,
+    vector<vector<double>>& VNtoChN,
+    vector<int>& Interleaver,
+    vector<int>& ColDeg,
+    int N,
+    int GF,
+    vector<vector<int>>& MatValue,
+    int M,
+    vector<int>& RowDeg,
+    vector<vector<int>>& MULGF,
+    vector<vector<int>>& DIVGF,
+    vector<vector<int>>& FFTSQ,
+    vector<int>& TrueNoiseSynd) {
+  DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
+  CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
+}
+
 // Function: DecodeIteration
 // Purpose: TODO - describe the function's responsibility succinctly.
 
@@ -3582,8 +3605,8 @@ vector<vector<int>> Mat,
 vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF,
 vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
 
-  DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
-  CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
+  RunDataCheckPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF,
+                   MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, TrueNoiseSynd);
   ComputeAPP(VNtoChN, ChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
 
   Decision(EstmNoise, UpdatedDecision, VNtoChN, N, GF);
@@ -4094,6 +4117,17 @@ int main(int argc, char * argv[]){
       // Conditional branch.
         ChannelPass(VNtoChN_CD, ChFactorMatrix_CD, ChNtoVN_CD, N, GF);
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
+    }
+
+    if (itr < kInitialMessagePassOnlyIterations) {
+      RunDataCheckPass(VNtoCNxxx_C, CNtoVNxxx_C, VNtoChN_DC, Interleaver_C,
+                       ColDeg_C, N, GF, MatValue_C, M, RowDeg_C, MULGF,
+                       DIVGF, FFTSQ, TrueNoiseSynd_C);
+      RunDataCheckPass(VNtoCNxxx_D, CNtoVNxxx_D, VNtoChN_CD, Interleaver_D,
+                       ColDeg_D, N, GF, MatValue_D, M, RowDeg_D, MULGF,
+                       DIVGF, TFFTSQ, TrueNoiseSynd_D);
+      itr++;
+      continue;
     }
 
     DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
