@@ -1,9 +1,37 @@
 # GD-CSS Decoder (Quantum Error Correction using Non-binary LDPC over GF(q))
 
-This repository provides a C++23 implementation of a **joint / degenerate decoder**  
-for CSS codes constructed from non-binary LDPC codes over GF(q).  
-It performs iterative BP decoding with cross-channel coupling (C↔D) and  
+This repository provides a C++23 implementation of a **joint / degenerate decoder**
+for CSS codes constructed from non-binary LDPC codes over GF(q).
+It performs iterative BP decoding with cross-channel coupling (C↔D) and
 supports small-error recovery heuristics based on UTCBC structures.
+
+---
+
+## 背景と目的
+
+量子誤り訂正 (Quantum Error Correction; QEC) は，量子ビットが外界との相互作用によって
+容易に劣化するという問題を克服し，大規模でフォールトトレラントな量子計算を実現する
+ために不可欠な技術です。中でも CSS 型量子 LDPC 符号は，疎な構造を活かした確率伝搬
+(Belief Propagation; BP) による反復復号が可能であり，理論・実装の両面で有望視されて
+います。
+
+近年，従来の BP 復号を拡張し，縮退性を考慮して X および Z タイプのシンドロームを
+同時に処理する *同時 BP 復号* が提案されました。この手法は非二元 LDPC-CSS 符号に
+対しハッシング限界近傍の高い性能を示し，従来の独立 BP 復号を大きく上回る復号能力
+を有します。しかし，多元有限体 GF(q) 上でのメッセージ伝搬は計算量が非常に大きく，
+CPU 実装のみでは大規模符号の高速シミュレーションが困難でした。
+
+本実装では，このボトルネックを解消するために，従来の OpenMP ベース CPU 実装に
+加えて GPU 上の並列処理を導入しています。`gd_css_patched.cc` では変数ノード→チェック
+ノード更新 (VN→CN) とチェックノード→変数ノード更新 (CheckPass) の双方に CUDA カーネル
+を実装し，共有メモリやルックアップテーブルの再利用によって GF(q) 演算を効率化しま
+した。さらに，ホスト↔デバイス間のデータ転送 (H2D / D2H) と GPU カーネル実行時間を
+分離して計測するデバッグログを備え，性能解析を容易にしています。
+
+本リポジトリを用いることで，非二元量子 LDPC 符号の大規模復号シミュレーションを
+GPU 上で実行でき，有限長性能やエラーフロア特性に関する詳細な解析が可能になります。
+公開された CUDA 対応実装が高性能量子 LDPC 復号の研究と実装技術の橋渡しになることを
+目指しています。
 
 ---
 
