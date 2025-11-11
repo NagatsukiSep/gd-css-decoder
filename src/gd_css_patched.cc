@@ -237,6 +237,7 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
   extern __shared__ double shared[];
   double* FTrue = shared;
   double* TMP = shared + GF;
+  __shared__ double reductionBuffer[256];
 
   const int tid = threadIdx.x;
   const int degree = RowDegree[row];
@@ -247,15 +248,13 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
   }
   __syncthreads();
 
-  if (tid == 0) {
-    for (int k = 0; k < pairCount; ++k) {
-      const int i = FFT0[k];
-      const int j = FFT1[k];
-      const double A = FTrue[i];
-      const double B = FTrue[j];
-      FTrue[i] = A + B;
-      FTrue[j] = A - B;
-    }
+  for (int k = tid; k < pairCount; k += blockDim.x) {
+    const int i = FFT0[k];
+    const int j = FFT1[k];
+    const double A = FTrue[i];
+    const double B = FTrue[j];
+    FTrue[i] = A + B;
+    FTrue[j] = A - B;
   }
   __syncthreads();
 
@@ -270,15 +269,13 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       edgeVec[g] = TMP[g];
     }
     __syncthreads();
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = edgeVec[i];
-        const double B = edgeVec[j];
-        edgeVec[i] = A + B;
-        edgeVec[j] = A - B;
-      }
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = edgeVec[i];
+      const double B = edgeVec[j];
+      edgeVec[i] = A + B;
+      edgeVec[j] = A - B;
     }
     __syncthreads();
   }
@@ -300,15 +297,13 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
 
   for (int t = 0; t < degree; ++t) {
     double* outVec = CNtoVNxxx + (base + t) * GF;
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = outVec[i];
-        const double B = outVec[j];
-        outVec[i] = 0.5 * (A + B);
-        outVec[j] = 0.5 * (A - B);
-      }
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = outVec[i];
+      const double B = outVec[j];
+      outVec[i] = 0.5 * (A + B);
+      outVec[j] = 0.5 * (A - B);
     }
     __syncthreads();
 
@@ -318,32 +313,38 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     }
     __syncthreads();
 
+    double local_sum = 0.0;
+    for (int g = tid; g < GF; g += blockDim.x) {
+      double v = TMP[g];
+      if (v < 0.0) {
+        v = 0.0;
+      }
+      TMP[g] = v;
+      local_sum += v;
+    }
+    reductionBuffer[tid] = local_sum;
+    __syncthreads();
+
     if (tid == 0) {
       double sum = 0.0;
-      for (int g = 0; g < GF; ++g) {
-        double v = TMP[g];
-        if (v < 0.0) {
-          v = 0.0;
-        }
-        TMP[g] = v;
-        sum += v;
+      for (int i = 0; i < blockDim.x; ++i) {
+        sum += reductionBuffer[i];
       }
-      if (sum == 0.0) {
-        const double uniform = 1.0 / static_cast<double>(GF);
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] = uniform;
-        }
-      } else {
-        const double inv = 1.0 / sum;
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] *= inv;
-        }
-      }
+      reductionBuffer[0] = sum;
     }
     __syncthreads();
 
-    for (int g = tid; g < GF; g += blockDim.x) {
-      outVec[g] = TMP[g];
+    const double total = reductionBuffer[0];
+    if (total == 0.0) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] = uniform;
+      }
+    } else {
+      const double inv = 1.0 / total;
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] = TMP[g] * inv;
+      }
     }
     __syncthreads();
   }
