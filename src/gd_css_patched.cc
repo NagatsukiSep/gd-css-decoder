@@ -316,7 +316,7 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     double local_sum = 0.0;
     for (int g = tid; g < GF; g += blockDim.x) {
       double v = TMP[g];
-      if (v < 0.0) {
+      if (!isfinite(v) || v < 0.0) {
         v = 0.0;
       }
       TMP[g] = v;
@@ -330,12 +330,16 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       for (int i = 0; i < blockDim.x; ++i) {
         sum += reductionBuffer[i];
       }
-      reductionBuffer[0] = sum;
+      if (!isfinite(sum) || sum <= 0.0) {
+        reductionBuffer[0] = 0.0;
+      } else {
+        reductionBuffer[0] = sum;
+      }
     }
     __syncthreads();
 
     const double total = reductionBuffer[0];
-    if (total == 0.0) {
+    if (total <= 0.0) {
       const double uniform = 1.0 / static_cast<double>(GF);
       for (int g = tid; g < GF; g += blockDim.x) {
         outVec[g] = uniform;
@@ -343,7 +347,11 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     } else {
       const double inv = 1.0 / total;
       for (int g = tid; g < GF; g += blockDim.x) {
-        outVec[g] = TMP[g] * inv;
+        double value = TMP[g];
+        if (!isfinite(value)) {
+          value = 0.0;
+        }
+        outVec[g] = value * inv;
       }
     }
     __syncthreads();
@@ -928,16 +936,30 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void normalize(vector<double>& input, int n){
-  double sum=0;for(size_t i=0;i<n;i++){sum+=input[i];}
-  // Conditional branch.
-  if(sum==0){
+  double sum = 0.0;
+  bool valid = true;
+  for (int i = 0; i < n; ++i) {
+    double value = input[static_cast<size_t>(i)];
+    if (!std::isfinite(value)) {
+      valid = false;
+      break;
+    }
+    sum += value;
+  }
+
+  if (!valid || !std::isfinite(sum) || sum <= 0.0) {
     cout << "divided by zero" << endl;
-    // Loop: iterate over a range/collection.
-    for(size_t i=0;i<n;i++){input[i]=1.0f/n;}
+    const double uniform = 1.0 / static_cast<double>(std::max(1, n));
+    for (int i = 0; i < n; ++i) {
+      input[static_cast<size_t>(i)] = uniform;
+    }
     return;
-  }else
-  // Loop: iterate over a range/collection.
-  for(size_t i=0;i<n;i++){input[i]/=sum;}
+  }
+
+  const double inv = 1.0 / sum;
+  for (int i = 0; i < n; ++i) {
+    input[static_cast<size_t>(i)] *= inv;
+  }
 }
 // Function: log2
 // Purpose: TODO - describe the function's responsibility succinctly.
