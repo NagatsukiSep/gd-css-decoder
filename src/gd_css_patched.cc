@@ -22,6 +22,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#ifdef USE_CUDA
+#include "checkpass_cuda.h"
+#endif
 using namespace std;
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -462,7 +465,7 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 // Function: CheckPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+void CheckPassCPU(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
     int logGF = rint(log2(GF) / log2(2));
 
     // 各行の先頭オフセットを事前計算
@@ -531,6 +534,23 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             normalize(CNtoVNxxx[base+t], GF);
         }
     }
+}
+
+void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+#ifdef USE_CUDA
+  try {
+    if (CheckPassCUDA(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDegree, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd)) {
+      return;
+    }
+  } catch (const std::exception& ex) {
+    static bool warned = false;
+    if (!warned) {
+      cerr << "[CheckPass] CUDA path disabled: " << ex.what() << endl;
+      warned = true;
+    }
+  }
+#endif
+  CheckPassCPU(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDegree, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
 }
 // Function: calcSyndrome
 // Purpose: TODO - describe the function's responsibility succinctly.
