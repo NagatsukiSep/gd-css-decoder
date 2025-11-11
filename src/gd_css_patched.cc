@@ -22,6 +22,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <limits>
+#include <sstream>
 using namespace std;
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -161,6 +163,84 @@ using LoopSet = vector<Loop>;
 using IndexList = vector<vector<int>>;
 using BitSet = unordered_set<int>;
 using NodeList = vector<int>;
+
+#ifdef USE_CUDA
+bool InitializeCudaSupport();
+bool ComputeAPP_GPU(std::vector<std::vector<double>> &APP,
+                    std::vector<std::vector<double>> &ChNtoVN,
+                    const std::vector<std::vector<double>> &CNtoVNxxx,
+                    const std::vector<std::vector<double>> &VNtoChN,
+                    const std::vector<int> &Interleaver,
+                    const std::vector<int> &ColDeg,
+                    int N, int GF);
+bool Decision_GPU(std::vector<int> &Decision,
+                  std::vector<int> &Updated_EstmNoise_History,
+                  const std::vector<std::vector<double>> &APP,
+                  int N, int GF);
+#endif  // USE_CUDA
+
+namespace {
+
+#ifdef USE_CUDA
+bool computeAppValidated = false;
+bool decisionValidated = false;
+#endif
+
+double maxAbsDiff(const std::vector<std::vector<double>> &a,
+                  const std::vector<std::vector<double>> &b) {
+  double diff = 0.0;
+  size_t rows = std::min(a.size(), b.size());
+  for (size_t i = 0; i < rows; ++i) {
+    size_t cols = std::min(a[i].size(), b[i].size());
+    for (size_t j = 0; j < cols; ++j) {
+      diff = std::max(diff, std::fabs(a[i][j] - b[i][j]));
+    }
+  }
+  return diff;
+}
+
+bool hasSameShape(const std::vector<std::vector<double>> &a,
+                  const std::vector<std::vector<double>> &b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].size() != b[i].size()) return false;
+  }
+  return true;
+}
+
+bool hasSameShape(const std::vector<int> &a, const std::vector<int> &b) {
+  return a.size() == b.size();
+}
+
+int countDifferences(const std::vector<int> &a, const std::vector<int> &b) {
+  size_t common = std::min(a.size(), b.size());
+  int diff = 0;
+  for (size_t i = 0; i < common; ++i) {
+    if (a[i] != b[i]) ++diff;
+  }
+  diff += static_cast<int>(a.size() > b.size() ? a.size() - b.size()
+                                               : b.size() - a.size());
+  return diff;
+}
+
+bool shouldUseCuda() {
+#ifdef USE_CUDA
+  static bool initialized = false;
+  static bool available = false;
+  if (!initialized) {
+    available = InitializeCudaSupport();
+    initialized = true;
+    if (!available) {
+      std::cerr << "[CUDA] Runtime not detected. Falling back to CPU implementation.\n";
+    }
+  }
+  return available;
+#else
+  return false;
+#endif
+}
+
+}  // namespace
 template <typename T>
 // Function: contains
 // Purpose: TODO - describe the function's responsibility succinctly.
@@ -323,7 +403,7 @@ int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>
 // Function: ComputeAPP
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void ComputeAPP(std::vector<std::vector<double>> &APP,
+void ComputeAPP_CPU(std::vector<std::vector<double>> &APP,
 std::vector<std::vector<double>> &ChNtoVN,
 const std::vector<std::vector<double>> &CNtoVNxxx,
 const std::vector<std::vector<double>> &VNtoChN,
@@ -366,7 +446,7 @@ std::vector<int> computeUnion(const std::vector<std::vector<int>>& Updated_EstmN
 // Function: Decision
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void Decision(std::vector<int> &Decision,
+void Decision_CPU(std::vector<int> &Decision,
 std::vector<int> &Updated_EstmNoise_History,
 const std::vector<std::vector<double>> &APP,
 int N, int GF) {
@@ -389,6 +469,117 @@ int N, int GF) {
     }
     Decision[n] = ind;
   }
+}
+
+// GPU-aware wrapper around ComputeAPP_CPU. The CUDA kernel executes the
+// independent (n,g) loops that iterate over variable nodes and GF symbols in
+// parallel when available, while preserving CPU semantics.
+void ComputeAPP(std::vector<std::vector<double>> &APP,
+                std::vector<std::vector<double>> &ChNtoVN,
+                const std::vector<std::vector<double>> &CNtoVNxxx,
+                const std::vector<std::vector<double>> &VNtoChN,
+                const std::vector<int> &Interleaver,
+                const std::vector<int> &ColDeg,
+                int N, int GF) {
+  if (static_cast<int>(APP.size()) < N)
+    APP.resize(N, std::vector<double>(GF, 0.0));
+  if (static_cast<int>(ChNtoVN.size()) < N)
+    ChNtoVN.resize(N, std::vector<double>(GF, 0.0));
+  for (int n = 0; n < N; ++n) {
+    if (static_cast<int>(APP[n].size()) != GF) APP[n].assign(GF, 0.0);
+    if (static_cast<int>(ChNtoVN[n].size()) != GF) ChNtoVN[n].assign(GF, 0.0);
+  }
+#ifdef USE_CUDA
+  if (shouldUseCuda()) {
+    bool needsValidation = !computeAppValidated;
+    std::vector<std::vector<double>> cpuAPP;
+    std::vector<std::vector<double>> cpuChNtoVN;
+    if (needsValidation) {
+      cpuAPP = APP;
+      cpuChNtoVN = ChNtoVN;
+    }
+    if (ComputeAPP_GPU(APP, ChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF)) {
+      if (needsValidation) {
+        ComputeAPP_CPU(cpuAPP, cpuChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
+        if (!hasSameShape(APP, cpuAPP) || !hasSameShape(ChNtoVN, cpuChNtoVN)) {
+          std::cerr << "[CUDA] Shape mismatch detected in ComputeAPP validation. Reverting to CPU output.\n";
+          APP = cpuAPP;
+          ChNtoVN = cpuChNtoVN;
+          return;
+        }
+        double diffAPP = maxAbsDiff(APP, cpuAPP);
+        double diffCh = maxAbsDiff(ChNtoVN, cpuChNtoVN);
+        double maxDiff = std::max(diffAPP, diffCh);
+        std::ostringstream oss;
+        oss << std::setprecision(12) << maxDiff;
+        std::cerr << "[CUDA] ComputeAPP validation max diff = " << oss.str() << "\n";
+        if (maxDiff <= 1e-9) {
+          computeAppValidated = true;
+          return;
+        }
+        std::cerr << "[CUDA] Difference exceeded tolerance. Falling back to CPU results for this call.\n";
+        APP = cpuAPP;
+        ChNtoVN = cpuChNtoVN;
+        return;
+      }
+      return;
+    } else {
+      std::cerr << "[CUDA] ComputeAPP GPU path failed. Falling back to CPU implementation.\n";
+    }
+  }
+#endif
+  ComputeAPP_CPU(APP, ChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
+}
+
+// GPU-aware wrapper around Decision_CPU. The CUDA path assigns one thread per
+// variable node to parallelize the arg-max search over GF symbols.
+void Decision(std::vector<int> &DecisionVec,
+              std::vector<int> &Updated_EstmNoise_History,
+              const std::vector<std::vector<double>> &APP,
+              int N, int GF) {
+  if (static_cast<int>(DecisionVec.size()) < N)
+    DecisionVec.resize(N, 0);
+  Updated_EstmNoise_History.clear();
+#ifdef USE_CUDA
+  if (shouldUseCuda()) {
+    bool needsValidation = !decisionValidated;
+    std::vector<int> cpuDecision;
+    std::vector<int> cpuHistory;
+    if (needsValidation) {
+      cpuDecision = DecisionVec;
+    }
+    if (Decision_GPU(DecisionVec, Updated_EstmNoise_History, APP, N, GF)) {
+      if (needsValidation) {
+        cpuHistory.clear();
+        cpuHistory.reserve(N);
+        Decision_CPU(cpuDecision, cpuHistory, APP, N, GF);
+        if (!hasSameShape(DecisionVec, cpuDecision)) {
+          std::cerr << "[CUDA] Decision size mismatch detected. Reverting to CPU output.\n";
+          DecisionVec = cpuDecision;
+          Updated_EstmNoise_History = cpuHistory;
+          return;
+        }
+        int diffCount = countDifferences(DecisionVec, cpuDecision);
+        bool historyMatch = (Updated_EstmNoise_History == cpuHistory);
+        std::cerr << "[CUDA] Decision validation diff count = " << diffCount
+                  << ", history match = " << (historyMatch ? "true" : "false")
+                  << "\n";
+        if (diffCount == 0 && historyMatch) {
+          decisionValidated = true;
+          return;
+        }
+        std::cerr << "[CUDA] Decision validation failed. Falling back to CPU results for this call.\n";
+        DecisionVec = cpuDecision;
+        Updated_EstmNoise_History = cpuHistory;
+        return;
+      }
+      return;
+    } else {
+      std::cerr << "[CUDA] Decision GPU path failed. Falling back to CPU implementation.\n";
+    }
+  }
+#endif
+  Decision_CPU(DecisionVec, Updated_EstmNoise_History, APP, N, GF);
 }
 // Function: ChannelPass_zero
 // Purpose: TODO - describe the function's responsibility succinctly.
