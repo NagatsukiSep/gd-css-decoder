@@ -468,7 +468,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              int GF,
                              int logGF,
                              string& error) {
-  GD_CSS_FUNCTION_TIMER();
   const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
     return true;
@@ -801,7 +800,6 @@ template <typename T>
 // Function: contains
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool contains(const vector<T>& S, const T& x) {
-  GD_CSS_FUNCTION_TIMER();
   // Loop: iterate over a range/collection.
   for (const T& elem : S) {
     // Conditional branch.
@@ -813,7 +811,6 @@ bool contains(const vector<T>& S, const T& x) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 template <typename T>
 vector<T> difference(const vector<T>& A, const vector<T>& B) {
-  GD_CSS_FUNCTION_TIMER();
   unordered_set<T> setB(B.begin(), B.end());
   vector<T> diff;
   for (const auto& x : A) {
@@ -824,7 +821,6 @@ vector<T> difference(const vector<T>& A, const vector<T>& B) {
 // Function: find_missing_elements
 // Purpose: TODO - describe the function's responsibility succinctly.
 std::vector<int> find_missing_elements(const std::vector<int>& subset, const std::vector<int>& superset) {
-  GD_CSS_FUNCTION_TIMER();
   std::unordered_set<int> set_superset(superset.begin(), superset.end());
   std::vector<int> missing;
   // Loop: iterate over a range/collection.
@@ -849,7 +845,6 @@ return missing;
 }
 
 vector<int> find_dangerous_checks(const NodeList& C0, const IndexList& JatI, const BitSet& S) {
-  GD_CSS_FUNCTION_TIMER();
   vector<int> danger;
   // Loop: iterate over a range/collection.
   for (int c : C0) {
@@ -869,7 +864,6 @@ vector<int> find_dangerous_checks(const NodeList& C0, const IndexList& JatI, con
 // Function: print_progress_bar
 // Purpose: TODO - describe the function's responsibility succinctly.
 void print_progress_bar(int current, int total, const string& label = "", int bar_width = 50) {
-  GD_CSS_FUNCTION_TIMER();
   float progress = float(current) / total;
   int pos = int(bar_width * progress);
   cout << "\r\033[32m[";
@@ -893,7 +887,6 @@ void print_progress_bar(int current, int total, const string& label = "", int ba
 
 void VNtoChN_init(Eigen::MatrixXd& f_VNtoChN_eigen,
 double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BINGF1){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@ VNtoChN_init" << endl;
   f_VNtoChN_eigen=Eigen::MatrixXd(GF,GF);
   cout << "eigen done" << endl;
@@ -1035,7 +1028,6 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void normalize(vector<double>& input, int n){
-  GD_CSS_FUNCTION_TIMER();
   if (n <= 0) {
     return;
   }
@@ -1090,21 +1082,18 @@ void normalize(vector<double>& input, int n){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 int log2(int x){
-  GD_CSS_FUNCTION_TIMER();
   return log((double)x)/log(2.0);
 }
 // Function: h2
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 double h2(double x){
-  GD_CSS_FUNCTION_TIMER();
   return -x*std::log2(x) - (1.0 - x)*std::log2(1.0 - x);
 }
 // Function: Bin2GF
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 int Bin2GF(vector<int>& U,int GF,int logGF,vector<vector<int>>& BINGF){
-  GD_CSS_FUNCTION_TIMER();
   // Loop: iterate over a range/collection.
   for(size_t k=0;k<GF;k++){
     bool mtc=true;
@@ -1120,7 +1109,6 @@ int Bin2GF(vector<int>& U,int GF,int logGF,vector<vector<int>>& BINGF){
 
 int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BINGF1){
 
-  GD_CSS_FUNCTION_TIMER();
   return Bin2GF(BINGF0[g],GF,logGF,BINGF1);
 }
 // Function: ComputeAPP
@@ -1153,7 +1141,6 @@ int N, int GF) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 std::vector<int> computeUnion(const std::vector<std::vector<int>>& Updated_EstmNoise_History) {
-  GD_CSS_FUNCTION_TIMER();
 
   std::set<int> unionSet;
 
@@ -1200,7 +1187,6 @@ int N, int GF) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,double f_m,vector<vector<int>>& BINGF){
-  GD_CSS_FUNCTION_TIMER();
   vector<double> VNtoChN0(GF,1);
   // Loop: iterate over a range/collection.
   for(size_t d=0;d<GF;d++){
@@ -1459,7 +1445,6 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void calcSyndrome(vector<int>& Synd, int M,vector<int>& EstmNoise,vector<vector<int>>& MatValue,vector<int>& RowDegree,vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& Mat){
-  GD_CSS_FUNCTION_TIMER();
   // Loop: iterate over a range/collection.
   for(int k=0;k<M;k++){
     Synd[k]=0;
@@ -1512,7 +1497,6 @@ int& eS, int& eS_C, int& eS_D,
 int& NumUSS_C, int& NumUSS_D
 ) {
 
-  GD_CSS_FUNCTION_TIMER();
 
   IncorrectJ_C.clear();
   IncorrectJ_D.clear();
@@ -1536,7 +1520,6 @@ int& NumUSS_C, int& NumUSS_D
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void gaussianElimination(Matrix& H, vector<int>& Perm) {
-  GD_CSS_FUNCTION_TIMER();
   int m = H.rows, n = H.cols;
   Perm=vector<int>(n);
   // Loop: iterate over a range/collection.
@@ -1619,7 +1602,6 @@ void gaussianElimination(Matrix& H, vector<int>& Perm) {
 }
 
 Matrix findGeneratorMatrix(Matrix H) {
-  GD_CSS_FUNCTION_TIMER();
   int m = H.rows;
   int n = H.cols;
 
@@ -1688,7 +1670,6 @@ const vector<int>& cols,
 const vector<vector<int>>& JatI,
 vector<vector<int>>& MatValue)
 {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@generateDenseMatrixA\n");
 
   vector<vector<int>> A(rows.size(), vector<int>(cols.size(), 0));
@@ -2047,7 +2028,6 @@ vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIV
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& Noise_C, vector<vector<int>>& JatI_C, vector<vector<int>>& JatI_D, vector<vector<int>>& MatValue_D, int N, int M){
-  GD_CSS_FUNCTION_TIMER();
   printf("@check_degenerate_decoding_success\n");
 
   unordered_set<int> J_set;
@@ -2149,7 +2129,6 @@ bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& No
 // Purpose: TODO - describe the function's responsibility succinctly.
 void addIfNotIncluded(std::vector<int>& v, int x) {
 
-  GD_CSS_FUNCTION_TIMER();
   // Conditional branch.
   if (std::find(v.begin(), v.end(), x) == v.end()) {
     v.push_back(x);
@@ -2159,7 +2138,6 @@ vector<int> makeUnion(
 const vector<int>& Candidate_Covering_Normal_Rows_D,
 const vector<vector<int>>& UTCBC_Indices
 ) {
-  GD_CSS_FUNCTION_TIMER();
   set<int> union_set;
   // Loop: iterate over a range/collection.
   for (int i : Candidate_Covering_Normal_Rows_D) {
@@ -2176,7 +2154,6 @@ const vector<vector<int>>& UTCBC_Indices
 // Function: Find_Nonsingular_Cycle_of_Length_Larger_thatn_L
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@Find_Nonsingular_Cycle_of_Length_Larger_thatn_L" << endl;
   cols.clear();
   rows.clear();
@@ -2224,7 +2201,6 @@ bool Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(vector<int>& cols, vector<i
 // Function: Find_Cycle_of_Length_L
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Find_Cycle_of_Length_L(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@Find_Cycle_of_Length_L" << endl;
   cols.clear();
   rows.clear();
@@ -2271,7 +2247,6 @@ bool Find_Cycle_of_Length_L(vector<int>& cols, vector<int>& rows, vector<int>& S
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool Find_Covering_Cycles_By_RUSS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Find_Covering_Cycles_By_RUSS" << endl;
   cols.clear();
   rows.clear();
@@ -2319,7 +2294,6 @@ bool Find_Covering_Cycles_By_RUSS(vector<int>& cols, vector<int>& rows, vector<i
 // Function: Find_Rows_Coverintg_SuspectJ_From_RUSS
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Find_Rows_Coverintg_SuspectJ_From_RUSS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Find_Rows_Coverintg_SuspectJ_From_RUSS" << endl;
   cols.clear();
   rows.clear();
@@ -2357,7 +2331,6 @@ bool Find_Rows_Coverintg_SuspectJ_From_RUSS(vector<int>& cols, vector<int>& rows
 // Function: Find_Unique_Solution_Noise_From_USS
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Find_Unique_Solution_Noise_From_USS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& USS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Find_Unique_Solution_Noise_From_RUSS" << endl;
   cols.clear();
   rows.clear();
@@ -2395,7 +2368,6 @@ bool Find_Unique_Solution_Noise_From_USS(vector<int>& cols, vector<int>& rows, v
 // Function: Rows_eq_USS_Cols_eq_Overlapping_USS
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Rows_eq_USS_Cols_eq_Overlapping_USS(vector<int>& cols, vector<int>& rows, vector<int>& USS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Rows_eq_USS_Cols_eq_Overlapping_USS" << endl;
   cols.clear();
   rows.clear();
@@ -2447,7 +2419,6 @@ bool Rows_eq_USS_Cols_eq_Overlapping_USS(vector<int>& cols, vector<int>& rows, v
 // Function: Rows_eq_RUSS_Cols_eq_SuspectJ
 // Purpose: TODO - describe the function's responsibility succinctly.
 bool Rows_eq_RUSS_Cols_eq_SuspectJ(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Rows_eq_RUSS_Cols_eq_SuspectJ" << endl;
   cols.clear();
   rows.clear();
@@ -2470,7 +2441,6 @@ bool Rows_eq_RUSS_Cols_eq_SuspectJ(vector<int>& cols, vector<int>& rows, vector<
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap" << endl;
   cols.clear();
   rows.clear();
@@ -2530,7 +2500,6 @@ bool Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(vector<int>& cols, vector
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ_C, vector<vector<int>>& UTCBC_Rows_C_orthogonal_D, vector<vector<int>>& UTCBC_Cols_C_orthogonal_D, vector<vector<int>>& full_IatJ_D){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@findCoveringRowsByUTCBC_Cols" << endl;
   vector<int> Candidate_Covering_Normal_Rows_D;
 
@@ -2613,7 +2582,6 @@ void printMatrix(const vector<vector<int>>& mat) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool isEqual(vector<int>& a, vector<int>& b, int size) {
-  GD_CSS_FUNCTION_TIMER();
   // Loop: iterate over a range/collection.
   for (size_t i = 0; i < size; i++) {
     // Conditional branch.
@@ -2674,7 +2642,6 @@ int GF_minus_one
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void decode_small_errors_from_rows_cols(vector<int>& TrueNoiseSynd, vector<int>& TrueNoise, int M, int N, vector<int>& EstmNoise, vector<int>& RowDeg, vector<int>& rows, vector<int>& cols, vector<vector<int>>& IatJ_C, vector<vector<int>>& JatI_C, vector<vector<int>>& Mat, vector<vector<int>>& MatValue, vector<vector<int>>& MULGF, vector<vector<int>>& ADDGF, vector<vector<int>>& DIVGF, vector<vector<int>>& BINGF){
-  GD_CSS_FUNCTION_TIMER();
   printf("@decode_small_errors_from_rows_cols\n");
   vector<int> Set_J=cols;
 
@@ -2929,7 +2896,6 @@ printf("***decode_small_errors_from_rows_cols %d\n", res.first);
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void decode_small_errors(vector<int>& TrueNoiseSynd, vector<int>& TrueNoise_C, int M, int N, vector<int>& EstmNoise, vector<int>& RowDeg, vector<int>& Candidate_Covering_Normal_Rows_D, vector<vector<int>>& UTCBC_Rows_C_orthogonal_D, vector<vector<int>>& UTCBC_Cols_C_orthogonal_D, vector<vector<int>>& IatJ_C, vector<vector<int>>& JatI_C, vector<vector<int>>& Mat, vector<vector<int>>& MatValue, vector<vector<int>>& MULGF, vector<vector<int>>& ADDGF, vector<vector<int>>& DIVGF, vector<vector<int>>& BINGF){
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@decode_small_errors\n");
 
   set<int> rows_set,cols_set;
@@ -2997,7 +2963,6 @@ int mult_apm(int x,int y,int P){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void print_apm(int x,int P){
-  GD_CSS_FUNCTION_TIMER();
   // Conditional branch.
   if(x)
   cout << setw(log10(P)+1) << x/P << "X+" << setw(log10(P)+1) << x%P << " ";
@@ -3053,7 +3018,6 @@ int mod_inverse(int a, int P) {
 
 void construct_inv_ZP(int P){
 
-  GD_CSS_FUNCTION_TIMER();
   cout << "constructing inv_ZP" << endl;
   inv_ZP= vector<int>(P);
   inv_ZP[1]=1;
@@ -3087,7 +3051,6 @@ void construct_inv_ZP(int P){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool commute(int x, int y, int P){
-  GD_CSS_FUNCTION_TIMER();
   int a=x/P;
   int b=x%P;
   int c=y/P;
@@ -3098,7 +3061,6 @@ bool commute(int x, int y, int P){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void print_commute_matrix_ff_gg(vector<int>& ff,vector<int>& gg,int P){
-  GD_CSS_FUNCTION_TIMER();
   cout << "@print_commute_matrix_ff_gg" << endl;
   cout << "commute matrix ff,ff" << endl;
   // Loop: iterate over a range/collection.
@@ -3132,7 +3094,6 @@ void print_commute_matrix_ff_gg(vector<int>& ff,vector<int>& gg,int P){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void print_ff_gg(vector<int> ff,vector<int> gg,int P){
-  GD_CSS_FUNCTION_TIMER();
   cout << "ff=";for(int i=0;i<ff.size();i++){cout << setw(5) << ff[i]/P << "X+" << setw(5) << ff[i]%P << " ";}cout << endl;
   cout << "gg=";for(int i=0;i<gg.size();i++){cout << setw(5) << gg[i]/P << "X+" << setw(5) << gg[i]%P << " ";}cout << endl;
 }
@@ -3141,7 +3102,6 @@ void print_ff_gg(vector<int> ff,vector<int> gg,int P){
 
 void print_Hc_pair(vector<vector<int>> HcA,vector<vector<int>>  HcB, int P){
 
-  GD_CSS_FUNCTION_TIMER();
   cout << "HcA=" << endl;
   // Loop: iterate over a range/collection.
   for(int j=0;j<HcA.size();j++){
@@ -3167,7 +3127,6 @@ void print_Hc_pair(vector<vector<int>> HcA,vector<vector<int>>  HcB, int P){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void construct_HcA_HcB_from_ff_gg(vector<vector<int>> &HcA,vector<vector<int>> &HcB,vector<int> ff,vector<int> gg, int J, int L, int P){
-  GD_CSS_FUNCTION_TIMER();
   int L2=L/2;
 
   HcA=vector<vector<int>>(J);
@@ -3223,7 +3182,6 @@ vector<vector<int>>& JatI,
 vector<vector<int>>& IatJ,
 int J,int L, int P
 ){
-  GD_CSS_FUNCTION_TIMER();
   JatI = vector<vector<int>>(P*Hc.size());
   IatJ = vector<vector<int>>(P*Hc[0].size());
 
@@ -3254,7 +3212,6 @@ vector<vector<int>>& full_IatJ_B,
 vector<int>& ff,
 vector<int>& gg,
 int P){
-  GD_CSS_FUNCTION_TIMER();
   int L2=ff.size();
   int L=L2*2;
   vector<vector<int>> HcA, HcB;
@@ -3425,7 +3382,6 @@ vector<vector<int>>& UTCBC_Rows_D_orthogonal_C,
 vector<vector<int>>& full_JatI_C, vector<vector<int>>& IatJ_D,
 vector<vector<int>>& full_JatI_D, vector<vector<int>>& IatJ_C
 ) {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@initializeUTCBC_Rows\n");
 
   UTCBC_Rows_C_orthogonal_D = vector<vector<int>>(M+P);
@@ -3463,7 +3419,6 @@ vector<vector<int>>& UTCBC_Cols_D_orthogonal_C,
 vector<vector<int>>& full_JatI_C,
 vector<vector<int>>& full_JatI_D
 ) {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@initializeUTCBC_Cols\n");
 
   UTCBC_Cols_D_orthogonal_C = vector<vector<int>>(M+P);
@@ -3490,7 +3445,6 @@ vector<vector<double>>& ChNtoVN_CD,
 vector<vector<double>>& APP_C,
 vector<int>& EstmNoise_C,
 vector<vector<double>>& VNtoChN_CD) {
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@ initialize_decoding_arrays" << endl;
   TrueNoise_C.resize(N);
   CNtoVNxxx_C.resize(NumEdge_C);
@@ -3517,7 +3471,6 @@ vector<vector<double>>& VNtoChN_CD) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void initialize_interleaver(int N, int M, int*& ColDeg_C, int*& RowDeg_C, int**& Mat_C, int**& NtoB_C, vector<int>& Interleaver_C, int& NumEdge_C) {
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@ initialize_interleaver" << endl;
   vector<int> ind(N, 0);
   NumEdge_C = 0;
@@ -3551,7 +3504,6 @@ void initialize_interleaver(int N, int M, int*& ColDeg_C, int*& RowDeg_C, int**&
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void initialize_interleaver(int N, int M, vector<int>& ColDeg_C, vector<int>& RowDeg_C, vector<vector<int>>& Mat_C, vector<vector<int>>& NtoB_C, vector<int>& Interleaver_C, int& NumEdge_C) {
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@ initialize_interleaver" << endl;
   vector<int> ind(N, 0);
   NumEdge_C = 0;
@@ -3584,7 +3536,6 @@ void initialize_interleaver(int N, int M, vector<int>& ColDeg_C, vector<int>& Ro
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void initialize_syndrome_and_channel(int M, vector<int>& TrueNoiseSynd_C, vector<int>& EstmNoiseSynd_C) {
-  GD_CSS_FUNCTION_TIMER();
   cout << "@@@ initialize_syndrome_and_channel" << endl;
   TrueNoiseSynd_C = vector<int>(M, 0);
   EstmNoiseSynd_C = vector<int>(M, 0);
@@ -3596,7 +3547,6 @@ void initialize_syndrome_and_channel(int M, vector<int>& TrueNoiseSynd_C, vector
 void load_GF_tables(
 int GF, int logGF,
 vector<vector<int>>& BINGF, vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ) {
-  GD_CSS_FUNCTION_TIMER();
   char FileName[100], name[10];
   FILE* f;
   BINGF = vector<vector<int>>(GF, vector<int>(logGF));
@@ -3656,7 +3606,6 @@ vector<vector<int>>& BINGF, vector<vector<int>>& FFTSQ,
 vector<vector<int>>& TBINGF, vector<vector<int>>& TFFTSQ)
 {
 
-  GD_CSS_FUNCTION_TIMER();
   TBINGF = vector<vector<int>>(GF, vector<int>(logGF));
   TFFTSQ = vector<vector<int>>(logGF * GF / 2, vector<int>(2));
 
@@ -3706,7 +3655,6 @@ vector<vector<int>>& TBINGF, vector<vector<int>>& TFFTSQ)
 void simulateTransmissionErrors(int N,  int logGF, int GF, double pD,
 vector<int>& TrueNoise_C, vector<int>& TrueNoise_D,
 vector<vector<int>>& BINGF, vector<vector<int>>& TBINGF, int &num_X, int &num_Z) {
-  GD_CSS_FUNCTION_TIMER();
   num_X = 0;
   num_Z = 0;
   // Loop: iterate over a range/collection.
@@ -3753,7 +3701,6 @@ TrueNoise_D[n] = Bin2GF(s_D, GF, logGF, TBINGF);
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 int extractValueFromFilename(const std::string& filename, const std::string& pattern_char) {
-  GD_CSS_FUNCTION_TIMER();
   int value = 0;
   std::regex pattern("_"+pattern_char+"(\\d+)");
   std::smatch match;
@@ -3783,7 +3730,6 @@ vector<vector<int>> Mat,
 vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF,
 vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
 
-  GD_CSS_FUNCTION_TIMER();
 
   DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
   CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
@@ -3806,7 +3752,6 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 bool load_size(const char* baseFileName, int& M, int& N, int& GF,  int& logGF) {
-  GD_CSS_FUNCTION_TIMER();
   char FileName[256];
   sprintf(FileName, "%s_size", baseFileName);
   FILE* f = fopen(FileName, "r");
@@ -3826,7 +3771,6 @@ bool load_size(const char* baseFileName, int& M, int& N, int& GF,  int& logGF) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void check_code_parameters_equal(const char* MatrixFilePrefix_C, const char* MatrixFilePrefix_D, int &M, int &N, int &GF, int &logGF){
-  GD_CSS_FUNCTION_TIMER();
   int M_C, N_C,  GF_C, logGF_C;
   int M_D, N_D,  GF_D, logGF_D;
 
@@ -3856,7 +3800,6 @@ vector<vector<int>>& IatJ_X,
 vector<vector<int>>& JatI_Z,
 vector<vector<int>>& IatJ_Z,
 int L, int P){
-  GD_CSS_FUNCTION_TIMER();
   printf("P=%d L=%d\n",P,L);
   ff=vector<int>(L/2);
   // Loop: iterate over a range/collection.
@@ -3905,7 +3848,6 @@ int itr,
 int HistoryLength,
 int P
 ) {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@printDecodingDebugInfo\n");
   printf("MatValue_C[0][0]=%3x\n",MatValue_C[0][0]);
   // Conditional branch.
@@ -3988,7 +3930,6 @@ vector<vector<int>>& ADDGF,
 vector<vector<int>>& DIVGF,
 vector<vector<int>>& BINGF,
 int L) {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@TryDecodeSmallErrors\n");
   printf("MatValue_C[0][0]=%3x\n",MatValue_C[0][0]);
   EF_LOG.clear();
@@ -4076,7 +4017,6 @@ int L) {
 // Function: check_orthogonality
 // Purpose: TODO - describe the function's responsibility succinctly.
 void check_orthogonality(vector<vector<int>>& MatValue_C, vector<vector<int>>& MatValue_D, vector<vector<int>>& JatI_C, vector<vector<int>>& JatI_D, int M, vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF) {
-  GD_CSS_FUNCTION_TIMER();
   printf("@@@ check_orthogonality\n");
   // Loop: iterate over a range/collection.
   for (int i = 0; i < M ; i++) {
@@ -4130,7 +4070,6 @@ static inline void TryDecodeSmallErrorsRef(
     const SM_GFTablesRef& gf,
     int M, int N, int L, int itr, int HistoryLength) {
 
-  GD_CSS_FUNCTION_TIMER();
   TryDecodeSmallErrors(
     s.SyndromeIsSatisfied,
     s.SuspectJ,
@@ -4166,7 +4105,6 @@ static inline void TryDecodeSmallErrorsRef(
 // ==============================================================================
 
 int main(int argc, char * argv[]){
-  GD_CSS_FUNCTION_TIMER();
 
   char *FileName  =(char *)malloc(500);
   char *FileResult=(char *)malloc(500);
