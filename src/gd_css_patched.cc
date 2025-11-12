@@ -1843,30 +1843,32 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             std::memcpy(vnDst, vnSrc, static_cast<size_t>(GF) * sizeof(double));
         }
 
-        const auto total_end = std::chrono::steady_clock::now();
-        const double total_ms =
-            std::chrono::duration<double, std::milli>(total_end - total_start)
-                .count();
-        const double transfer_total_ms =
-            transfer_to_device_ms + transfer_to_host_ms;
-        double host_processing_ms =
-            total_ms - (transfer_total_ms + kernel_ms);
-        if (host_processing_ms < 0.0) {
-            host_processing_ms = 0.0;
-        }
+        if (gd_css::IsTimingDebugEnabled()) {
+            const auto total_end = std::chrono::steady_clock::now();
+            const double total_ms =
+                std::chrono::duration<double, std::milli>(total_end - total_start)
+                    .count();
+            const double transfer_total_ms =
+                transfer_to_device_ms + transfer_to_host_ms;
+            double host_processing_ms =
+                total_ms - (transfer_total_ms + kernel_ms);
+            if (host_processing_ms < 0.0) {
+                host_processing_ms = 0.0;
+            }
 
-        std::streamsize previous_precision = std::cout.precision();
-        std::ios::fmtflags previous_flags = std::cout.flags();
-        std::cout << std::fixed << std::setprecision(3)
-                  << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
-                  << " ms, kernel: " << kernel_ms
-                  << " ms, D2H: " << transfer_to_host_ms
-                  << " ms, host-side: " << host_processing_ms
-                  << " ms, total: " << total_ms
-                  << " ms, total transfer: " << transfer_total_ms << " ms)"
-                  << std::endl;
-        std::cout.precision(previous_precision);
-        std::cout.flags(previous_flags);
+            std::streamsize previous_precision = std::cout.precision();
+            std::ios::fmtflags previous_flags = std::cout.flags();
+            std::cout << std::fixed << std::setprecision(3)
+                      << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
+                      << " ms, kernel: " << kernel_ms
+                      << " ms, D2H: " << transfer_to_host_ms
+                      << " ms, host-side: " << host_processing_ms
+                      << " ms, total: " << total_ms
+                      << " ms, total transfer: " << transfer_total_ms << " ms)"
+                      << std::endl;
+            std::cout.precision(previous_precision);
+            std::cout.flags(previous_flags);
+        }
 
         if (!reported_cuda_success) {
             std::cout << "CheckPass executed with CUDA acceleration." << std::endl;
