@@ -313,10 +313,47 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     }
     __syncthreads();
 
+    double local_max = 0.0;
+    for (int g = tid; g < GF; g += blockDim.x) {
+      const double v = TMP[g];
+      if (isfinite(v) && v > local_max) {
+        local_max = v;
+      }
+    }
+    reductionBuffer[tid] = local_max;
+    __syncthreads();
+
+    if (tid == 0) {
+      double max_val = 0.0;
+      for (int i = 0; i < blockDim.x; ++i) {
+        const double candidate = reductionBuffer[i];
+        if (isfinite(candidate) && candidate > max_val) {
+          max_val = candidate;
+        }
+      }
+      reductionBuffer[0] = max_val;
+    }
+    __syncthreads();
+
+    const double max_val = reductionBuffer[0];
+    if (!(isfinite(max_val) && max_val > 0.0)) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] = uniform;
+      }
+      __syncthreads();
+      continue;
+    }
+
     double local_sum = 0.0;
     for (int g = tid; g < GF; g += blockDim.x) {
       double v = TMP[g];
-      if (!isfinite(v) || v < 0.0) {
+      if (!isfinite(v) || v <= 0.0) {
+        TMP[g] = 0.0;
+        continue;
+      }
+      v /= max_val;
+      if (!isfinite(v)) {
         v = 0.0;
       }
       TMP[g] = v;
@@ -331,15 +368,14 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
         sum += reductionBuffer[i];
       }
       if (!isfinite(sum) || sum <= 0.0) {
-        reductionBuffer[0] = 0.0;
-      } else {
-        reductionBuffer[0] = sum;
+        sum = 0.0;
       }
+      reductionBuffer[0] = sum;
     }
     __syncthreads();
 
     const double total = reductionBuffer[0];
-    if (total <= 0.0) {
+    if (!(isfinite(total) && total > 0.0)) {
       const double uniform = 1.0 / static_cast<double>(GF);
       for (int g = tid; g < GF; g += blockDim.x) {
         outVec[g] = uniform;
@@ -347,11 +383,7 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     } else {
       const double inv = 1.0 / total;
       for (int g = tid; g < GF; g += blockDim.x) {
-        double value = TMP[g];
-        if (!isfinite(value)) {
-          value = 0.0;
-        }
-        outVec[g] = value * inv;
+        outVec[g] = TMP[g] * inv;
       }
     }
     __syncthreads();
@@ -936,20 +968,45 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void normalize(vector<double>& input, int n){
+  if (n <= 0) {
+    return;
+  }
+
+  double maxVal = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double value = input[static_cast<size_t>(i)];
+    if (!std::isfinite(value)) {
+      continue;
+    }
+    if (value > maxVal) {
+      maxVal = value;
+    }
+  }
+  if (!(std::isfinite(maxVal) && maxVal > 0.0)) {
+    const double uniform = 1.0 / static_cast<double>(n);
+    for (int i = 0; i < n; ++i) {
+      input[static_cast<size_t>(i)] = uniform;
+    }
+    return;
+  }
+
   double sum = 0.0;
-  bool valid = true;
   for (int i = 0; i < n; ++i) {
     double value = input[static_cast<size_t>(i)];
-    if (!std::isfinite(value)) {
-      valid = false;
-      break;
+    if (!std::isfinite(value) || value <= 0.0) {
+      input[static_cast<size_t>(i)] = 0.0;
+      continue;
     }
+    value /= maxVal;
+    if (!std::isfinite(value)) {
+      value = 0.0;
+    }
+    input[static_cast<size_t>(i)] = value;
     sum += value;
   }
 
-  if (!valid || !std::isfinite(sum) || sum <= 0.0) {
-    cout << "divided by zero" << endl;
-    const double uniform = 1.0 / static_cast<double>(std::max(1, n));
+  if (!std::isfinite(sum) || sum <= 0.0) {
+    const double uniform = 1.0 / static_cast<double>(n);
     for (int i = 0; i < n; ++i) {
       input[static_cast<size_t>(i)] = uniform;
     }
