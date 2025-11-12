@@ -456,39 +456,166 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
 #if GD_CSS_ENABLE_CUDA
 namespace {
 
-struct CheckPassCudaWorkspace {
-  vector<double> cnFlat;
-  vector<double> vnFlat;
-  vector<int> matValueFlat;
-  vector<int> fft0;
-  vector<int> fft1;
+template <typename T>
+struct PinnedHostBuffer {
+  T* data_ptr = nullptr;
+  size_t size = 0;
+  size_t capacity = 0;
 
-  void EnsureEdgeCapacity(size_t totalEdges, int GF) {
-    const size_t required = totalEdges * static_cast<size_t>(GF);
-    if (cnFlat.size() != required) {
-      cnFlat.resize(required);
+  ~PinnedHostBuffer() { Free(); }
+
+  void Free() {
+    if (data_ptr) {
+      cudaFreeHost(data_ptr);
+      data_ptr = nullptr;
     }
-    if (vnFlat.size() != required) {
-      vnFlat.resize(required);
-    }
-    if (matValueFlat.size() != totalEdges) {
-      matValueFlat.resize(totalEdges);
-    }
+    size = 0;
+    capacity = 0;
   }
 
-  void EnsurePairCapacity(size_t pairCount) {
-    if (fft0.size() != pairCount) {
-      fft0.resize(pairCount);
+  bool EnsureCapacity(size_t required, string& error) {
+    if (required <= capacity) {
+      size = required;
+      return true;
     }
-    if (fft1.size() != pairCount) {
-      fft1.resize(pairCount);
+    Free();
+    if (required == 0) {
+      return true;
     }
+    T* new_ptr = nullptr;
+    cudaError_t status = cudaHostAlloc(&new_ptr,
+                                       required * sizeof(T),
+                                       cudaHostAllocDefault);
+    if (status != cudaSuccess) {
+      error = "cudaHostAlloc failed for pinned host buffer";
+      return false;
+    }
+    data_ptr = new_ptr;
+    capacity = required;
+    size = required;
+    return true;
+  }
+
+  T* data() { return data_ptr; }
+  const T* data() const { return data_ptr; }
+
+  T& operator[](size_t index) { return data_ptr[index]; }
+  const T& operator[](size_t index) const { return data_ptr[index]; }
+};
+
+struct CheckPassCudaWorkspace {
+  PinnedHostBuffer<double> cnFlat;
+  PinnedHostBuffer<double> vnFlat;
+  PinnedHostBuffer<int> matValueFlat;
+  PinnedHostBuffer<int> rowBaseFlat;
+  PinnedHostBuffer<int> rowDegreeFlat;
+  PinnedHostBuffer<int> trueNoiseSyndFlat;
+  PinnedHostBuffer<int> fft0;
+  PinnedHostBuffer<int> fft1;
+
+  size_t validatedEdgeCount = 0;
+  int validatedGF = -1;
+  size_t validatedRowDegreeChecksum = 0;
+  size_t validatedPairChecksum = 0;
+  bool hasValidationSignature = false;
+
+  bool EnsureEdgeCapacity(size_t totalEdges, int GF, string& error) {
+    const size_t required = totalEdges * static_cast<size_t>(GF);
+    if (!cnFlat.EnsureCapacity(required, error)) {
+      error = "Unable to allocate pinned CN workspace: " + error;
+      return false;
+    }
+    if (!vnFlat.EnsureCapacity(required, error)) {
+      error = "Unable to allocate pinned VN workspace: " + error;
+      return false;
+    }
+    if (!matValueFlat.EnsureCapacity(totalEdges, error)) {
+      error = "Unable to allocate pinned MatValue workspace: " + error;
+      return false;
+    }
+    if (validatedGF != GF) {
+      hasValidationSignature = false;
+    }
+    return true;
+  }
+
+  bool EnsureRowMetadata(const vector<int>& rowBase,
+                         const vector<int>& RowDegree,
+                         string& error) {
+    if (!rowBaseFlat.EnsureCapacity(rowBase.size(), error)) {
+      error = "Unable to allocate pinned rowBase workspace: " + error;
+      return false;
+    }
+    if (!rowBase.empty()) {
+      std::memcpy(rowBaseFlat.data(),
+                  rowBase.data(),
+                  rowBase.size() * sizeof(int));
+    }
+
+    if (!rowDegreeFlat.EnsureCapacity(RowDegree.size(), error)) {
+      error = "Unable to allocate pinned RowDegree workspace: " + error;
+      return false;
+    }
+    if (!RowDegree.empty()) {
+      std::memcpy(rowDegreeFlat.data(),
+                  RowDegree.data(),
+                  RowDegree.size() * sizeof(int));
+    }
+    return true;
+  }
+
+  bool EnsureTrueNoiseSynd(const vector<int>& TrueNoiseSynd, string& error) {
+    if (!trueNoiseSyndFlat.EnsureCapacity(TrueNoiseSynd.size(), error)) {
+      error = "Unable to allocate pinned TrueNoiseSynd workspace: " + error;
+      return false;
+    }
+    if (!TrueNoiseSynd.empty()) {
+      std::memcpy(trueNoiseSyndFlat.data(),
+                  TrueNoiseSynd.data(),
+                  TrueNoiseSynd.size() * sizeof(int));
+    }
+    return true;
+  }
+
+  bool EnsurePairCapacity(size_t pairCount, string& error) {
+    if (!fft0.EnsureCapacity(pairCount, error)) {
+      error = "Unable to allocate pinned FFTSQ workspace: " + error;
+      return false;
+    }
+    if (!fft1.EnsureCapacity(pairCount, error)) {
+      error = "Unable to allocate pinned FFTSQ workspace: " + error;
+      return false;
+    }
+    return true;
+  }
+
+  bool NeedsValidation(size_t totalEdges,
+                       int GF,
+                       size_t rowDegreeChecksum,
+                       size_t pairChecksum) const {
+    if (!hasValidationSignature) {
+      return true;
+    }
+    return validatedEdgeCount != totalEdges || validatedGF != GF ||
+           validatedRowDegreeChecksum != rowDegreeChecksum ||
+           validatedPairChecksum != pairChecksum;
+  }
+
+  void UpdateValidationSignature(size_t totalEdges,
+                                 int GF,
+                                 size_t rowDegreeChecksum,
+                                 size_t pairChecksum) {
+    validatedEdgeCount = totalEdges;
+    validatedGF = GF;
+    validatedRowDegreeChecksum = rowDegreeChecksum;
+    validatedPairChecksum = pairChecksum;
+    hasValidationSignature = true;
   }
 };
 
 struct FlattenedGFTablesCache {
-  vector<int> divFlat;
-  vector<int> mulFlat;
+  PinnedHostBuffer<int> divFlat;
+  PinnedHostBuffer<int> mulFlat;
   int cachedGF = -1;
   const vector<vector<int>>* divSource = nullptr;
   const vector<vector<int>>* mulSource = nullptr;
@@ -505,8 +632,17 @@ struct FlattenedGFTablesCache {
       error = "GF lookup tables are incomplete";
       return false;
     }
-    divFlat.resize(static_cast<size_t>(GF) * GF);
-    mulFlat.resize(static_cast<size_t>(GF) * GF);
+
+    const size_t flattened = static_cast<size_t>(GF) * GF;
+    if (!divFlat.EnsureCapacity(flattened, error)) {
+      error = "Unable to allocate pinned DIVGF workspace: " + error;
+      return false;
+    }
+    if (!mulFlat.EnsureCapacity(flattened, error)) {
+      error = "Unable to allocate pinned MULGF workspace: " + error;
+      return false;
+    }
+
     for (int i = 0; i < GF; ++i) {
       if (DIVGF[i].size() != static_cast<size_t>(GF) ||
           MULGF[i].size() != static_cast<size_t>(GF)) {
@@ -527,16 +663,21 @@ struct FlattenedGFTablesCache {
 
 }  // namespace
 
-static bool RunCheckPassCUDA(const vector<int>& rowBase,
-                             const vector<int>& RowDegree,
-                             const vector<int>& MatValueFlat,
-                             vector<double>& CNtoVNFlat,
-                             vector<double>& VNtoCNFlat,
-                             const vector<int>& DIVGFFlat,
-                             const vector<int>& MULGFFlat,
-                             const vector<int>& FFT0,
-                             const vector<int>& FFT1,
-                             const vector<int>& TrueNoiseSynd,
+static bool RunCheckPassCUDA(const int* rowBase,
+                             size_t rowBaseCount,
+                             const int* RowDegree,
+                             size_t rowDegreeCount,
+                             const int* MatValueFlat,
+                             size_t totalEdges,
+                             double* CNtoVNFlat,
+                             double* VNtoCNFlat,
+                             const int* DIVGFFlat,
+                             const int* MULGFFlat,
+                             const int* FFT0,
+                             const int* FFT1,
+                             size_t pairCount,
+                             const int* TrueNoiseSynd,
+                             size_t syndromeCount,
                              int M,
                              int GF,
                              int logGF,
@@ -544,7 +685,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              double* kernel_ms_out,
                              double* transfer_to_host_ms_out,
                              string& error) {
-  const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
     return true;
   }
@@ -567,15 +707,40 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
 
   const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
   const size_t edgesBytes = totalEdges * sizeof(int);
-  const size_t rowBaseBytes = rowBase.size() * sizeof(int);
-  const size_t rowDegreeBytes = RowDegree.size() * sizeof(int);
+  const size_t rowBaseBytes = rowBaseCount * sizeof(int);
+  const size_t rowDegreeBytes = rowDegreeCount * sizeof(int);
   const size_t gfSquareBytes = static_cast<size_t>(GF) * static_cast<size_t>(GF) * sizeof(int);
-  const size_t pairCount = FFT0.size();
   const size_t pairBytes = pairCount * sizeof(int);
-  const size_t syndromeBytes = TrueNoiseSynd.size() * sizeof(int);
+  const size_t syndromeBytes = syndromeCount * sizeof(int);
   cudaError_t status = cudaSuccess;
+  cudaStream_t stream = nullptr;
+
+  struct TimedCopy {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+    double* accumulator = nullptr;
+  };
+
+  std::vector<TimedCopy> h2dCopies;
+  std::vector<TimedCopy> d2hCopies;
 
   auto cleanup = [&]() {
+    auto destroyCopies = [](std::vector<TimedCopy>& copies) {
+      for (auto& copy : copies) {
+        if (copy.start) {
+          cudaEventDestroy(copy.start);
+          copy.start = nullptr;
+        }
+        if (copy.end) {
+          cudaEventDestroy(copy.end);
+          copy.end = nullptr;
+        }
+      }
+      copies.clear();
+    };
+
+    destroyCopies(h2dCopies);
+    destroyCopies(d2hCopies);
     if (d_CNtoVN) cudaFree(d_CNtoVN);
     if (d_VNtoCN) cudaFree(d_VNtoCN);
     if (d_MatValue) cudaFree(d_MatValue);
@@ -588,24 +753,71 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
+    if (stream) {
+      cudaStreamDestroy(stream);
+      stream = nullptr;
+    }
   };
 
-  auto timedMemcpy = [&](void* dst,
-                         const void* src,
-                         size_t bytes,
-                         cudaMemcpyKind kind,
-                         const char* failure,
-                         double& accumulator) -> bool {
-    auto start = std::chrono::steady_clock::now();
-    status = cudaMemcpy(dst, src, bytes, kind);
-    auto end = std::chrono::steady_clock::now();
-    accumulator +=
-        std::chrono::duration<double, std::milli>(end - start).count();
+  status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+  if (status != cudaSuccess) {
+    error = "cudaStreamCreateWithFlags failed";
+    cleanup();
+    return false;
+  }
+
+  auto timedMemcpyAsync = [&](void* dst,
+                              const void* src,
+                              size_t bytes,
+                              cudaMemcpyKind kind,
+                              const char* failure,
+                              double& accumulator,
+                              std::vector<TimedCopy>& copies) -> bool {
+    if (bytes == 0) {
+      return true;
+    }
+    TimedCopy copy;
+    copy.accumulator = &accumulator;
+    status = cudaEventCreate(&copy.start);
     if (status != cudaSuccess) {
-      error = failure;
+      error = "cudaEventCreate failed for copy start";
+      if (copy.start) cudaEventDestroy(copy.start);
       cleanup();
       return false;
     }
+    status = cudaEventCreate(&copy.end);
+    if (status != cudaSuccess) {
+      error = "cudaEventCreate failed for copy end";
+      if (copy.start) cudaEventDestroy(copy.start);
+      if (copy.end) cudaEventDestroy(copy.end);
+      cleanup();
+      return false;
+    }
+    status = cudaEventRecord(copy.start, stream);
+    if (status != cudaSuccess) {
+      error = "cudaEventRecord failed for copy start";
+      if (copy.start) cudaEventDestroy(copy.start);
+      if (copy.end) cudaEventDestroy(copy.end);
+      cleanup();
+      return false;
+    }
+    status = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+    if (status != cudaSuccess) {
+      error = failure;
+      if (copy.start) cudaEventDestroy(copy.start);
+      if (copy.end) cudaEventDestroy(copy.end);
+      cleanup();
+      return false;
+    }
+    status = cudaEventRecord(copy.end, stream);
+    if (status != cudaSuccess) {
+      error = "cudaEventRecord failed for copy end";
+      if (copy.start) cudaEventDestroy(copy.start);
+      if (copy.end) cudaEventDestroy(copy.end);
+      cleanup();
+      return false;
+    }
+    copies.push_back(copy);
     return true;
   };
 
@@ -670,84 +882,94 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNFlat.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_CNtoVN,
+                        CNtoVNFlat,
+                        matrixBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for CNtoVN host->device",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_VNtoCN,
-                   VNtoCNFlat.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for VNtoCN host->device",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_VNtoCN,
+                        VNtoCNFlat,
+                        matrixBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for VNtoCN host->device",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_MatValue,
-                   MatValueFlat.data(),
-                   edgesBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MatValue",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_MatValue,
+                        MatValueFlat,
+                        edgesBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for MatValue",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_rowBase,
-                   rowBase.data(),
-                   rowBaseBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for rowBase",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_rowBase,
+                        rowBase,
+                        rowBaseBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for rowBase",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_RowDegree,
-                   RowDegree.data(),
-                   rowDegreeBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for RowDegree",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_RowDegree,
+                        RowDegree,
+                        rowDegreeBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for RowDegree",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_DIVGF,
-                   DIVGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for DIVGF",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_DIVGF,
+                        DIVGFFlat,
+                        gfSquareBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for DIVGF",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_MULGF,
-                   MULGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MULGF",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_MULGF,
+                        MULGFFlat,
+                        gfSquareBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for MULGF",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_FFT0,
-                   FFT0.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT0",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_FFT0,
+                        FFT0,
+                        pairBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for FFT0",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_FFT1,
-                   FFT1.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT1",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_FFT1,
+                        FFT1,
+                        pairBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for FFT1",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(d_TrueNoiseSynd,
-                   TrueNoiseSynd.data(),
-                   syndromeBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for TrueNoiseSynd",
-                   transfer_to_device_ms)) {
+  if (!timedMemcpyAsync(d_TrueNoiseSynd,
+                        TrueNoiseSynd,
+                        syndromeBytes,
+                        cudaMemcpyHostToDevice,
+                        "cudaMemcpy failed for TrueNoiseSynd",
+                        transfer_to_device_ms,
+                        h2dCopies)) {
     return false;
   }
 
@@ -789,14 +1011,14 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     cleanup();
     return false;
   }
-  status = cudaEventRecord(kernelStart);
+  status = cudaEventRecord(kernelStart, stream);
   if (status != cudaSuccess) {
     error = "cudaEventRecord failed for kernelStart";
     cleanup();
     return false;
   }
 
-  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes>>>(
+  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes, stream>>>(
       d_CNtoVN,
       d_VNtoCN,
       d_MatValue,
@@ -812,7 +1034,7 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
       logGF,
       static_cast<int>(pairCount));
 
-  status = cudaEventRecord(kernelEnd);
+  status = cudaEventRecord(kernelEnd, stream);
   if (status != cudaSuccess) {
     error = "cudaEventRecord failed for kernelEnd";
     cleanup();
@@ -826,33 +1048,64 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  status = cudaEventSynchronize(kernelEnd);
+  float kernel_ms_f = 0.0f;
+  if (!timedMemcpyAsync(CNtoVNFlat,
+                        d_CNtoVN,
+                        matrixBytes,
+                        cudaMemcpyDeviceToHost,
+                        "cudaMemcpy failed for CNtoVN device->host",
+                        transfer_to_host_ms,
+                        d2hCopies)) {
+    return false;
+  }
+  if (!timedMemcpyAsync(VNtoCNFlat,
+                        d_VNtoCN,
+                        matrixBytes,
+                        cudaMemcpyDeviceToHost,
+                        "cudaMemcpy failed for VNtoCN device->host",
+                        transfer_to_host_ms,
+                        d2hCopies)) {
+    return false;
+  }
+
+  status = cudaStreamSynchronize(stream);
   if (status != cudaSuccess) {
-    error = "CheckPass CUDA kernel execution failed";
+    error = "cudaStreamSynchronize failed";
     cleanup();
     return false;
   }
 
-  float kernel_ms_f = 0.0f;
   status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
   if (status == cudaSuccess) {
     kernel_ms = static_cast<double>(kernel_ms_f);
   }
 
-  if (!timedMemcpy(CNtoVNFlat.data(),
-                   d_CNtoVN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for CNtoVN device->host",
-                   transfer_to_host_ms)) {
+  auto finalizeCopies = [&](std::vector<TimedCopy>& copies) -> bool {
+    for (auto& copy : copies) {
+      if (!copy.accumulator) {
+        continue;
+      }
+      float elapsed = 0.0f;
+      status = cudaEventElapsedTime(&elapsed, copy.start, copy.end);
+      if (status != cudaSuccess) {
+        error = "cudaEventElapsedTime failed";
+        cleanup();
+        return false;
+      }
+      *copy.accumulator += static_cast<double>(elapsed);
+      cudaEventDestroy(copy.start);
+      cudaEventDestroy(copy.end);
+      copy.start = nullptr;
+      copy.end = nullptr;
+    }
+    copies.clear();
+    return true;
+  };
+
+  if (!finalizeCopies(h2dCopies)) {
     return false;
   }
-  if (!timedMemcpy(VNtoCNFlat.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
+  if (!finalizeCopies(d2hCopies)) {
     return false;
   }
 
@@ -1433,32 +1686,87 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         const auto total_start = std::chrono::steady_clock::now();
 
         static CheckPassCudaWorkspace workspace;
-        workspace.EnsureEdgeCapacity(totalEdges, GF);
-        auto& cnFlat = workspace.cnFlat;
-        auto& vnFlat = workspace.vnFlat;
-        for (size_t edge=0; edge<totalEdges; ++edge) {
-            if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
+        if (!workspace.EnsureEdgeCapacity(totalEdges, GF, gpu_error)) {
+            break;
+        }
+
+        const size_t pairCount = FFTSQ.size();
+        const unsigned long long fnv_offset = 1469598103934665603ULL;
+        const unsigned long long fnv_prime = 1099511628211ULL;
+        unsigned long long rowDegreeChecksum = fnv_offset;
+        for (int degree : RowDegree) {
+            rowDegreeChecksum ^= static_cast<unsigned long long>(degree);
+            rowDegreeChecksum *= fnv_prime;
+        }
+        unsigned long long pairChecksum = fnv_offset;
+        pairChecksum ^= static_cast<unsigned long long>(pairCount);
+        pairChecksum *= fnv_prime;
+        pairChecksum ^= static_cast<unsigned long long>(logGF);
+        pairChecksum *= fnv_prime;
+
+        const bool needsValidation = workspace.NeedsValidation(
+            totalEdges, GF, static_cast<size_t>(rowDegreeChecksum),
+            static_cast<size_t>(pairChecksum));
+
+        if (!workspace.EnsureRowMetadata(rowBase, RowDegree, gpu_error)) {
+            break;
+        }
+        if (!workspace.EnsureTrueNoiseSynd(TrueNoiseSynd, gpu_error)) {
+            break;
+        }
+
+        if (!workspace.EnsurePairCapacity(pairCount, gpu_error)) {
+            break;
+        }
+
+        double* cnFlatPtr = workspace.cnFlat.data();
+        double* vnFlatPtr = workspace.vnFlat.data();
+        int* matValueFlatPtr = workspace.matValueFlat.data();
+        int* fft0Ptr = workspace.fft0.data();
+        int* fft1Ptr = workspace.fft1.data();
+
+        for (size_t edge = 0; edge < totalEdges; ++edge) {
+            const auto& cnVec = CNtoVNxxx[edge];
+            const auto& vnVec = VNtoCNxxx[edge];
+            if (needsValidation &&
+                (cnVec.size() < static_cast<size_t>(GF) ||
+                 vnVec.size() < static_cast<size_t>(GF))) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
-            for (int g=0; g<GF; ++g) {
-                cnFlat[edge * GF + g] = CNtoVNxxx[edge][g];
-                vnFlat[edge * GF + g] = VNtoCNxxx[edge][g];
+            for (int g = 0; g < GF; ++g) {
+                cnFlatPtr[edge * GF + g] = cnVec[g];
+                vnFlatPtr[edge * GF + g] = vnVec[g];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        auto& matValueFlat = workspace.matValueFlat;
-        for (int mIdx=0; mIdx<M; ++mIdx) {
-            if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
+        for (int mIdx = 0; mIdx < M; ++mIdx) {
+            const int degree = RowDegree[mIdx];
+            const auto& row = MatValue[mIdx];
+            if (needsValidation &&
+                row.size() < static_cast<size_t>(degree)) {
                 gpu_error = "MatValue row shorter than RowDegree";
                 break;
             }
-            for (int t=0; t<RowDegree[mIdx]; ++t) {
-                matValueFlat[rowBase[mIdx] + t] = MatValue[mIdx][t];
+            std::memcpy(matValueFlatPtr + rowBase[mIdx],
+                        row.data(),
+                        static_cast<size_t>(degree) * sizeof(int));
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+
+        for (size_t k = 0; k < pairCount; ++k) {
+            const auto& pair = FFTSQ[k];
+            if (needsValidation && pair.size() < 2) {
+                gpu_error = "FFTSQ entries must contain two indices";
+                break;
             }
+            fft0Ptr[k] = pair[0];
+            fft1Ptr[k] = pair[1];
         }
         if (!gpu_error.empty()) {
             break;
@@ -1469,32 +1777,28 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        const size_t pairCount = FFTSQ.size();
-        workspace.EnsurePairCapacity(pairCount);
-        auto& fft0 = workspace.fft0;
-        auto& fft1 = workspace.fft1;
-        for (size_t k=0; k<pairCount; ++k) {
-            if (FFTSQ[k].size() < 2) {
-                gpu_error = "FFTSQ entries must contain two indices";
-                break;
-            }
-            fft0[k] = FFTSQ[k][0];
-            fft1[k] = FFTSQ[k][1];
-        }
-        if (!gpu_error.empty()) {
-            break;
+        if (needsValidation) {
+            workspace.UpdateValidationSignature(totalEdges,
+                                               GF,
+                                               static_cast<size_t>(rowDegreeChecksum),
+                                               static_cast<size_t>(pairChecksum));
         }
 
-        gpu_success = RunCheckPassCUDA(rowBase,
-                                       RowDegree,
-                                       matValueFlat,
-                                       cnFlat,
-                                       vnFlat,
-                                       gf_cache.divFlat,
-                                       gf_cache.mulFlat,
-                                       fft0,
-                                       fft1,
-                                       TrueNoiseSynd,
+        gpu_success = RunCheckPassCUDA(workspace.rowBaseFlat.data(),
+                                       rowBase.size(),
+                                       workspace.rowDegreeFlat.data(),
+                                       RowDegree.size(),
+                                       workspace.matValueFlat.data(),
+                                       totalEdges,
+                                       workspace.cnFlat.data(),
+                                       workspace.vnFlat.data(),
+                                       gf_cache.divFlat.data(),
+                                       gf_cache.mulFlat.data(),
+                                       workspace.fft0.data(),
+                                       workspace.fft1.data(),
+                                       pairCount,
+                                       workspace.trueNoiseSyndFlat.data(),
+                                       TrueNoiseSynd.size(),
                                        M,
                                        GF,
                                        logGF,
@@ -1506,11 +1810,13 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        for (size_t edge=0; edge<totalEdges; ++edge) {
-            for (int g=0; g<GF; ++g) {
-                CNtoVNxxx[edge][g] = cnFlat[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlat[edge * GF + g];
-            }
+        for (size_t edge = 0; edge < totalEdges; ++edge) {
+            double* cnDst = CNtoVNxxx[edge].data();
+            double* vnDst = VNtoCNxxx[edge].data();
+            const double* cnSrc = cnFlatPtr + edge * GF;
+            const double* vnSrc = vnFlatPtr + edge * GF;
+            std::memcpy(cnDst, cnSrc, static_cast<size_t>(GF) * sizeof(double));
+            std::memcpy(vnDst, vnSrc, static_cast<size_t>(GF) * sizeof(double));
         }
 
         const auto total_end = std::chrono::steady_clock::now();
