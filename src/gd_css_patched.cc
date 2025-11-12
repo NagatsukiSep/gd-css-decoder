@@ -1752,9 +1752,8 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         for (size_t edge = 0; edge < totalEdges; ++edge) {
             const auto& cnVec = CNtoVNxxx[edge];
             const auto& vnVec = VNtoCNxxx[edge];
-            if (needsValidation &&
-                (cnVec.size() < static_cast<size_t>(GF) ||
-                 vnVec.size() < static_cast<size_t>(GF))) {
+            if (cnVec.size() < static_cast<size_t>(GF) ||
+                vnVec.size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
@@ -1770,14 +1769,15 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         for (int mIdx = 0; mIdx < M; ++mIdx) {
             const int degree = RowDegree[mIdx];
             const auto& row = MatValue[mIdx];
-            if (needsValidation &&
-                row.size() < static_cast<size_t>(degree)) {
+            if (row.size() < static_cast<size_t>(degree)) {
                 gpu_error = "MatValue row shorter than RowDegree";
                 break;
             }
-            std::memcpy(matValueFlatPtr + rowBase[mIdx],
-                        row.data(),
-                        static_cast<size_t>(degree) * sizeof(int));
+            if (degree > 0) {
+                std::memcpy(matValueFlatPtr + rowBase[mIdx],
+                            row.data(),
+                            static_cast<size_t>(degree) * sizeof(int));
+            }
         }
         if (!gpu_error.empty()) {
             break;
@@ -1785,7 +1785,7 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
 
         for (size_t k = 0; k < pairCount; ++k) {
             const auto& pair = FFTSQ[k];
-            if (needsValidation && pair.size() < 2) {
+            if (pair.size() < 2) {
                 gpu_error = "FFTSQ entries must contain two indices";
                 break;
             }
