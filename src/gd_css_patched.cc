@@ -467,6 +467,9 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              int M,
                              int GF,
                              int logGF,
+                             double* transfer_to_device_ms_out,
+                             double* kernel_ms_out,
+                             double* transfer_to_host_ms_out,
                              string& error) {
   const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
@@ -780,17 +783,15 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  std::streamsize previous_precision = std::cout.precision();
-  std::ios::fmtflags previous_flags = std::cout.flags();
-  std::cout << std::fixed << std::setprecision(3)
-            << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
-            << " ms, kernel: " << kernel_ms
-            << " ms, D2H: " << transfer_to_host_ms
-            << " ms, total transfer: "
-            << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
-            << std::endl;
-  std::cout.precision(previous_precision);
-  std::cout.flags(previous_flags);
+  if (transfer_to_device_ms_out) {
+    *transfer_to_device_ms_out = transfer_to_device_ms;
+  }
+  if (kernel_ms_out) {
+    *kernel_ms_out = kernel_ms;
+  }
+  if (transfer_to_host_ms_out) {
+    *transfer_to_host_ms_out = transfer_to_host_ms;
+  }
 
   cleanup();
   return true;
@@ -1353,6 +1354,11 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
+        double transfer_to_device_ms = 0.0;
+        double kernel_ms = 0.0;
+        double transfer_to_host_ms = 0.0;
+        const auto total_start = std::chrono::steady_clock::now();
+
         vector<double> cnFlat(totalEdges * static_cast<size_t>(GF));
         vector<double> vnFlat(totalEdges * static_cast<size_t>(GF));
         for (size_t edge=0; edge<totalEdges; ++edge) {
@@ -1414,7 +1420,23 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        gpu_success = RunCheckPassCUDA(rowBase, RowDegree, matValueFlat, cnFlat, vnFlat, divFlat, mulFlat, fft0, fft1, TrueNoiseSynd, M, GF, logGF, gpu_error);
+        gpu_success = RunCheckPassCUDA(rowBase,
+                                       RowDegree,
+                                       matValueFlat,
+                                       cnFlat,
+                                       vnFlat,
+                                       divFlat,
+                                       mulFlat,
+                                       fft0,
+                                       fft1,
+                                       TrueNoiseSynd,
+                                       M,
+                                       GF,
+                                       logGF,
+                                       &transfer_to_device_ms,
+                                       &kernel_ms,
+                                       &transfer_to_host_ms,
+                                       gpu_error);
         if (!gpu_success) {
             break;
         }
@@ -1425,6 +1447,31 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
                 VNtoCNxxx[edge][g] = vnFlat[edge * GF + g];
             }
         }
+
+        const auto total_end = std::chrono::steady_clock::now();
+        const double total_ms =
+            std::chrono::duration<double, std::milli>(total_end - total_start)
+                .count();
+        const double transfer_total_ms =
+            transfer_to_device_ms + transfer_to_host_ms;
+        double host_processing_ms =
+            total_ms - (transfer_total_ms + kernel_ms);
+        if (host_processing_ms < 0.0) {
+            host_processing_ms = 0.0;
+        }
+
+        std::streamsize previous_precision = std::cout.precision();
+        std::ios::fmtflags previous_flags = std::cout.flags();
+        std::cout << std::fixed << std::setprecision(3)
+                  << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
+                  << " ms, kernel: " << kernel_ms
+                  << " ms, D2H: " << transfer_to_host_ms
+                  << " ms, host-side: " << host_processing_ms
+                  << " ms, total: " << total_ms
+                  << " ms, total transfer: " << transfer_total_ms << " ms)"
+                  << std::endl;
+        std::cout.precision(previous_precision);
+        std::cout.flags(previous_flags);
 
         if (!reported_cuda_success) {
             std::cout << "CheckPass executed with CUDA acceleration." << std::endl;
