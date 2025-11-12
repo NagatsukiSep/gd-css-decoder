@@ -454,6 +454,79 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
 #endif
 
 #if GD_CSS_ENABLE_CUDA
+namespace {
+
+struct CheckPassCudaWorkspace {
+  vector<double> cnFlat;
+  vector<double> vnFlat;
+  vector<int> matValueFlat;
+  vector<int> fft0;
+  vector<int> fft1;
+
+  void EnsureEdgeCapacity(size_t totalEdges, int GF) {
+    const size_t required = totalEdges * static_cast<size_t>(GF);
+    if (cnFlat.size() != required) {
+      cnFlat.resize(required);
+    }
+    if (vnFlat.size() != required) {
+      vnFlat.resize(required);
+    }
+    if (matValueFlat.size() != totalEdges) {
+      matValueFlat.resize(totalEdges);
+    }
+  }
+
+  void EnsurePairCapacity(size_t pairCount) {
+    if (fft0.size() != pairCount) {
+      fft0.resize(pairCount);
+    }
+    if (fft1.size() != pairCount) {
+      fft1.resize(pairCount);
+    }
+  }
+};
+
+struct FlattenedGFTablesCache {
+  vector<int> divFlat;
+  vector<int> mulFlat;
+  int cachedGF = -1;
+  const vector<vector<int>>* divSource = nullptr;
+  const vector<vector<int>>* mulSource = nullptr;
+
+  bool Ensure(const vector<vector<int>>& DIVGF,
+              const vector<vector<int>>& MULGF,
+              int GF,
+              string& error) {
+    if (cachedGF == GF && divSource == &DIVGF && mulSource == &MULGF) {
+      return true;
+    }
+    if (DIVGF.size() != static_cast<size_t>(GF) ||
+        MULGF.size() != static_cast<size_t>(GF)) {
+      error = "GF lookup tables are incomplete";
+      return false;
+    }
+    divFlat.resize(static_cast<size_t>(GF) * GF);
+    mulFlat.resize(static_cast<size_t>(GF) * GF);
+    for (int i = 0; i < GF; ++i) {
+      if (DIVGF[i].size() != static_cast<size_t>(GF) ||
+          MULGF[i].size() != static_cast<size_t>(GF)) {
+        error = "GF lookup tables are incomplete";
+        return false;
+      }
+      for (int j = 0; j < GF; ++j) {
+        divFlat[i * GF + j] = DIVGF[i][j];
+        mulFlat[i * GF + j] = MULGF[i][j];
+      }
+    }
+    cachedGF = GF;
+    divSource = &DIVGF;
+    mulSource = &MULGF;
+    return true;
+  }
+};
+
+}  // namespace
+
 static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              const vector<int>& RowDegree,
                              const vector<int>& MatValueFlat,
@@ -1359,8 +1432,10 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         double transfer_to_host_ms = 0.0;
         const auto total_start = std::chrono::steady_clock::now();
 
-        vector<double> cnFlat(totalEdges * static_cast<size_t>(GF));
-        vector<double> vnFlat(totalEdges * static_cast<size_t>(GF));
+        static CheckPassCudaWorkspace workspace;
+        workspace.EnsureEdgeCapacity(totalEdges, GF);
+        auto& cnFlat = workspace.cnFlat;
+        auto& vnFlat = workspace.vnFlat;
         for (size_t edge=0; edge<totalEdges; ++edge) {
             if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
@@ -1375,7 +1450,7 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        vector<int> matValueFlat(totalEdges);
+        auto& matValueFlat = workspace.matValueFlat;
         for (int mIdx=0; mIdx<M; ++mIdx) {
             if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
                 gpu_error = "MatValue row shorter than RowDegree";
@@ -1389,25 +1464,15 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        vector<int> divFlat(static_cast<size_t>(GF) * GF);
-        vector<int> mulFlat(static_cast<size_t>(GF) * GF);
-        for (int i=0; i<GF; ++i) {
-            if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
-                gpu_error = "GF lookup tables are incomplete";
-                break;
-            }
-            for (int j=0; j<GF; ++j) {
-                divFlat[i * GF + j] = DIVGF[i][j];
-                mulFlat[i * GF + j] = MULGF[i][j];
-            }
-        }
-        if (!gpu_error.empty()) {
+        static FlattenedGFTablesCache gf_cache;
+        if (!gf_cache.Ensure(DIVGF, MULGF, GF, gpu_error)) {
             break;
         }
 
         const size_t pairCount = FFTSQ.size();
-        vector<int> fft0(pairCount);
-        vector<int> fft1(pairCount);
+        workspace.EnsurePairCapacity(pairCount);
+        auto& fft0 = workspace.fft0;
+        auto& fft1 = workspace.fft1;
         for (size_t k=0; k<pairCount; ++k) {
             if (FFTSQ[k].size() < 2) {
                 gpu_error = "FFTSQ entries must contain two indices";
@@ -1425,8 +1490,8 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
                                        matValueFlat,
                                        cnFlat,
                                        vnFlat,
-                                       divFlat,
-                                       mulFlat,
+                                       gf_cache.divFlat,
+                                       gf_cache.mulFlat,
                                        fft0,
                                        fft1,
                                        TrueNoiseSynd,
