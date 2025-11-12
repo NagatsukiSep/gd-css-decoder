@@ -26,6 +26,8 @@
 #include <chrono>
 #include <mutex>
 #include <sstream>
+#include <atomic>
+#include <string>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -54,19 +56,41 @@ using namespace std;
 namespace gd_css {
 namespace {
 
-bool IsTimingDebugEnabledInternal() {
-  const char* env = std::getenv("GD_CSS_TIMING_DEBUG");
-  if (!env) {
-    return true;
+std::atomic<bool>& TimingDebugEnabledFlag() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
+
+std::atomic<bool>& TimingDebugInitializedFlag() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
+
+void EnsureTimingDebugInitialized() {
+  if (!TimingDebugInitializedFlag().load(std::memory_order_acquire)) {
+    const char* env = std::getenv("GD_CSS_TIMING_DEBUG");
+    const bool enabled = env && std::atoi(env) != 0;
+    TimingDebugEnabledFlag().store(enabled, std::memory_order_release);
+    TimingDebugInitializedFlag().store(true, std::memory_order_release);
   }
-  return std::atoi(env) != 0;
 }
 
 }  // namespace
 
-static bool IsTimingDebugEnabled() {
-  static bool enabled = IsTimingDebugEnabledInternal();
-  return enabled;
+bool IsTimingDebugEnabled() {
+  EnsureTimingDebugInitialized();
+  return TimingDebugEnabledFlag().load(std::memory_order_acquire);
+}
+
+void SetTimingDebugEnabled(bool enabled) {
+  TimingDebugEnabledFlag().store(enabled, std::memory_order_release);
+  TimingDebugInitializedFlag().store(true, std::memory_order_release);
+}
+
+void RefreshTimingDebugEnabledFromEnv() {
+  const char* env = std::getenv("GD_CSS_TIMING_DEBUG");
+  const bool enabled = env && std::atoi(env) != 0;
+  SetTimingDebugEnabled(enabled);
 }
 
 static std::mutex& TimingMutex() {
@@ -4531,7 +4555,7 @@ int main(int argc, char * argv[]){
   int max_num_error;
   printf("argc=%d\n",argc);
   // Conditional branch.
-  if(argc!=8){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed" << endl; exit(0);}
+  if(argc<8){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed [--timing|--no-timing|--timing=0/1]" << endl; exit(0);}
   max_num_iteration=atoi(argv[1]);
   strcpy(MatrixFilePrefix_C,argv[2]);
   strcpy(MatrixFilePrefix_D,argv[3]);
@@ -4540,6 +4564,20 @@ int main(int argc, char * argv[]){
   DEBUG_transmission=atoi(argv[6]);
   unsigned seed = (unsigned) atoi(argv[7]);
   srand48(seed);
+  gd_css::RefreshTimingDebugEnabledFromEnv();
+  for (int arg_index = 8; arg_index < argc; ++arg_index) {
+    const std::string timing_flag(argv[arg_index]);
+    if (timing_flag == "--timing") {
+      gd_css::SetTimingDebugEnabled(true);
+    } else if (timing_flag == "--no-timing") {
+      gd_css::SetTimingDebugEnabled(false);
+    } else if (timing_flag.rfind("--timing=", 0) == 0) {
+      const std::string value = timing_flag.substr(std::strlen("--timing="));
+      if (!value.empty()) {
+        gd_css::SetTimingDebugEnabled(std::atoi(value.c_str()) != 0);
+      }
+    }
+  }
   const int USS_error_floor_threshold = 100;
   const int USS_stagnation_check_interval = 50;
   check_code_parameters_equal(MatrixFilePrefix_C, MatrixFilePrefix_D, M, N, GF, logGF);
