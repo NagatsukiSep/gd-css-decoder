@@ -80,6 +80,15 @@ class ScopedTimer {
   std::chrono::steady_clock::time_point start_{};
 };
 
+struct GFTablesCache {
+  std::vector<int> divFlat;
+  std::vector<int> mulFlat;
+  const std::vector<std::vector<int>>* divSource = nullptr;
+  const std::vector<std::vector<int>>* mulSource = nullptr;
+  int gf = 0;
+  bool valid = false;
+};
+
 }  // namespace
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -1227,6 +1236,12 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
 #if GD_CSS_ENABLE_CUDA
     static bool reported_cuda_success = false;
     static bool reported_cuda_failure = false;
+    static vector<double> cnFlatBuffer;
+    static vector<double> vnFlatBuffer;
+    static vector<int> matValueFlatBuffer;
+    static vector<int> fft0Buffer;
+    static vector<int> fft1Buffer;
+    static GFTablesCache gfCache;
 
     bool gpu_success = false;
     string gpu_error;
@@ -1241,81 +1256,117 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             gpu_error = "CheckPass GPU path received incompatible table dimensions";
             break;
         }
-        if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
-            gpu_error = "CheckPass GPU path requires full GF tables";
-            break;
-        }
 
-        vector<double> cnFlat(totalEdges * static_cast<size_t>(GF));
-        vector<double> vnFlat(totalEdges * static_cast<size_t>(GF));
+        cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+        vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
         for (size_t edge=0; edge<totalEdges; ++edge) {
             if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
             for (int g=0; g<GF; ++g) {
-                cnFlat[edge * GF + g] = CNtoVNxxx[edge][g];
-                vnFlat[edge * GF + g] = VNtoCNxxx[edge][g];
+                cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        vector<int> matValueFlat(totalEdges);
+        matValueFlatBuffer.resize(totalEdges);
         for (int mIdx=0; mIdx<M; ++mIdx) {
             if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
                 gpu_error = "MatValue row shorter than RowDegree";
                 break;
             }
             for (int t=0; t<RowDegree[mIdx]; ++t) {
-                matValueFlat[rowBase[mIdx] + t] = MatValue[mIdx][t];
+                matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        vector<int> divFlat(static_cast<size_t>(GF) * GF);
-        vector<int> mulFlat(static_cast<size_t>(GF) * GF);
-        for (int i=0; i<GF; ++i) {
-            if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
-                gpu_error = "GF lookup tables are incomplete";
-                break;
+        auto ensureGFTablesPacked = [&]() -> bool {
+            const size_t expectedSize = static_cast<size_t>(GF) * GF;
+            const bool needsPack = !gfCache.valid || gfCache.gf != GF ||
+                                   gfCache.divSource != &DIVGF ||
+                                   gfCache.mulSource != &MULGF ||
+                                   gfCache.divFlat.size() != expectedSize ||
+                                   gfCache.mulFlat.size() != expectedSize;
+            if (!needsPack) {
+                return true;
             }
-            for (int j=0; j<GF; ++j) {
-                divFlat[i * GF + j] = DIVGF[i][j];
-                mulFlat[i * GF + j] = MULGF[i][j];
+
+            gfCache.valid = false;
+            gfCache.gf = GF;
+            gfCache.divSource = &DIVGF;
+            gfCache.mulSource = &MULGF;
+
+            if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
+                gpu_error = "CheckPass GPU path requires full GF tables";
+                return false;
             }
-        }
-        if (!gpu_error.empty()) {
+
+            gfCache.divFlat.resize(expectedSize);
+            gfCache.mulFlat.resize(expectedSize);
+
+            for (int i=0; i<GF; ++i) {
+                if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
+                    gpu_error = "GF lookup tables are incomplete";
+                    return false;
+                }
+                for (int j=0; j<GF; ++j) {
+                    gfCache.divFlat[static_cast<size_t>(i) * GF + j] = DIVGF[i][j];
+                    gfCache.mulFlat[static_cast<size_t>(i) * GF + j] = MULGF[i][j];
+                }
+            }
+
+            gfCache.valid = true;
+            return true;
+        };
+
+        if (!ensureGFTablesPacked()) {
             break;
         }
 
         const size_t pairCount = FFTSQ.size();
-        vector<int> fft0(pairCount);
-        vector<int> fft1(pairCount);
+        fft0Buffer.resize(pairCount);
+        fft1Buffer.resize(pairCount);
         for (size_t k=0; k<pairCount; ++k) {
             if (FFTSQ[k].size() < 2) {
                 gpu_error = "FFTSQ entries must contain two indices";
                 break;
             }
-            fft0[k] = FFTSQ[k][0];
-            fft1[k] = FFTSQ[k][1];
+            fft0Buffer[k] = FFTSQ[k][0];
+            fft1Buffer[k] = FFTSQ[k][1];
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        gpu_success = RunCheckPassCUDA(rowBase, RowDegree, matValueFlat, cnFlat, vnFlat, divFlat, mulFlat, fft0, fft1, TrueNoiseSynd, M, GF, logGF, gpu_error);
+        gpu_success = RunCheckPassCUDA(rowBase,
+                                       RowDegree,
+                                       matValueFlatBuffer,
+                                       cnFlatBuffer,
+                                       vnFlatBuffer,
+                                       gfCache.divFlat,
+                                       gfCache.mulFlat,
+                                       fft0Buffer,
+                                       fft1Buffer,
+                                       TrueNoiseSynd,
+                                       M,
+                                       GF,
+                                       logGF,
+                                       gpu_error);
         if (!gpu_success) {
             break;
         }
 
         for (size_t edge=0; edge<totalEdges; ++edge) {
             for (int g=0; g<GF; ++g) {
-                CNtoVNxxx[edge][g] = cnFlat[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlat[edge * GF + g];
+                CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
+                VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
             }
         }
 
