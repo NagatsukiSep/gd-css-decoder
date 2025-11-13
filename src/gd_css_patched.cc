@@ -272,28 +272,32 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     return;
   }
 
-  extern __shared__ double shared[];
-  double* FTrue = shared;
-  double* TMP = shared + GF;
+  extern __shared__ unsigned char sharedRaw[];
+  double* FTrue = reinterpret_cast<double*>(sharedRaw);
+  double* TMP = FTrue + GF;
+  double* baseProducts = TMP + GF;
+  int* zeroCounts = reinterpret_cast<int*>(baseProducts + GF);
+  int* zeroIndex = zeroCounts + GF;
+  __shared__ double warpSums[32];
+  __shared__ double sumShared;
 
   const int tid = threadIdx.x;
   const int degree = RowDegree[row];
   const int base = rowBase[row];
+  const int warpCount = (blockDim.x + warpSize - 1) / warpSize;
 
   for (int g = tid; g < GF; g += blockDim.x) {
     FTrue[g] = (g == TrueNoiseSynd[row]) ? 1.0 : 0.0;
   }
   __syncthreads();
 
-  if (tid == 0) {
-    for (int k = 0; k < pairCount; ++k) {
-      const int i = FFT0[k];
-      const int j = FFT1[k];
-      const double A = FTrue[i];
-      const double B = FTrue[j];
-      FTrue[i] = A + B;
-      FTrue[j] = A - B;
-    }
+  for (int k = tid; k < pairCount; k += blockDim.x) {
+    const int i = FFT0[k];
+    const int j = FFT1[k];
+    const double A = FTrue[i];
+    const double B = FTrue[j];
+    FTrue[i] = A + B;
+    FTrue[j] = A - B;
   }
   __syncthreads();
 
@@ -304,84 +308,126 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       TMP[g] = edgeVec[DIVGF[g * GF + matVal]];
     }
     __syncthreads();
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = TMP[i];
+      const double B = TMP[j];
+      TMP[i] = A + B;
+      TMP[j] = A - B;
+    }
+    __syncthreads();
     for (int g = tid; g < GF; g += blockDim.x) {
       edgeVec[g] = TMP[g];
     }
     __syncthreads();
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = edgeVec[i];
-        const double B = edgeVec[j];
-        edgeVec[i] = A + B;
-        edgeVec[j] = A - B;
+  }
+
+  for (int g = tid; g < GF; g += blockDim.x) {
+    double prod = FTrue[g];
+    int zeros = 0;
+    int zeroSource = -1;
+    if (prod == 0.0) {
+      zeros = 1;
+      zeroSource = -2;
+      prod = 1.0;
+    }
+    for (int t = 0; t < degree; ++t) {
+      const double msg = VNtoCNxxx[(base + t) * GF + g];
+      if (msg == 0.0) {
+        ++zeros;
+        zeroSource = (zeroSource == -1) ? t : -3;
+      } else {
+        prod *= msg;
       }
     }
-    __syncthreads();
+    baseProducts[g] = prod;
+    zeroCounts[g] = zeros;
+    zeroIndex[g] = zeroSource;
   }
+  __syncthreads();
 
   for (int t = 0; t < degree; ++t) {
     double* outVec = CNtoVNxxx + (base + t) * GF;
     for (int g = tid; g < GF; g += blockDim.x) {
-      double value = FTrue[g];
-      for (int tz = 0; tz < degree; ++tz) {
-        if (tz == t) {
-          continue;
+      const int zeros = zeroCounts[g];
+      const int zeroSource = zeroIndex[g];
+      double value;
+      if (zeros > 1) {
+        value = 0.0;
+      } else if (zeros == 1) {
+        if (zeroSource == -2) {
+          value = 0.0;
+        } else if (zeroSource == t) {
+          value = baseProducts[g];
+        } else {
+          value = 0.0;
         }
-        value *= VNtoCNxxx[(base + tz) * GF + g];
+      } else {
+        const double msg = VNtoCNxxx[(base + t) * GF + g];
+        value = baseProducts[g] / msg;
       }
-      outVec[g] = value;
+      TMP[g] = value;
     }
     __syncthreads();
-  }
 
-  for (int t = 0; t < degree; ++t) {
-    double* outVec = CNtoVNxxx + (base + t) * GF;
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = outVec[i];
-        const double B = outVec[j];
-        outVec[i] = 0.5 * (A + B);
-        outVec[j] = 0.5 * (A - B);
-      }
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = TMP[i];
+      const double B = TMP[j];
+      TMP[i] = 0.5 * (A + B);
+      TMP[j] = 0.5 * (A - B);
     }
     __syncthreads();
 
     const int matVal = MatValue[base + t];
     for (int g = tid; g < GF; g += blockDim.x) {
-      TMP[g] = outVec[MULGF[matVal * GF + g]];
+      outVec[g] = TMP[MULGF[matVal * GF + g]];
     }
     __syncthreads();
 
-    if (tid == 0) {
-      double sum = 0.0;
-      for (int g = 0; g < GF; ++g) {
-        double v = TMP[g];
-        if (v < 0.0) {
-          v = 0.0;
-        }
-        TMP[g] = v;
-        sum += v;
-      }
-      if (sum == 0.0) {
-        const double uniform = 1.0 / static_cast<double>(GF);
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] = uniform;
-        }
-      } else {
-        const double inv = 1.0 / sum;
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] *= inv;
-        }
-      }
-    }
-    __syncthreads();
-
+    double partial = 0.0;
     for (int g = tid; g < GF; g += blockDim.x) {
-      outVec[g] = TMP[g];
+      double v = outVec[g];
+      if (v < 0.0) {
+        v = 0.0;
+      }
+      outVec[g] = v;
+      partial += v;
+    }
+
+    double sum = partial;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if ((threadIdx.x & (warpSize - 1)) == 0) {
+      warpSums[threadIdx.x / warpSize] = sum;
+    }
+    __syncthreads();
+
+    double blockSum = 0.0;
+    if (threadIdx.x < warpSize) {
+      blockSum = (threadIdx.x < warpCount) ? warpSums[threadIdx.x] : 0.0;
+      for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        blockSum += __shfl_down_sync(0xffffffff, blockSum, offset);
+      }
+      if (threadIdx.x == 0) {
+        sumShared = blockSum;
+      }
+    }
+    __syncthreads();
+
+    const double total = sumShared;
+    const double inv = (total == 0.0) ? (1.0 / static_cast<double>(GF)) : (1.0 / total);
+    if (total == 0.0) {
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] = inv;
+      }
+    } else {
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] *= inv;
+      }
     }
     __syncthreads();
   }
@@ -628,7 +674,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  const size_t sharedBytes = sizeof(double) * 2ULL * static_cast<size_t>(GF);
+  const size_t sharedBytes =
+      (sizeof(double) * 3ULL + sizeof(int) * 2ULL) * static_cast<size_t>(GF);
   if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
     error = "CheckPass CUDA kernel requires more shared memory than available";
     cleanup();
