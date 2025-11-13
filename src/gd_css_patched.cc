@@ -49,6 +49,39 @@
 #endif
 using namespace std;
 
+namespace {
+
+bool g_enable_timing_output = false;
+
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(const char* label)
+      : label_(label),
+        enabled_(g_enable_timing_output) {
+    if (enabled_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedTimer() {
+    if (!enabled_) {
+      return;
+    }
+    auto end = std::chrono::steady_clock::now();
+    double elapsed_ms =
+        std::chrono::duration<double, std::milli>(end - start_).count();
+    std::cout << "[Timing] " << label_ << ": " << elapsed_ms << " ms"
+              << std::endl;
+  }
+
+ private:
+  const char* label_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
+}  // namespace
+
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
 struct SM_StateRef {
   int &SyndromeIsSatisfied;
@@ -679,17 +712,19 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  std::streamsize previous_precision = std::cout.precision();
-  std::ios::fmtflags previous_flags = std::cout.flags();
-  std::cout << std::fixed << std::setprecision(3)
-            << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
-            << " ms, kernel: " << kernel_ms
-            << " ms, D2H: " << transfer_to_host_ms
-            << " ms, total transfer: "
-            << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
-            << std::endl;
-  std::cout.precision(previous_precision);
-  std::cout.flags(previous_flags);
+  if (g_enable_timing_output) {
+    std::streamsize previous_precision = std::cout.precision();
+    std::ios::fmtflags previous_flags = std::cout.flags();
+    std::cout << std::fixed << std::setprecision(3)
+              << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
+              << " ms, kernel: " << kernel_ms
+              << " ms, D2H: " << transfer_to_host_ms
+              << " ms, total transfer: "
+              << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+              << std::endl;
+    std::cout.precision(previous_precision);
+    std::cout.flags(previous_flags);
+  }
 
   cleanup();
   return true;
@@ -979,6 +1014,7 @@ const std::vector<std::vector<double>> &VNtoChN,
 const std::vector<int> &Interleaver,
 const std::vector<int> &ColDeg,
 int N, int GF) {
+  ScopedTimer timer("ComputeAPP");
   int numB = 0;
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
@@ -1019,6 +1055,7 @@ void Decision(std::vector<int> &Decision,
 std::vector<int> &Updated_EstmNoise_History,
 const std::vector<std::vector<double>> &APP,
 int N, int GF) {
+  ScopedTimer timer("Decision");
   Updated_EstmNoise_History.clear();
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
@@ -1067,6 +1104,7 @@ void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,do
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eigen, vector<vector<double>>& ChNtoVN, int N, int GF){// Loop: iterate over a range/collection.
+  ScopedTimer timer("ChannelPass");
   for(size_t n=0;n<N;n++){
     vector<double> input(GF);
 // Loop: iterate over a range/collection.
@@ -1086,6 +1124,7 @@ void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eig
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoChN,vector<int>& Interleaver,vector<int>& ColumnDegree,int N,int GF){
+  ScopedTimer timer("DataPass");
 
   int numB=0;
   // Loop: iterate over a range/collection.
@@ -1112,6 +1151,7 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+    ScopedTimer timer("CheckPass");
     int logGF = rint(log2(GF) / log2(2));
 
     vector<int> rowBase(M+1,0);
@@ -3963,7 +4003,7 @@ int main(int argc, char * argv[]){
   int max_num_error;
   printf("argc=%d\n",argc);
   // Conditional branch.
-  if(argc!=8){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed" << endl; exit(0);}
+  if(argc!=8 && argc!=9){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed [timing_debug]" << endl; exit(0);}
   max_num_iteration=atoi(argv[1]);
   strcpy(MatrixFilePrefix_C,argv[2]);
   strcpy(MatrixFilePrefix_D,argv[3]);
@@ -3971,6 +4011,12 @@ int main(int argc, char * argv[]){
   f_m=atof(argv[5]);
   DEBUG_transmission=atoi(argv[6]);
   unsigned seed = (unsigned) atoi(argv[7]);
+  if (argc == 9) {
+    g_enable_timing_output = atoi(argv[8]) != 0;
+  }
+  if (g_enable_timing_output) {
+    std::cout << "Timing debug output enabled." << std::endl;
+  }
   srand48(seed);
   const int USS_error_floor_threshold = 100;
   const int USS_stagnation_check_interval = 50;
