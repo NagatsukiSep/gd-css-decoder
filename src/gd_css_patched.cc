@@ -275,9 +275,6 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
   extern __shared__ unsigned char sharedRaw[];
   double* FTrue = reinterpret_cast<double*>(sharedRaw);
   double* TMP = FTrue + GF;
-  double* baseProducts = TMP + GF;
-  int* zeroCounts = reinterpret_cast<int*>(baseProducts + GF);
-  int* zeroIndex = zeroCounts + GF;
   __shared__ double warpSums[32];
   __shared__ double sumShared;
 
@@ -324,74 +321,30 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
   }
 
   for (int g = tid; g < GF; g += blockDim.x) {
-    double prod = FTrue[g];
-    int zeros = 0;
-    int zeroSource = -1;
-    if (prod == 0.0) {
-      zeros = 1;
-      zeroSource = -2;
-      prod = 1.0;
-    }
+    double prefix = FTrue[g];
     for (int t = 0; t < degree; ++t) {
-      const double msg = VNtoCNxxx[(base + t) * GF + g];
-      if (msg == 0.0) {
-        ++zeros;
-        zeroSource = (zeroSource == -1) ? t : -3;
-      } else {
-        prod *= msg;
-      }
+      CNtoVNxxx[(base + t) * GF + g] = prefix;
+      prefix *= VNtoCNxxx[(base + t) * GF + g];
     }
-    baseProducts[g] = prod;
-    zeroCounts[g] = zeros;
-    zeroIndex[g] = zeroSource;
+  }
+  __syncthreads();
+
+  for (int g = tid; g < GF; g += blockDim.x) {
+    double suffix = 1.0;
+    for (int t = degree - 1; t >= 0; --t) {
+      const int edgeIndex = (base + t) * GF + g;
+      const double prefix = CNtoVNxxx[edgeIndex];
+      const double value = prefix * suffix;
+      CNtoVNxxx[edgeIndex] = value;
+      suffix *= VNtoCNxxx[edgeIndex];
+    }
   }
   __syncthreads();
 
   for (int t = 0; t < degree; ++t) {
     double* outVec = CNtoVNxxx + (base + t) * GF;
     for (int g = tid; g < GF; g += blockDim.x) {
-      const int zeros = zeroCounts[g];
-      const int zeroSource = zeroIndex[g];
-      double value;
-      if (zeros > 1) {
-        value = 0.0;
-      } else if (zeros == 1) {
-        if (zeroSource == -2) {
-          value = 0.0;
-        } else if (zeroSource == t) {
-          value = baseProducts[g];
-        } else {
-          value = 0.0;
-        }
-      } else {
-        const double msg = VNtoCNxxx[(base + t) * GF + g];
-        if (msg == 0.0) {
-          double recomputed = FTrue[g];
-          bool zeroDetected = (recomputed == 0.0);
-          if (zeroDetected) {
-            recomputed = 0.0;
-          } else {
-            for (int u = 0; u < degree; ++u) {
-              if (u == t) {
-                continue;
-              }
-              const double other = VNtoCNxxx[(base + u) * GF + g];
-              if (other == 0.0) {
-                zeroDetected = true;
-                break;
-              }
-              recomputed *= other;
-            }
-            if (zeroDetected) {
-              recomputed = 0.0;
-            }
-          }
-          value = recomputed;
-        } else {
-          value = baseProducts[g] / msg;
-        }
-      }
-      TMP[g] = value;
+      TMP[g] = outVec[g];
     }
     __syncthreads();
 
@@ -701,7 +654,7 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   }
 
   const size_t sharedBytes =
-      (sizeof(double) * 3ULL + sizeof(int) * 2ULL) * static_cast<size_t>(GF);
+      (sizeof(double) * 2ULL) * static_cast<size_t>(GF);
   if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
     error = "CheckPass CUDA kernel requires more shared memory than available";
     cleanup();
