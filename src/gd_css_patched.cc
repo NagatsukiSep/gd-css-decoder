@@ -365,7 +365,31 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
         }
       } else {
         const double msg = VNtoCNxxx[(base + t) * GF + g];
-        value = baseProducts[g] / msg;
+        if (msg == 0.0) {
+          double recomputed = FTrue[g];
+          bool zeroDetected = (recomputed == 0.0);
+          if (zeroDetected) {
+            recomputed = 0.0;
+          } else {
+            for (int u = 0; u < degree; ++u) {
+              if (u == t) {
+                continue;
+              }
+              const double other = VNtoCNxxx[(base + u) * GF + g];
+              if (other == 0.0) {
+                zeroDetected = true;
+                break;
+              }
+              recomputed *= other;
+            }
+            if (zeroDetected) {
+              recomputed = 0.0;
+            }
+          }
+          value = recomputed;
+        } else {
+          value = baseProducts[g] / msg;
+        }
       }
       TMP[g] = value;
     }
@@ -419,12 +443,14 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     __syncthreads();
 
     const double total = sumShared;
-    const double inv = (total == 0.0) ? (1.0 / static_cast<double>(GF)) : (1.0 / total);
+    double inv;
     if (total == 0.0) {
+      inv = 1.0 / static_cast<double>(GF);
       for (int g = tid; g < GF; g += blockDim.x) {
         outVec[g] = inv;
       }
     } else {
+      inv = 1.0 / total;
       for (int g = tid; g < GF; g += blockDim.x) {
         outVec[g] *= inv;
       }
