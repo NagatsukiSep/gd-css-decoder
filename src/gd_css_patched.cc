@@ -737,34 +737,8 @@ static bool RunCheckPassCUDA(const int* rowBase,
   const size_t pairBytes = pairCount * sizeof(int);
   const size_t syndromeBytes = syndromeCount * sizeof(int);
   cudaError_t status = cudaSuccess;
-  cudaStream_t stream = nullptr;
-
-  struct TimedCopy {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t end = nullptr;
-    double* accumulator = nullptr;
-  };
-
-  std::vector<TimedCopy> h2dCopies;
-  std::vector<TimedCopy> d2hCopies;
 
   auto cleanup = [&]() {
-    auto destroyCopies = [](std::vector<TimedCopy>& copies) {
-      for (auto& copy : copies) {
-        if (copy.start) {
-          cudaEventDestroy(copy.start);
-          copy.start = nullptr;
-        }
-        if (copy.end) {
-          cudaEventDestroy(copy.end);
-          copy.end = nullptr;
-        }
-      }
-      copies.clear();
-    };
-
-    destroyCopies(h2dCopies);
-    destroyCopies(d2hCopies);
     if (d_CNtoVN) cudaFree(d_CNtoVN);
     if (d_VNtoCN) cudaFree(d_VNtoCN);
     if (d_MatValue) cudaFree(d_MatValue);
@@ -777,71 +751,27 @@ static bool RunCheckPassCUDA(const int* rowBase,
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
-    if (stream) {
-      cudaStreamDestroy(stream);
-      stream = nullptr;
-    }
   };
 
-  status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-  if (status != cudaSuccess) {
-    error = "cudaStreamCreateWithFlags failed";
-    cleanup();
-    return false;
-  }
-
-  auto timedMemcpyAsync = [&](void* dst,
-                              const void* src,
-                              size_t bytes,
-                              cudaMemcpyKind kind,
-                              const char* failure,
-                              double& accumulator,
-                              std::vector<TimedCopy>& copies) -> bool {
+  auto timedMemcpy = [&](void* dst,
+                         const void* src,
+                         size_t bytes,
+                         cudaMemcpyKind kind,
+                         const char* failure,
+                         double& accumulator) -> bool {
     if (bytes == 0) {
       return true;
     }
-    TimedCopy copy;
-    copy.accumulator = &accumulator;
-    status = cudaEventCreate(&copy.start);
-    if (status != cudaSuccess) {
-      error = "cudaEventCreate failed for copy start";
-      if (copy.start) cudaEventDestroy(copy.start);
-      cleanup();
-      return false;
-    }
-    status = cudaEventCreate(&copy.end);
-    if (status != cudaSuccess) {
-      error = "cudaEventCreate failed for copy end";
-      if (copy.start) cudaEventDestroy(copy.start);
-      if (copy.end) cudaEventDestroy(copy.end);
-      cleanup();
-      return false;
-    }
-    status = cudaEventRecord(copy.start, stream);
-    if (status != cudaSuccess) {
-      error = "cudaEventRecord failed for copy start";
-      if (copy.start) cudaEventDestroy(copy.start);
-      if (copy.end) cudaEventDestroy(copy.end);
-      cleanup();
-      return false;
-    }
-    status = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+    auto start = std::chrono::steady_clock::now();
+    status = cudaMemcpy(dst, src, bytes, kind);
+    auto end = std::chrono::steady_clock::now();
+    accumulator +=
+        std::chrono::duration<double, std::milli>(end - start).count();
     if (status != cudaSuccess) {
       error = failure;
-      if (copy.start) cudaEventDestroy(copy.start);
-      if (copy.end) cudaEventDestroy(copy.end);
       cleanup();
       return false;
     }
-    status = cudaEventRecord(copy.end, stream);
-    if (status != cudaSuccess) {
-      error = "cudaEventRecord failed for copy end";
-      if (copy.start) cudaEventDestroy(copy.start);
-      if (copy.end) cudaEventDestroy(copy.end);
-      cleanup();
-      return false;
-    }
-    copies.push_back(copy);
     return true;
   };
 
@@ -906,94 +836,84 @@ static bool RunCheckPassCUDA(const int* rowBase,
     return false;
   }
 
-  if (!timedMemcpyAsync(d_CNtoVN,
-                        CNtoVNFlat,
-                        matrixBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for CNtoVN host->device",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_CNtoVN,
+                   CNtoVNFlat,
+                   matrixBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for CNtoVN host->device",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_VNtoCN,
-                        VNtoCNFlat,
-                        matrixBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for VNtoCN host->device",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_VNtoCN,
+                   VNtoCNFlat,
+                   matrixBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for VNtoCN host->device",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_MatValue,
-                        MatValueFlat,
-                        edgesBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for MatValue",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_MatValue,
+                   MatValueFlat,
+                   edgesBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for MatValue",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_rowBase,
-                        rowBase,
-                        rowBaseBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for rowBase",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_rowBase,
+                   rowBase,
+                   rowBaseBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for rowBase",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_RowDegree,
-                        RowDegree,
-                        rowDegreeBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for RowDegree",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_RowDegree,
+                   RowDegree,
+                   rowDegreeBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for RowDegree",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_DIVGF,
-                        DIVGFFlat,
-                        gfSquareBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for DIVGF",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_DIVGF,
+                   DIVGFFlat,
+                   gfSquareBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DIVGF",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_MULGF,
-                        MULGFFlat,
-                        gfSquareBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for MULGF",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_MULGF,
+                   MULGFFlat,
+                   gfSquareBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for MULGF",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_FFT0,
-                        FFT0,
-                        pairBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for FFT0",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_FFT0,
+                   FFT0,
+                   pairBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for FFT0",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_FFT1,
-                        FFT1,
-                        pairBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for FFT1",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_FFT1,
+                   FFT1,
+                   pairBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for FFT1",
+                   transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpyAsync(d_TrueNoiseSynd,
-                        TrueNoiseSynd,
-                        syndromeBytes,
-                        cudaMemcpyHostToDevice,
-                        "cudaMemcpy failed for TrueNoiseSynd",
-                        transfer_to_device_ms,
-                        h2dCopies)) {
+  if (!timedMemcpy(d_TrueNoiseSynd,
+                   TrueNoiseSynd,
+                   syndromeBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for TrueNoiseSynd",
+                   transfer_to_device_ms)) {
     return false;
   }
 
@@ -1035,14 +955,14 @@ static bool RunCheckPassCUDA(const int* rowBase,
     cleanup();
     return false;
   }
-  status = cudaEventRecord(kernelStart, stream);
+  status = cudaEventRecord(kernelStart);
   if (status != cudaSuccess) {
     error = "cudaEventRecord failed for kernelStart";
     cleanup();
     return false;
   }
 
-  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes, stream>>>(
+  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes>>>(
       d_CNtoVN,
       d_VNtoCN,
       d_MatValue,
@@ -1058,7 +978,7 @@ static bool RunCheckPassCUDA(const int* rowBase,
       logGF,
       static_cast<int>(pairCount));
 
-  status = cudaEventRecord(kernelEnd, stream);
+  status = cudaEventRecord(kernelEnd);
   if (status != cudaSuccess) {
     error = "cudaEventRecord failed for kernelEnd";
     cleanup();
@@ -1072,64 +992,33 @@ static bool RunCheckPassCUDA(const int* rowBase,
     return false;
   }
 
-  float kernel_ms_f = 0.0f;
-  if (!timedMemcpyAsync(CNtoVNFlat,
-                        d_CNtoVN,
-                        matrixBytes,
-                        cudaMemcpyDeviceToHost,
-                        "cudaMemcpy failed for CNtoVN device->host",
-                        transfer_to_host_ms,
-                        d2hCopies)) {
-    return false;
-  }
-  if (!timedMemcpyAsync(VNtoCNFlat,
-                        d_VNtoCN,
-                        matrixBytes,
-                        cudaMemcpyDeviceToHost,
-                        "cudaMemcpy failed for VNtoCN device->host",
-                        transfer_to_host_ms,
-                        d2hCopies)) {
-    return false;
-  }
-
-  status = cudaStreamSynchronize(stream);
+  status = cudaEventSynchronize(kernelEnd);
   if (status != cudaSuccess) {
-    error = "cudaStreamSynchronize failed";
+    error = "CheckPass CUDA kernel execution failed";
     cleanup();
     return false;
   }
 
+  float kernel_ms_f = 0.0f;
   status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
   if (status == cudaSuccess) {
     kernel_ms = static_cast<double>(kernel_ms_f);
   }
 
-  auto finalizeCopies = [&](std::vector<TimedCopy>& copies) -> bool {
-    for (auto& copy : copies) {
-      if (!copy.accumulator) {
-        continue;
-      }
-      float elapsed = 0.0f;
-      status = cudaEventElapsedTime(&elapsed, copy.start, copy.end);
-      if (status != cudaSuccess) {
-        error = "cudaEventElapsedTime failed";
-        cleanup();
-        return false;
-      }
-      *copy.accumulator += static_cast<double>(elapsed);
-      cudaEventDestroy(copy.start);
-      cudaEventDestroy(copy.end);
-      copy.start = nullptr;
-      copy.end = nullptr;
-    }
-    copies.clear();
-    return true;
-  };
-
-  if (!finalizeCopies(h2dCopies)) {
+  if (!timedMemcpy(CNtoVNFlat,
+                   d_CNtoVN,
+                   matrixBytes,
+                   cudaMemcpyDeviceToHost,
+                   "cudaMemcpy failed for CNtoVN device->host",
+                   transfer_to_host_ms)) {
     return false;
   }
-  if (!finalizeCopies(d2hCopies)) {
+  if (!timedMemcpy(VNtoCNFlat,
+                   d_VNtoCN,
+                   matrixBytes,
+                   cudaMemcpyDeviceToHost,
+                   "cudaMemcpy failed for VNtoCN device->host",
+                   transfer_to_host_ms)) {
     return false;
   }
 
