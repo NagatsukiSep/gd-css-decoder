@@ -80,6 +80,11 @@ class ScopedTimer {
   std::chrono::steady_clock::time_point start_{};
 };
 
+struct GFTablesCache {
+  std::vector<int> divFlat;
+  std::vector<int> mulFlat;
+};
+
 }  // namespace
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -267,28 +272,29 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     return;
   }
 
-  extern __shared__ double shared[];
-  double* FTrue = shared;
-  double* TMP = shared + GF;
+  extern __shared__ unsigned char sharedRaw[];
+  double* FTrue = reinterpret_cast<double*>(sharedRaw);
+  double* TMP = FTrue + GF;
+  __shared__ double warpSums[32];
+  __shared__ double sumShared;
 
   const int tid = threadIdx.x;
   const int degree = RowDegree[row];
   const int base = rowBase[row];
+  const int warpCount = (blockDim.x + warpSize - 1) / warpSize;
 
   for (int g = tid; g < GF; g += blockDim.x) {
     FTrue[g] = (g == TrueNoiseSynd[row]) ? 1.0 : 0.0;
   }
   __syncthreads();
 
-  if (tid == 0) {
-    for (int k = 0; k < pairCount; ++k) {
-      const int i = FFT0[k];
-      const int j = FFT1[k];
-      const double A = FTrue[i];
-      const double B = FTrue[j];
-      FTrue[i] = A + B;
-      FTrue[j] = A - B;
-    }
+  for (int k = tid; k < pairCount; k += blockDim.x) {
+    const int i = FFT0[k];
+    const int j = FFT1[k];
+    const double A = FTrue[i];
+    const double B = FTrue[j];
+    FTrue[i] = A + B;
+    FTrue[j] = A - B;
   }
   __syncthreads();
 
@@ -299,84 +305,108 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       TMP[g] = edgeVec[DIVGF[g * GF + matVal]];
     }
     __syncthreads();
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = TMP[i];
+      const double B = TMP[j];
+      TMP[i] = A + B;
+      TMP[j] = A - B;
+    }
+    __syncthreads();
     for (int g = tid; g < GF; g += blockDim.x) {
       edgeVec[g] = TMP[g];
     }
     __syncthreads();
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = edgeVec[i];
-        const double B = edgeVec[j];
-        edgeVec[i] = A + B;
-        edgeVec[j] = A - B;
-      }
-    }
-    __syncthreads();
   }
+
+  for (int g = tid; g < GF; g += blockDim.x) {
+    double prefix = FTrue[g];
+    for (int t = 0; t < degree; ++t) {
+      CNtoVNxxx[(base + t) * GF + g] = prefix;
+      prefix *= VNtoCNxxx[(base + t) * GF + g];
+    }
+  }
+  __syncthreads();
+
+  for (int g = tid; g < GF; g += blockDim.x) {
+    double suffix = 1.0;
+    for (int t = degree - 1; t >= 0; --t) {
+      const int edgeIndex = (base + t) * GF + g;
+      const double prefix = CNtoVNxxx[edgeIndex];
+      const double value = prefix * suffix;
+      CNtoVNxxx[edgeIndex] = value;
+      suffix *= VNtoCNxxx[edgeIndex];
+    }
+  }
+  __syncthreads();
 
   for (int t = 0; t < degree; ++t) {
     double* outVec = CNtoVNxxx + (base + t) * GF;
     for (int g = tid; g < GF; g += blockDim.x) {
-      double value = FTrue[g];
-      for (int tz = 0; tz < degree; ++tz) {
-        if (tz == t) {
-          continue;
-        }
-        value *= VNtoCNxxx[(base + tz) * GF + g];
-      }
-      outVec[g] = value;
+      TMP[g] = outVec[g];
     }
     __syncthreads();
-  }
 
-  for (int t = 0; t < degree; ++t) {
-    double* outVec = CNtoVNxxx + (base + t) * GF;
-    if (tid == 0) {
-      for (int k = 0; k < pairCount; ++k) {
-        const int i = FFT0[k];
-        const int j = FFT1[k];
-        const double A = outVec[i];
-        const double B = outVec[j];
-        outVec[i] = 0.5 * (A + B);
-        outVec[j] = 0.5 * (A - B);
-      }
+    for (int k = tid; k < pairCount; k += blockDim.x) {
+      const int i = FFT0[k];
+      const int j = FFT1[k];
+      const double A = TMP[i];
+      const double B = TMP[j];
+      TMP[i] = 0.5 * (A + B);
+      TMP[j] = 0.5 * (A - B);
     }
     __syncthreads();
 
     const int matVal = MatValue[base + t];
     for (int g = tid; g < GF; g += blockDim.x) {
-      TMP[g] = outVec[MULGF[matVal * GF + g]];
+      outVec[g] = TMP[MULGF[matVal * GF + g]];
     }
     __syncthreads();
 
-    if (tid == 0) {
-      double sum = 0.0;
-      for (int g = 0; g < GF; ++g) {
-        double v = TMP[g];
-        if (v < 0.0) {
-          v = 0.0;
-        }
-        TMP[g] = v;
-        sum += v;
-      }
-      if (sum == 0.0) {
-        const double uniform = 1.0 / static_cast<double>(GF);
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] = uniform;
-        }
-      } else {
-        const double inv = 1.0 / sum;
-        for (int g = 0; g < GF; ++g) {
-          TMP[g] *= inv;
-        }
-      }
-    }
-    __syncthreads();
-
+    double partial = 0.0;
     for (int g = tid; g < GF; g += blockDim.x) {
-      outVec[g] = TMP[g];
+      double v = outVec[g];
+      if (v < 0.0) {
+        v = 0.0;
+      }
+      outVec[g] = v;
+      partial += v;
+    }
+
+    double sum = partial;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    if ((threadIdx.x & (warpSize - 1)) == 0) {
+      warpSums[threadIdx.x / warpSize] = sum;
+    }
+    __syncthreads();
+
+    double blockSum = 0.0;
+    if (threadIdx.x < warpSize) {
+      blockSum = (threadIdx.x < warpCount) ? warpSums[threadIdx.x] : 0.0;
+      for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        blockSum += __shfl_down_sync(0xffffffff, blockSum, offset);
+      }
+      if (threadIdx.x == 0) {
+        sumShared = blockSum;
+      }
+    }
+    __syncthreads();
+
+    const double total = sumShared;
+    double inv;
+    if (total == 0.0) {
+      inv = 1.0 / static_cast<double>(GF);
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] = inv;
+      }
+    } else {
+      inv = 1.0 / total;
+      for (int g = tid; g < GF; g += blockDim.x) {
+        outVec[g] *= inv;
+      }
     }
     __syncthreads();
   }
@@ -623,7 +653,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  const size_t sharedBytes = sizeof(double) * 2ULL * static_cast<size_t>(GF);
+  const size_t sharedBytes =
+      (sizeof(double) * 2ULL) * static_cast<size_t>(GF);
   if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
     error = "CheckPass CUDA kernel requires more shared memory than available";
     cleanup();
@@ -1227,6 +1258,12 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
 #if GD_CSS_ENABLE_CUDA
     static bool reported_cuda_success = false;
     static bool reported_cuda_failure = false;
+    static vector<double> cnFlatBuffer;
+    static vector<double> vnFlatBuffer;
+    static vector<int> matValueFlatBuffer;
+    static vector<int> fft0Buffer;
+    static vector<int> fft1Buffer;
+    static GFTablesCache gfCache;
 
     bool gpu_success = false;
     string gpu_error;
@@ -1241,81 +1278,103 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             gpu_error = "CheckPass GPU path received incompatible table dimensions";
             break;
         }
-        if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
-            gpu_error = "CheckPass GPU path requires full GF tables";
-            break;
-        }
 
-        vector<double> cnFlat(totalEdges * static_cast<size_t>(GF));
-        vector<double> vnFlat(totalEdges * static_cast<size_t>(GF));
+        cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+        vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
         for (size_t edge=0; edge<totalEdges; ++edge) {
             if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
             for (int g=0; g<GF; ++g) {
-                cnFlat[edge * GF + g] = CNtoVNxxx[edge][g];
-                vnFlat[edge * GF + g] = VNtoCNxxx[edge][g];
+                cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        vector<int> matValueFlat(totalEdges);
+        matValueFlatBuffer.resize(totalEdges);
         for (int mIdx=0; mIdx<M; ++mIdx) {
             if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
                 gpu_error = "MatValue row shorter than RowDegree";
                 break;
             }
             for (int t=0; t<RowDegree[mIdx]; ++t) {
-                matValueFlat[rowBase[mIdx] + t] = MatValue[mIdx][t];
+                matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        vector<int> divFlat(static_cast<size_t>(GF) * GF);
-        vector<int> mulFlat(static_cast<size_t>(GF) * GF);
-        for (int i=0; i<GF; ++i) {
-            if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
-                gpu_error = "GF lookup tables are incomplete";
-                break;
+        auto ensureGFTablesPacked = [&]() -> bool {
+            if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
+                gpu_error = "CheckPass GPU path requires full GF tables";
+                return false;
             }
-            for (int j=0; j<GF; ++j) {
-                divFlat[i * GF + j] = DIVGF[i][j];
-                mulFlat[i * GF + j] = MULGF[i][j];
+
+            const size_t expectedSize = static_cast<size_t>(GF) * GF;
+            gfCache.divFlat.resize(expectedSize);
+            gfCache.mulFlat.resize(expectedSize);
+
+            for (int i=0; i<GF; ++i) {
+                if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
+                    gpu_error = "GF lookup tables are incomplete";
+                    return false;
+                }
+                for (int j=0; j<GF; ++j) {
+                    const size_t idx = static_cast<size_t>(i) * GF + j;
+                    gfCache.divFlat[idx] = DIVGF[i][j];
+                    gfCache.mulFlat[idx] = MULGF[i][j];
+                }
             }
-        }
-        if (!gpu_error.empty()) {
+
+            return true;
+        };
+
+        if (!ensureGFTablesPacked()) {
             break;
         }
 
         const size_t pairCount = FFTSQ.size();
-        vector<int> fft0(pairCount);
-        vector<int> fft1(pairCount);
+        fft0Buffer.resize(pairCount);
+        fft1Buffer.resize(pairCount);
         for (size_t k=0; k<pairCount; ++k) {
             if (FFTSQ[k].size() < 2) {
                 gpu_error = "FFTSQ entries must contain two indices";
                 break;
             }
-            fft0[k] = FFTSQ[k][0];
-            fft1[k] = FFTSQ[k][1];
+            fft0Buffer[k] = FFTSQ[k][0];
+            fft1Buffer[k] = FFTSQ[k][1];
         }
         if (!gpu_error.empty()) {
             break;
         }
 
-        gpu_success = RunCheckPassCUDA(rowBase, RowDegree, matValueFlat, cnFlat, vnFlat, divFlat, mulFlat, fft0, fft1, TrueNoiseSynd, M, GF, logGF, gpu_error);
+        gpu_success = RunCheckPassCUDA(rowBase,
+                                       RowDegree,
+                                       matValueFlatBuffer,
+                                       cnFlatBuffer,
+                                       vnFlatBuffer,
+                                       gfCache.divFlat,
+                                       gfCache.mulFlat,
+                                       fft0Buffer,
+                                       fft1Buffer,
+                                       TrueNoiseSynd,
+                                       M,
+                                       GF,
+                                       logGF,
+                                       gpu_error);
         if (!gpu_success) {
             break;
         }
 
         for (size_t edge=0; edge<totalEdges; ++edge) {
             for (int g=0; g<GF; ++g) {
-                CNtoVNxxx[edge][g] = cnFlat[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlat[edge * GF + g];
+                CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
+                VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
             }
         }
 
