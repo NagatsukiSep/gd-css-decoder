@@ -288,15 +288,26 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
   }
   __syncthreads();
 
-  for (int k = tid; k < pairCount; k += blockDim.x) {
-    const int i = FFT0[k];
-    const int j = FFT1[k];
-    const double A = FTrue[i];
-    const double B = FTrue[j];
-    FTrue[i] = A + B;
-    FTrue[j] = A - B;
+  const int butterfliesPerStage = (logGF > 0) ? (pairCount / logGF) : 0;
+  const bool hasFFT = butterfliesPerStage > 0 && logGF > 0;
+
+  if (hasFFT) {
+    for (int stage = 0; stage < logGF; ++stage) {
+      const int stageOffset = stage * butterfliesPerStage;
+      for (int k = tid; k < butterfliesPerStage; k += blockDim.x) {
+        const int idx = stageOffset + k;
+        const int i = FFT0[idx];
+        const int j = FFT1[idx];
+        const double A = FTrue[i];
+        const double B = FTrue[j];
+        FTrue[i] = A + B;
+        FTrue[j] = A - B;
+      }
+      __syncthreads();
+    }
+  } else {
+    __syncthreads();
   }
-  __syncthreads();
 
   for (int t = 0; t < degree; ++t) {
     double* edgeVec = VNtoCNxxx + (base + t) * GF;
@@ -305,15 +316,23 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       TMP[g] = edgeVec[DIVGF[g * GF + matVal]];
     }
     __syncthreads();
-    for (int k = tid; k < pairCount; k += blockDim.x) {
-      const int i = FFT0[k];
-      const int j = FFT1[k];
-      const double A = TMP[i];
-      const double B = TMP[j];
-      TMP[i] = A + B;
-      TMP[j] = A - B;
+    if (hasFFT) {
+      for (int stage = 0; stage < logGF; ++stage) {
+        const int stageOffset = stage * butterfliesPerStage;
+        for (int k = tid; k < butterfliesPerStage; k += blockDim.x) {
+          const int idx = stageOffset + k;
+          const int i = FFT0[idx];
+          const int j = FFT1[idx];
+          const double A = TMP[i];
+          const double B = TMP[j];
+          TMP[i] = A + B;
+          TMP[j] = A - B;
+        }
+        __syncthreads();
+      }
+    } else {
+      __syncthreads();
     }
-    __syncthreads();
     for (int g = tid; g < GF; g += blockDim.x) {
       edgeVec[g] = TMP[g];
     }
@@ -348,15 +367,23 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
     }
     __syncthreads();
 
-    for (int k = tid; k < pairCount; k += blockDim.x) {
-      const int i = FFT0[k];
-      const int j = FFT1[k];
-      const double A = TMP[i];
-      const double B = TMP[j];
-      TMP[i] = 0.5 * (A + B);
-      TMP[j] = 0.5 * (A - B);
+    if (hasFFT) {
+      for (int stage = 0; stage < logGF; ++stage) {
+        const int stageOffset = stage * butterfliesPerStage;
+        for (int k = tid; k < butterfliesPerStage; k += blockDim.x) {
+          const int idx = stageOffset + k;
+          const int i = FFT0[idx];
+          const int j = FFT1[idx];
+          const double A = TMP[i];
+          const double B = TMP[j];
+          TMP[i] = 0.5 * (A + B);
+          TMP[j] = 0.5 * (A - B);
+        }
+        __syncthreads();
+      }
+    } else {
+      __syncthreads();
     }
-    __syncthreads();
 
     const int matVal = MatValue[base + t];
     for (int g = tid; g < GF; g += blockDim.x) {
@@ -1339,6 +1366,10 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         }
 
         const size_t pairCount = FFTSQ.size();
+        if (logGF > 0 && (pairCount % static_cast<size_t>(logGF)) != 0) {
+            gpu_error = "FFTSQ size must be divisible by logGF";
+            break;
+        }
         fft0Buffer.resize(pairCount);
         fft1Buffer.resize(pairCount);
         for (size_t k=0; k<pairCount; ++k) {
