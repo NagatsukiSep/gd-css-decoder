@@ -1655,6 +1655,9 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
     static vector<int> matValueFlatBuffer;
     static vector<int> fft0Buffer;
     static vector<int> fft1Buffer;
+    static vector<int> compactRowBase;
+    static vector<int> compactRowDegree;
+    static vector<int> compactEdgeMap;
     static GFTablesCache gfCache;
 
     bool gpu_success = false;
@@ -1671,30 +1674,88 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
-        vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
-        for (size_t edge=0; edge<totalEdges; ++edge) {
-            if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
-                gpu_error = "GF dimension mismatch in message buffers";
-                break;
-            }
-            for (int g=0; g<GF; ++g) {
-                cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
-                vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
-            }
-        }
-        if (!gpu_error.empty()) {
-            break;
-        }
-
+        compactRowBase.assign(M + 1, 0);
+        compactRowDegree.assign(M, 0);
+        compactEdgeMap.clear();
+        compactEdgeMap.reserve(totalEdges);
+        vector<int> compactMatValues;
+        compactMatValues.reserve(totalEdges);
         matValueFlatBuffer.resize(totalEdges);
+        bool useCompactedEdges = false;
+
         for (int mIdx=0; mIdx<M; ++mIdx) {
+            compactRowBase[mIdx] = static_cast<int>(compactMatValues.size());
             if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
                 gpu_error = "MatValue row shorter than RowDegree";
                 break;
             }
             for (int t=0; t<RowDegree[mIdx]; ++t) {
-                matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
+                const int matVal = MatValue[mIdx][t];
+                matValueFlatBuffer[rowBase[mIdx] + t] = matVal;
+                if (matVal == 0) {
+                    useCompactedEdges = true;
+                    continue;
+                }
+                compactRowDegree[mIdx]++;
+                compactMatValues.push_back(matVal);
+                compactEdgeMap.push_back(rowBase[mIdx] + t);
+            }
+            if (compactRowDegree[mIdx] != RowDegree[mIdx]) {
+                useCompactedEdges = true;
+            }
+        }
+        if (!gpu_error.empty()) {
+            break;
+        }
+        compactRowBase[M] = static_cast<int>(compactMatValues.size());
+
+        const vector<int>* gpuRowBase = &rowBase;
+        const vector<int>* gpuRowDegree = &RowDegree;
+        const vector<int>* edgeMapping = nullptr;
+
+        if (useCompactedEdges) {
+            if (compactEdgeMap.empty()) {
+                gpu_error = "No active CN/VN edges remain after filtering";
+                break;
+            }
+            matValueFlatBuffer.assign(compactMatValues.begin(), compactMatValues.end());
+            gpuRowBase = &compactRowBase;
+            gpuRowDegree = &compactRowDegree;
+            edgeMapping = &compactEdgeMap;
+        }
+
+        const size_t gpuEdges = matValueFlatBuffer.size();
+        if (gpuEdges == 0) {
+            gpu_error = "CheckPass GPU path received zero edges";
+            break;
+        }
+
+        cnFlatBuffer.resize(gpuEdges * static_cast<size_t>(GF));
+        vnFlatBuffer.resize(gpuEdges * static_cast<size_t>(GF));
+        if (edgeMapping) {
+            for (size_t idx = 0; idx < gpuEdges; ++idx) {
+                const size_t edge = static_cast<size_t>((*edgeMapping)[idx]);
+                if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) ||
+                    VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
+                    gpu_error = "GF dimension mismatch in message buffers";
+                    break;
+                }
+                for (int g = 0; g < GF; ++g) {
+                    cnFlatBuffer[idx * GF + g] = CNtoVNxxx[edge][g];
+                    vnFlatBuffer[idx * GF + g] = VNtoCNxxx[edge][g];
+                }
+            }
+        } else {
+            for (size_t edge = 0; edge < gpuEdges; ++edge) {
+                if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) ||
+                    VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
+                    gpu_error = "GF dimension mismatch in message buffers";
+                    break;
+                }
+                for (int g = 0; g < GF; ++g) {
+                    cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                    vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
+                }
             }
         }
         if (!gpu_error.empty()) {
@@ -1749,8 +1810,8 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        gpu_success = RunCheckPassCUDA(rowBase,
-                                       RowDegree,
+        gpu_success = RunCheckPassCUDA(*gpuRowBase,
+                                       *gpuRowDegree,
                                        matValueFlatBuffer,
                                        cnFlatBuffer,
                                        vnFlatBuffer,
@@ -1767,10 +1828,20 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        for (size_t edge=0; edge<totalEdges; ++edge) {
-            for (int g=0; g<GF; ++g) {
-                CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
+        if (edgeMapping) {
+            for (size_t idx = 0; idx < gpuEdges; ++idx) {
+                const size_t edge = static_cast<size_t>((*edgeMapping)[idx]);
+                for (int g = 0; g < GF; ++g) {
+                    CNtoVNxxx[edge][g] = cnFlatBuffer[idx * GF + g];
+                    VNtoCNxxx[edge][g] = vnFlatBuffer[idx * GF + g];
+                }
+            }
+        } else {
+            for (size_t edge = 0; edge < gpuEdges; ++edge) {
+                for (int g = 0; g < GF; ++g) {
+                    CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
+                    VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
+                }
             }
         }
 
