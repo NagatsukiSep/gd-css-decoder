@@ -80,6 +80,31 @@ class ScopedTimer {
   std::chrono::steady_clock::time_point start_{};
 };
 
+class ScopedDurationAccumulator {
+ public:
+  explicit ScopedDurationAccumulator(double& accumulator)
+      : accumulator_(accumulator),
+        enabled_(g_enable_timing_output) {
+    if (enabled_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedDurationAccumulator() {
+    if (!enabled_) {
+      return;
+    }
+    auto end = std::chrono::steady_clock::now();
+    accumulator_ +=
+        std::chrono::duration<double, std::milli>(end - start_).count();
+  }
+
+ private:
+  double& accumulator_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
 struct GFTablesCache {
   std::vector<int> divFlat;
   std::vector<int> mulFlat;
@@ -1953,6 +1978,10 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 
   bool gpu_success = false;
   string gpu_error;
+  double host_validation_ms = 0.0;
+  double host_flatten_cn_ms = 0.0;
+  double host_flatten_ch_ms = 0.0;
+  double host_writeback_ms = 0.0;
   do {
     if (N <= 0 || GF <= 0) {
       break;
@@ -1971,52 +2000,60 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
       break;
     }
 
-    long long expectedEdges = 0;
-    nodeBaseBuffer.resize(N);
-    for (int n = 0; n < N; ++n) {
-      nodeBaseBuffer[n] = static_cast<int>(expectedEdges);
-      expectedEdges += ColumnDegree[n];
-    }
-    if (expectedEdges != static_cast<long long>(totalEdges)) {
-      gpu_error = "Interleaver size does not match ColumnDegree sum";
-      break;
-    }
+    {
+      ScopedDurationAccumulator section(host_validation_ms);
+      long long expectedEdges = 0;
+      nodeBaseBuffer.resize(N);
+      for (int n = 0; n < N; ++n) {
+        nodeBaseBuffer[n] = static_cast<int>(expectedEdges);
+        expectedEdges += ColumnDegree[n];
+      }
+      if (expectedEdges != static_cast<long long>(totalEdges)) {
+        gpu_error = "Interleaver size does not match ColumnDegree sum";
+      }
 
-    columnDegreeBuffer.assign(ColumnDegree.begin(), ColumnDegree.begin() + N);
-    interleaverBuffer.assign(Interleaver.begin(), Interleaver.end());
-    for (size_t idx = 0; idx < totalEdges; ++idx) {
-      const int edge = interleaverBuffer[idx];
-      if (edge < 0 || static_cast<size_t>(edge) >= totalEdges) {
-        gpu_error = "Interleaver contains out-of-range index";
-        break;
+      columnDegreeBuffer.assign(ColumnDegree.begin(), ColumnDegree.begin() + N);
+      interleaverBuffer.assign(Interleaver.begin(), Interleaver.end());
+      for (size_t idx = 0; idx < totalEdges && gpu_error.empty(); ++idx) {
+        const int edge = interleaverBuffer[idx];
+        if (edge < 0 || static_cast<size_t>(edge) >= totalEdges) {
+          gpu_error = "Interleaver contains out-of-range index";
+          break;
+        }
       }
     }
     if (!gpu_error.empty()) {
       break;
     }
 
-    cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
-    for (size_t edge = 0; edge < totalEdges; ++edge) {
-      if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF)) {
-        gpu_error = "CNtoVN message shorter than GF";
-        break;
-      }
-      for (int g = 0; g < GF; ++g) {
-        cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+    {
+      ScopedDurationAccumulator section(host_flatten_cn_ms);
+      cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+      for (size_t edge = 0; edge < totalEdges; ++edge) {
+        if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF)) {
+          gpu_error = "CNtoVN message shorter than GF";
+          break;
+        }
+        for (int g = 0; g < GF; ++g) {
+          cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+        }
       }
     }
     if (!gpu_error.empty()) {
       break;
     }
 
-    chFlatBuffer.resize(static_cast<size_t>(N) * GF);
-    for (int n = 0; n < N; ++n) {
-      if (VNtoChN[n].size() < static_cast<size_t>(GF)) {
-        gpu_error = "VNtoChN vector shorter than GF";
-        break;
-      }
-      for (int g = 0; g < GF; ++g) {
-        chFlatBuffer[static_cast<size_t>(n) * GF + g] = VNtoChN[n][g];
+    {
+      ScopedDurationAccumulator section(host_flatten_ch_ms);
+      chFlatBuffer.resize(static_cast<size_t>(N) * GF);
+      for (int n = 0; n < N; ++n) {
+        if (VNtoChN[n].size() < static_cast<size_t>(GF)) {
+          gpu_error = "VNtoChN vector shorter than GF";
+          break;
+        }
+        for (int g = 0; g < GF; ++g) {
+          chFlatBuffer[static_cast<size_t>(n) * GF + g] = VNtoChN[n][g];
+        }
       }
     }
     if (!gpu_error.empty()) {
@@ -2038,15 +2075,34 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
       break;
     }
 
-    for (size_t edge = 0; edge < totalEdges; ++edge) {
-      for (int g = 0; g < GF; ++g) {
-        VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
+    {
+      ScopedDurationAccumulator section(host_writeback_ms);
+      for (size_t edge = 0; edge < totalEdges; ++edge) {
+        for (int g = 0; g < GF; ++g) {
+          VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
+        }
       }
     }
 
     if (!reported_cuda_success) {
       std::cout << "DataPass executed with CUDA acceleration." << std::endl;
       reported_cuda_success = true;
+    }
+    if (g_enable_timing_output) {
+      auto previous_precision = std::cout.precision();
+      auto previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "[Timing] DataPass host processing (validation: "
+                << host_validation_ms << " ms, flatten CN: "
+                << host_flatten_cn_ms << " ms, flatten channel: "
+                << host_flatten_ch_ms << " ms, write-back: "
+                << host_writeback_ms
+                << " ms, subtotal: "
+                << (host_validation_ms + host_flatten_cn_ms + host_flatten_ch_ms +
+                    host_writeback_ms)
+                << " ms)" << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
     }
     return;
   } while (false);
