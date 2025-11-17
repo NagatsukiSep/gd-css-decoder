@@ -227,6 +227,99 @@ using NodeList = vector<int>;
 #if GD_CSS_COMPILED_WITH_NVCC
 namespace cuda_kernels {
 
+__device__ double BlockReduceSum(double* scratch, double value) {
+  const int tid = threadIdx.x;
+  scratch[tid] = value;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      scratch[tid] += scratch[tid + offset];
+    }
+    __syncthreads();
+  }
+  return scratch[0];
+}
+
+__global__ void ChannelPassKernel(double* VNtoChN,
+                                  const double* ChNtoVN,
+                                  const double* matrixT,
+                                  int N,
+                                  int GF) {
+  const long long blockIndex = blockIdx.x +
+                               static_cast<long long>(gridDim.x) * blockIdx.y +
+                               static_cast<long long>(gridDim.x) * gridDim.y *
+                                   blockIdx.z;
+  const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                gridDim.z;
+
+  extern __shared__ double shared[];
+  double* input = shared;
+  double* output = input + GF;
+  double* scratch = output + GF;
+
+  const int tid = threadIdx.x;
+
+  for (long long rowIndex = blockIndex; rowIndex < N; rowIndex += totalBlocks) {
+    const int row = static_cast<int>(rowIndex);
+    for (int g = tid; g < GF; g += blockDim.x) {
+      input[g] = ChNtoVN[row * GF + g];
+    }
+    __syncthreads();
+
+    double partial = 0.0;
+    for (int g = tid; g < GF; g += blockDim.x) {
+      partial += input[g];
+    }
+    const double sum = BlockReduceSum(scratch, partial);
+
+    if (sum == 0.0) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = tid; g < GF; g += blockDim.x) {
+        input[g] = uniform;
+      }
+    } else {
+      const double inv = 1.0 / sum;
+      for (int g = tid; g < GF; g += blockDim.x) {
+        input[g] *= inv;
+      }
+    }
+    __syncthreads();
+
+    for (int d = tid; d < GF; d += blockDim.x) {
+      double accum = 0.0;
+      for (int e = 0; e < GF; ++e) {
+        accum += matrixT[e * GF + d] * input[e];
+      }
+      output[d] = accum;
+    }
+    __syncthreads();
+
+    partial = 0.0;
+    for (int g = tid; g < GF; g += blockDim.x) {
+      partial += output[g];
+    }
+    const double out_sum = BlockReduceSum(scratch, partial);
+
+    if (out_sum == 0.0) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = tid; g < GF; g += blockDim.x) {
+        output[g] = uniform;
+      }
+    } else {
+      const double inv = 1.0 / out_sum;
+      for (int g = tid; g < GF; g += blockDim.x) {
+        output[g] *= inv;
+      }
+    }
+    __syncthreads();
+
+    for (int g = tid; g < GF; g += blockDim.x) {
+      VNtoChN[row * GF + g] = output[g];
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void VNtoChNKernel(double* out,
                               const int* B0,
                               const int* B1,
@@ -1161,22 +1254,294 @@ void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,do
 // Function: ChannelPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eigen, vector<vector<double>>& ChNtoVN, int N, int GF){// Loop: iterate over a range/collection.
+void ChannelPass(vector<vector<double>>& VNtoChN,
+                 Eigen::MatrixXd& f_VNtoChN_eigen,
+                 vector<vector<double>>& ChNtoVN,
+                 int N,
+                 int GF) {
   ScopedTimer timer("ChannelPass");
-  for(size_t n=0;n<N;n++){
-    vector<double> input(GF);
-// Loop: iterate over a range/collection.
-    for(size_t g=0;g<GF;g++){input[g]=ChNtoVN[n][g];}
-    normalize(input,GF);
-    Eigen::VectorXd vec(GF),res(GF);
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){vec(e)=input[e];}
-    res=f_VNtoChN_eigen.transpose()*vec;
 
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){VNtoChN[n][e]=res(e);}
-    normalize(VNtoChN[n],GF);
+  auto cpu_impl = [&]() {
+    for (int n = 0; n < N; ++n) {
+      vector<double> input(GF);
+      for (int g = 0; g < GF; ++g) {
+        input[g] = ChNtoVN[n][g];
+      }
+      normalize(input, GF);
+      Eigen::VectorXd vec(GF), res(GF);
+      for (int e = 0; e < GF; ++e) {
+        vec(e) = input[e];
+      }
+      res = f_VNtoChN_eigen.transpose() * vec;
+      for (int e = 0; e < GF; ++e) {
+        VNtoChN[n][e] = res(e);
+      }
+      normalize(VNtoChN[n], GF);
+    }
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do {
+    if (N <= 0 || GF <= 0) {
+      break;
+    }
+    if (VNtoChN.size() < static_cast<size_t>(N) ||
+        ChNtoVN.size() < static_cast<size_t>(N)) {
+      gpu_error = "ChannelPass GPU path received inconsistent row counts";
+      break;
+    }
+    bool dimension_error = false;
+    for (int n = 0; n < N; ++n) {
+      if (VNtoChN[n].size() < static_cast<size_t>(GF) ||
+          ChNtoVN[n].size() < static_cast<size_t>(GF)) {
+        dimension_error = true;
+        break;
+      }
+    }
+    if (dimension_error) {
+      gpu_error = "ChannelPass GPU path received GF-dimension mismatch";
+      break;
+    }
+
+    vector<double> inputFlat(static_cast<size_t>(N) * GF);
+    vector<double> outputFlat(static_cast<size_t>(N) * GF, 0.0);
+    vector<double> matrixFlat(static_cast<size_t>(GF) * GF);
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < GF; ++g) {
+        inputFlat[static_cast<size_t>(n) * GF + g] = ChNtoVN[n][g];
+      }
+    }
+    for (int e = 0; e < GF; ++e) {
+      for (int d = 0; d < GF; ++d) {
+        matrixFlat[static_cast<size_t>(e) * GF + d] = f_VNtoChN_eigen(e, d);
+      }
+    }
+
+    double* d_input = nullptr;
+    double* d_output = nullptr;
+    double* d_matrix = nullptr;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
+    auto cleanup = [&]() {
+      if (d_input) cudaFree(d_input);
+      if (d_output) cudaFree(d_output);
+      if (d_matrix) cudaFree(d_matrix);
+      d_input = nullptr;
+      d_output = nullptr;
+      d_matrix = nullptr;
+      if (kernelStart) {
+        cudaEventDestroy(kernelStart);
+        kernelStart = nullptr;
+      }
+      if (kernelEnd) {
+        cudaEventDestroy(kernelEnd);
+        kernelEnd = nullptr;
+      }
+    };
+
+    const size_t vectorBytes = inputFlat.size() * sizeof(double);
+    const size_t matrixBytes = matrixFlat.size() * sizeof(double);
+    cudaError_t status = cudaSuccess;
+
+    auto timedMemcpy = [&](void* dst,
+                           const void* src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char* failure,
+                           double& accumulator) {
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess) {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
+
+    status = cudaMalloc(&d_input, vectorBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass input buffer";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_output, vectorBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass output buffer";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_matrix, matrixBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass matrix";
+      cleanup();
+      break;
+    }
+
+    if (!timedMemcpy(d_input,
+                     inputFlat.data(),
+                     vectorBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ChannelPass input",
+                     transfer_to_device_ms)) {
+      break;
+    }
+    if (!timedMemcpy(d_matrix,
+                     matrixFlat.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ChannelPass matrix",
+                     transfer_to_device_ms)) {
+      break;
+    }
+
+    int threads = 1;
+    while (threads < GF && threads < 1024) {
+      threads <<= 1;
+    }
+    if (threads > 1024) {
+      threads = 1024;
+    }
+    int grid_x = std::min(N, 65535);
+    if (grid_x == 0) {
+      grid_x = 1;
+    }
+    int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+    grid_y = std::min(grid_y, 65535);
+    dim3 grid(grid_x, grid_y);
+    dim3 block(threads);
+    const size_t sharedBytes = sizeof(double) *
+                               (2 * static_cast<size_t>(GF) + block.x);
+
+    int device = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaGetDevice failed for ChannelPass";
+      cleanup();
+      break;
+    }
+    int maxSharedBytes = 0;
+    status = cudaDeviceGetAttribute(&maxSharedBytes,
+                                    cudaDevAttrMaxSharedMemoryPerBlock,
+                                    device);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaDeviceGetAttribute failed for ChannelPass";
+      cleanup();
+      break;
+    }
+    if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
+      gpu_error = "ChannelPass kernel requires more shared memory than available";
+      cleanup();
+      break;
+    }
+
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+
+    cuda_kernels::ChannelPassKernel<<<grid, block, sharedBytes>>>(
+        d_output, d_input, d_matrix, N, GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaEventSynchronize(kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass kernel execution failed";
+      cleanup();
+      break;
+    }
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess) {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    if (!timedMemcpy(outputFlat.data(),
+                     d_output,
+                     vectorBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for ChannelPass output",
+                     transfer_to_host_ms)) {
+      break;
+    }
+
+    cleanup();
+
+    if (g_enable_timing_output) {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "ChannelPass CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < GF; ++g) {
+        VNtoChN[n][g] = outputFlat[static_cast<size_t>(n) * GF + g];
+      }
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "ChannelPass executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (!gpu_success) {
+    if (!gpu_error.empty() && !reported_cuda_failure) {
+      std::cerr << "ChannelPass GPU path failed: " << gpu_error
+                << ". Falling back to CPU implementation." << std::endl;
+      reported_cuda_failure = true;
+    }
+  } else {
+    return;
   }
+#endif
+
+  cpu_impl();
 }
 // Function: DataPass
 // Purpose: TODO - describe the function's responsibility succinctly.
