@@ -1325,6 +1325,11 @@ void ChannelPass(vector<vector<double>>& VNtoChN,
     double* d_input = nullptr;
     double* d_output = nullptr;
     double* d_matrix = nullptr;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
     auto cleanup = [&]() {
       if (d_input) cudaFree(d_input);
       if (d_output) cudaFree(d_output);
@@ -1332,11 +1337,38 @@ void ChannelPass(vector<vector<double>>& VNtoChN,
       d_input = nullptr;
       d_output = nullptr;
       d_matrix = nullptr;
+      if (kernelStart) {
+        cudaEventDestroy(kernelStart);
+        kernelStart = nullptr;
+      }
+      if (kernelEnd) {
+        cudaEventDestroy(kernelEnd);
+        kernelEnd = nullptr;
+      }
     };
 
     const size_t vectorBytes = inputFlat.size() * sizeof(double);
     const size_t matrixBytes = matrixFlat.size() * sizeof(double);
     cudaError_t status = cudaSuccess;
+
+    auto timedMemcpy = [&](void* dst,
+                           const void* src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char* failure,
+                           double& accumulator) {
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess) {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
 
     status = cudaMalloc(&d_input, vectorBytes);
     if (status != cudaSuccess) {
@@ -1357,22 +1389,20 @@ void ChannelPass(vector<vector<double>>& VNtoChN,
       break;
     }
 
-    status = cudaMemcpy(d_input,
-                        inputFlat.data(),
-                        vectorBytes,
-                        cudaMemcpyHostToDevice);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMemcpy failed for ChannelPass input";
-      cleanup();
+    if (!timedMemcpy(d_input,
+                     inputFlat.data(),
+                     vectorBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ChannelPass input",
+                     transfer_to_device_ms)) {
       break;
     }
-    status = cudaMemcpy(d_matrix,
-                        matrixFlat.data(),
-                        matrixBytes,
-                        cudaMemcpyHostToDevice);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMemcpy failed for ChannelPass matrix";
-      cleanup();
+    if (!timedMemcpy(d_matrix,
+                     matrixFlat.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ChannelPass matrix",
+                     transfer_to_device_ms)) {
       break;
     }
 
@@ -1416,32 +1446,76 @@ void ChannelPass(vector<vector<double>>& VNtoChN,
       break;
     }
 
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+
     cuda_kernels::ChannelPassKernel<<<grid, block, sharedBytes>>>(
         d_output, d_input, d_matrix, N, GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
     status = cudaGetLastError();
     if (status != cudaSuccess) {
       gpu_error = "ChannelPass kernel launch failed";
       cleanup();
       break;
     }
-    status = cudaDeviceSynchronize();
+    status = cudaEventSynchronize(kernelEnd);
     if (status != cudaSuccess) {
       gpu_error = "ChannelPass kernel execution failed";
       cleanup();
       break;
     }
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess) {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
 
-    status = cudaMemcpy(outputFlat.data(),
-                        d_output,
-                        vectorBytes,
-                        cudaMemcpyDeviceToHost);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMemcpy failed for ChannelPass output";
-      cleanup();
+    if (!timedMemcpy(outputFlat.data(),
+                     d_output,
+                     vectorBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for ChannelPass output",
+                     transfer_to_host_ms)) {
       break;
     }
 
     cleanup();
+
+    if (g_enable_timing_output) {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "ChannelPass CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
 
     for (int n = 0; n < N; ++n) {
       for (int g = 0; g < GF; ++g) {
