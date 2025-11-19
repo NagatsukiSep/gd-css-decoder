@@ -676,14 +676,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNFlat.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
-    return false;
-  }
+  // CNtoVN is written entirely by the kernel, so we only transfer VNtoCN
+  // to the device to provide the necessary inputs.
   if (!timedMemcpy(d_VNtoCN,
                    VNtoCNFlat.data(),
                    matrixBytes,
@@ -1679,7 +1673,8 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
                 break;
             }
             for (int g=0; g<GF; ++g) {
-                cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                // CNtoVN is produced entirely inside the CUDA kernel, so there is no
+                // need to copy the host-side values into the flat buffer beforehand.
                 vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
             }
         }
