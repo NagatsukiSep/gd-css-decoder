@@ -442,35 +442,19 @@ void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,do
 
 void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eigen, vector<vector<double>>& ChNtoVN, int N, int GF){// Loop: iterate over a range/collection.
   ScopedTimer timer("ChannelPass");
-  double h2d_ms = 0.0;
-  double kernel_ms = 0.0;
-  double d2h_ms = 0.0;
   for(size_t n=0;n<N;n++){
     vector<double> input(GF);
     Eigen::VectorXd vec(GF),res(GF);
-    const auto h2d_start = std::chrono::steady_clock::now();
 // Loop: iterate over a range/collection.
     for(size_t g=0;g<GF;g++){input[g]=ChNtoVN[n][g];}
     normalize(input,GF);
     // Loop: iterate over a range/collection.
     for(size_t e=0;e<GF;e++){vec(e)=input[e];}
-    const auto h2d_end = std::chrono::steady_clock::now();
-    h2d_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(h2d_end - h2d_start).count();
-
-    const auto kernel_start = std::chrono::steady_clock::now();
     res=f_VNtoChN_eigen.transpose()*vec;
-    const auto kernel_end = std::chrono::steady_clock::now();
-    kernel_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(kernel_end - kernel_start).count();
-
-    const auto d2h_start = std::chrono::steady_clock::now();
     // Loop: iterate over a range/collection.
     for(size_t e=0;e<GF;e++){VNtoChN[n][e]=res(e);}
     normalize(VNtoChN[n],GF);
-    const auto d2h_end = std::chrono::steady_clock::now();
-    d2h_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(d2h_end - d2h_start).count();
   }
-  printf("ChannelPass CUDA timing (H2D: %.3f ms, kernel: %.3f ms, D2H: %.3f ms, total transfer: %.3f ms)\n",
-         h2d_ms, kernel_ms, d2h_ms, h2d_ms + d2h_ms);
 }
 // Function: DataPass
 // Purpose: TODO - describe the function's responsibility succinctly.
