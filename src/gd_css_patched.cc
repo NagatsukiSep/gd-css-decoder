@@ -639,6 +639,56 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
+  auto ensureResidentBuffer = [&](DeviceIntBuffer& buffer,
+                                  const vector<int>& host,
+                                  const char* mallocFailure,
+                                  const char* memcpyFailure,
+                                  double& accumulator) -> bool {
+    const size_t requiredBytes = host.size() * sizeof(int);
+
+    if (requiredBytes == 0) {
+      if (buffer.ptr) {
+        cudaFree(buffer.ptr);
+        buffer.ptr = nullptr;
+      }
+      buffer.bytes = 0;
+      buffer.primed = true;
+      return true;
+    }
+
+    if (!buffer.ptr || buffer.bytes < requiredBytes) {
+      if (buffer.ptr) {
+        cudaFree(buffer.ptr);
+      }
+      status = cudaMalloc(&buffer.ptr, requiredBytes);
+      if (status != cudaSuccess) {
+        error = mallocFailure;
+        cleanup();
+        return false;
+      }
+      buffer.bytes = requiredBytes;
+      buffer.primed = false;
+    }
+
+    if (!refreshPersistentMetadata && buffer.primed) {
+      return true;
+    }
+
+    if (!timedMemcpy(buffer.ptr,
+                     host.data(),
+                     requiredBytes,
+                     cudaMemcpyHostToDevice,
+                     memcpyFailure,
+                     accumulator)) {
+      return false;
+    }
+
+    buffer.primed = true;
+    return true;
+  };
+
+  CheckPassMetadataCache& metadataCache = g_checkpass_metadata_cache;
+
   status = cudaMalloc(&d_CNtoVN, matrixBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for CNtoVN buffer";
