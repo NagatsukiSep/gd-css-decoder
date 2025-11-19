@@ -193,6 +193,7 @@ class FlatMatrix {
       return false;
     }
     cuda_device_capacity_ = bytes;
+    cuda_device_data_valid_ = false;
     return true;
   }
 
@@ -212,6 +213,7 @@ class FlatMatrix {
       }
       return false;
     }
+    cuda_device_data_valid_ = true;
     return true;
   }
 
@@ -243,9 +245,24 @@ class FlatMatrix {
     }
     cuda_device_storage_ = nullptr;
     cuda_device_capacity_ = 0;
+    cuda_device_data_valid_ = false;
   }
 
   double* cuda_device_storage() const { return cuda_device_storage_; }
+
+  bool hasValidDeviceData() const {
+    return cuda_device_storage_ && cuda_device_data_valid_;
+  }
+
+  void markDeviceDataValid(bool valid = true) {
+    cuda_device_data_valid_ = valid && cuda_device_storage_;
+  }
+
+  void markDeviceDataInvalid() { cuda_device_data_valid_ = false; }
+#else
+  bool hasValidDeviceData() const { return false; }
+  void markDeviceDataValid(bool = true) {}
+  void markDeviceDataInvalid() {}
 #endif
 
  private:
@@ -259,6 +276,7 @@ class FlatMatrix {
   bool cuda_registered_ = false;
   double* cuda_device_storage_ = nullptr;
   size_t cuda_device_capacity_ = 0;
+  bool cuda_device_data_valid_ = false;
 #endif
 };
 
@@ -1300,6 +1318,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     kernel_ms = static_cast<double>(kernel_ms_f);
   }
 
+  CNtoVNxxx.markDeviceDataValid();
+  VNtoCNxxx.markDeviceDataValid();
   if (!timedMemcpy(CNtoVNxxx.data(),
                    d_CNtoVN,
                    matrixBytes,
@@ -1649,6 +1669,10 @@ void ComputeAPP(FlatMatrix &APP,
       }
       numB += ColDeg[n];
     }
+#if GD_CSS_ENABLE_CUDA
+    ChNtoVN.markDeviceDataInvalid();
+    APP.markDeviceDataInvalid();
+#endif
   };
 
 #if GD_CSS_ENABLE_CUDA
@@ -1717,16 +1741,8 @@ void ComputeAPP(FlatMatrix &APP,
     cudaError_t status = cudaSuccess;
 
     auto cleanup = [&]() {
-      if (d_CNtoVN) cudaFree(d_CNtoVN);
-      if (d_VNtoCh) cudaFree(d_VNtoCh);
-      if (d_ChNtoVN) cudaFree(d_ChNtoVN);
-      if (d_APP) cudaFree(d_APP);
       if (kernelStart) cudaEventDestroy(kernelStart);
       if (kernelEnd) cudaEventDestroy(kernelEnd);
-      d_CNtoVN = nullptr;
-      d_VNtoCh = nullptr;
-      d_ChNtoVN = nullptr;
-      d_APP = nullptr;
       kernelStart = nullptr;
       kernelEnd = nullptr;
     };
@@ -1753,32 +1769,49 @@ void ComputeAPP(FlatMatrix &APP,
       return true;
     };
 
-    if (matrixBytes > 0) {
-      status = cudaMalloc(&d_CNtoVN, matrixBytes);
-      if (status != cudaSuccess) {
-        gpu_error = "cudaMalloc failed for ComputeAPP CNtoVN buffer";
-        cleanup();
-        break;
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                                 size_t bytes,
+                                 const char* failure) -> double* {
+      if (bytes == 0) {
+        return nullptr;
       }
-    }
-    status = cudaMalloc(&d_VNtoCh, nodeBytes);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMalloc failed for ComputeAPP VNtoChN buffer";
-      cleanup();
-      break;
-    }
-    status = cudaMalloc(&d_ChNtoVN, nodeBytes);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMalloc failed for ComputeAPP ChNtoVN buffer";
-      cleanup();
-      break;
-    }
-    status = cudaMalloc(&d_APP, nodeBytes);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMalloc failed for ComputeAPP APP buffer";
-      cleanup();
-      break;
-    }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        cleanup();
+        return nullptr;
+      }
+      double* ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData()) {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms)) {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
+    };
+
+    auto prepareMatrixOutput = [&](FlatMatrix& matrix,
+                                   size_t bytes,
+                                   const char* label) -> double* {
+      if (bytes == 0) {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        cleanup();
+        return nullptr;
+      }
+      matrix.markDeviceDataInvalid();
+      double* ptr = matrix.cuda_device_storage();
+      if (!ptr) {
+        gpu_error = label;
+        cleanup();
+      }
+      return ptr;
+    };
 
     if (!EnsureDeviceArray(constant_set.interleaver,
                            totalEdges,
@@ -1798,8 +1831,6 @@ void ComputeAPP(FlatMatrix &APP,
       cleanup();
       break;
     }
-
-    constant_set.nodeBase.dirty = true;
 
     auto copyVector = [&](DeviceArray<int>& buffer,
                           const vector<int>& host,
@@ -1836,21 +1867,30 @@ void ComputeAPP(FlatMatrix &APP,
       break;
     }
 
-    if (matrixBytes > 0 &&
-        !timedMemcpy(d_CNtoVN,
-                     CNtoVNxxx.data(),
-                     matrixBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for ComputeAPP CNtoVN",
-                     transfer_to_device_ms)) {
+    if (matrixBytes > 0) {
+      d_CNtoVN = ensureMatrixInput(CNtoVNxxx,
+                                   matrixBytes,
+                                   "cudaMemcpy failed for ComputeAPP CNtoVN");
+      if (!d_CNtoVN) {
+        break;
+      }
+    }
+    d_VNtoCh = ensureMatrixInput(VNtoChN,
+                                 nodeBytes,
+                                 "cudaMemcpy failed for ComputeAPP VNtoChN");
+    if (!d_VNtoCh && nodeBytes > 0) {
       break;
     }
-    if (!timedMemcpy(d_VNtoCh,
-                     VNtoChN.data(),
-                     nodeBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for ComputeAPP VNtoChN",
-                     transfer_to_device_ms)) {
+    d_ChNtoVN = prepareMatrixOutput(ChNtoVN,
+                                    nodeBytes,
+                                    "ComputeAPP ChNtoVN device storage unavailable");
+    if (!d_ChNtoVN && nodeBytes > 0) {
+      break;
+    }
+    d_APP = prepareMatrixOutput(APP,
+                                nodeBytes,
+                                "ComputeAPP APP device storage unavailable");
+    if (!d_APP && nodeBytes > 0) {
       break;
     }
 
@@ -1919,6 +1959,8 @@ void ComputeAPP(FlatMatrix &APP,
       kernel_ms = static_cast<double>(kernel_ms_f);
     }
 
+    ChNtoVN.markDeviceDataValid();
+    APP.markDeviceDataValid();
     if (!timedMemcpy(ChNtoVN.data(),
                      d_ChNtoVN,
                      nodeBytes,
@@ -2048,6 +2090,9 @@ void ChannelPass_zero(FlatMatrix& VNtoChN,
       VNtoChN[n][g]=VNtoChN0[g];
     }
   }
+#if GD_CSS_ENABLE_CUDA
+  VNtoChN.markDeviceDataInvalid();
+#endif
 }
 // Function: ChannelPass
 // Purpose: TODO - describe the function's responsibility succinctly.
@@ -2076,6 +2121,9 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
       normalize(VNtoChN[n], GF);
     }
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN.markDeviceDataInvalid();
+#endif
   };
 
 #if GD_CSS_ENABLE_CUDA
@@ -2122,11 +2170,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
     double transfer_to_host_ms = 0.0;
     double kernel_ms = 0.0;
     auto cleanup = [&]() {
-      if (d_input) cudaFree(d_input);
-      if (d_output) cudaFree(d_output);
       if (d_matrix) cudaFree(d_matrix);
-      d_input = nullptr;
-      d_output = nullptr;
       d_matrix = nullptr;
       if (kernelStart) {
         cudaEventDestroy(kernelStart);
@@ -2161,18 +2205,26 @@ void ChannelPass(FlatMatrix& VNtoChN,
       return true;
     };
 
-    status = cudaMalloc(&d_input, vectorBytes);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMalloc failed for ChannelPass input buffer";
+    if (!ChNtoVN.ensureCudaDeviceStorage(vectorBytes, &gpu_error) ||
+        !VNtoChN.ensureCudaDeviceStorage(vectorBytes, &gpu_error)) {
       cleanup();
       break;
     }
-    status = cudaMalloc(&d_output, vectorBytes);
-    if (status != cudaSuccess) {
-      gpu_error = "cudaMalloc failed for ChannelPass output buffer";
-      cleanup();
-      break;
+    d_input = ChNtoVN.cuda_device_storage();
+    d_output = VNtoChN.cuda_device_storage();
+    if (vectorBytes > 0 && !ChNtoVN.hasValidDeviceData()) {
+      if (!timedMemcpy(d_input,
+                       ChNtoVN.data(),
+                       vectorBytes,
+                       cudaMemcpyHostToDevice,
+                       "cudaMemcpy failed for ChannelPass input",
+                       transfer_to_device_ms)) {
+        break;
+      }
+      ChNtoVN.markDeviceDataValid();
     }
+    VNtoChN.markDeviceDataInvalid();
+
     status = cudaMalloc(&d_matrix, matrixBytes);
     if (status != cudaSuccess) {
       gpu_error = "cudaMalloc failed for ChannelPass matrix";
@@ -2180,14 +2232,6 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
 
-    if (!timedMemcpy(d_input,
-                     ChNtoVN.data(),
-                     vectorBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for ChannelPass input",
-                     transfer_to_device_ms)) {
-      break;
-    }
     if (!timedMemcpy(d_matrix,
                      matrixFlat.data(),
                      matrixBytes,
@@ -2283,6 +2327,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
       kernel_ms = static_cast<double>(kernel_ms_f);
     }
 
+    VNtoChN.markDeviceDataValid();
     if (!timedMemcpy(VNtoChN.data(),
                      d_output,
                      vectorBytes,
@@ -2365,6 +2410,9 @@ void DataPass(FlatMatrix& VNtoCNxxx,
       }
       numB += degree;
     }
+#if GD_CSS_ENABLE_CUDA
+    VNtoCNxxx.markDeviceDataInvalid();
+#endif
   };
 
 #if GD_CSS_ENABLE_CUDA
@@ -2479,8 +2527,6 @@ void DataPass(FlatMatrix& VNtoCNxxx,
       cleanup();
       break;
     }
-
-    constant_set.nodeBase.dirty = true;
 
     auto copyVector = [&](DeviceArray<int>& buffer,
                           const vector<int>& host,
@@ -2626,6 +2672,7 @@ void DataPass(FlatMatrix& VNtoCNxxx,
       kernel_ms = static_cast<double>(kernel_ms_f);
     }
 
+    VNtoCNxxx.markDeviceDataValid();
     if (!timedMemcpy(VNtoCNxxx.data(),
                      d_VNtoCN,
                      matrixBytes,
@@ -2754,6 +2801,10 @@ void CheckPass(FlatMatrix& CNtoVNxxx,
                 normalize(CNtoVNxxx[base+t], GF);
             }
         }
+#if GD_CSS_ENABLE_CUDA
+        CNtoVNxxx.markDeviceDataInvalid();
+        VNtoCNxxx.markDeviceDataInvalid();
+#endif
     };
 
 #if GD_CSS_ENABLE_CUDA
@@ -5175,6 +5226,9 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
       int g_hat = EstmNoise[n];
       ChNtoVN[n][g_hat] = 1;
     }
+#if GD_CSS_ENABLE_CUDA
+    ChNtoVN.markDeviceDataInvalid();
+#endif
   }
 }
 // Function: load_size
@@ -5650,13 +5704,27 @@ int main(int argc, char * argv[]){
 
     // Loop: iterate over a range/collection.
     for(size_t l=0;l<NumEdge_C;l++) { for(size_t g=0;g<GF;g++) CNtoVNxxx_C[l][g]=1.0/GF; }
+#if GD_CSS_ENABLE_CUDA
+    CNtoVNxxx_C.markDeviceDataInvalid();
+#endif
     // Loop: iterate over a range/collection.
     for(size_t l=0;l<N;l++) { for(size_t g=0;g<GF;g++){ VNtoChN_CD[l][g]=1.0/GF;ChNtoVN_CD[l][g]=1.0; }}
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN_CD.markDeviceDataInvalid();
+    ChNtoVN_CD.markDeviceDataInvalid();
+#endif
 
     // Loop: iterate over a range/collection.
     for(size_t l=0;l<NumEdge_D;l++) { for(size_t g=0;g<GF;g++) CNtoVNxxx_D[l][g]=1.0/GF; }
+#if GD_CSS_ENABLE_CUDA
+    CNtoVNxxx_D.markDeviceDataInvalid();
+#endif
     // Loop: iterate over a range/collection.
     for(size_t l=0;l<N;l++) { for(size_t g=0;g<GF;g++){ VNtoChN_DC[l][g]=1.0/GF;ChNtoVN_DC[l][g]=1.0; }}
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN_DC.markDeviceDataInvalid();
+    ChNtoVN_DC.markDeviceDataInvalid();
+#endif
 
     cout << "Decoding Iteration" << endl;
     itr=0;
