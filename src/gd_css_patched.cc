@@ -85,6 +85,47 @@ struct GFTablesCache {
   std::vector<int> mulFlat;
 };
 
+#if GD_CSS_ENABLE_CUDA
+struct DeviceIntBuffer {
+  int* ptr = nullptr;
+  size_t bytes = 0;
+  bool primed = false;
+
+  void Reset() {
+    if (ptr) {
+      cudaFree(ptr);
+      ptr = nullptr;
+    }
+    bytes = 0;
+    primed = false;
+  }
+};
+
+struct CheckPassMetadataCache {
+  DeviceIntBuffer matValue;
+  DeviceIntBuffer rowBase;
+  DeviceIntBuffer rowDegree;
+  DeviceIntBuffer divGF;
+  DeviceIntBuffer mulGF;
+  DeviceIntBuffer fft0;
+  DeviceIntBuffer fft1;
+
+  ~CheckPassMetadataCache() { Reset(); }
+
+  void Reset() {
+    matValue.Reset();
+    rowBase.Reset();
+    rowDegree.Reset();
+    divGF.Reset();
+    mulGF.Reset();
+    fft0.Reset();
+    fft1.Reset();
+  }
+};
+
+CheckPassMetadataCache g_checkpass_metadata_cache;
+#endif
+
 }  // namespace
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
@@ -549,6 +590,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              int M,
                              int GF,
                              int logGF,
+                             bool refreshPersistentMetadata,
+                             bool copyVNBackToHost,
                              string& error) {
   const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
@@ -557,13 +600,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
 
   double* d_CNtoVN = nullptr;
   double* d_VNtoCN = nullptr;
-  int* d_MatValue = nullptr;
-  int* d_rowBase = nullptr;
-  int* d_RowDegree = nullptr;
-  int* d_DIVGF = nullptr;
-  int* d_MULGF = nullptr;
-  int* d_FFT0 = nullptr;
-  int* d_FFT1 = nullptr;
   int* d_TrueNoiseSynd = nullptr;
   double transfer_to_device_ms = 0.0;
   double transfer_to_host_ms = 0.0;
@@ -572,25 +608,13 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   cudaEvent_t kernelEnd = nullptr;
 
   const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
-  const size_t edgesBytes = totalEdges * sizeof(int);
-  const size_t rowBaseBytes = rowBase.size() * sizeof(int);
-  const size_t rowDegreeBytes = RowDegree.size() * sizeof(int);
-  const size_t gfSquareBytes = static_cast<size_t>(GF) * static_cast<size_t>(GF) * sizeof(int);
   const size_t pairCount = FFT0.size();
-  const size_t pairBytes = pairCount * sizeof(int);
   const size_t syndromeBytes = TrueNoiseSynd.size() * sizeof(int);
   cudaError_t status = cudaSuccess;
 
   auto cleanup = [&]() {
     if (d_CNtoVN) cudaFree(d_CNtoVN);
     if (d_VNtoCN) cudaFree(d_VNtoCN);
-    if (d_MatValue) cudaFree(d_MatValue);
-    if (d_rowBase) cudaFree(d_rowBase);
-    if (d_RowDegree) cudaFree(d_RowDegree);
-    if (d_DIVGF) cudaFree(d_DIVGF);
-    if (d_MULGF) cudaFree(d_MULGF);
-    if (d_FFT0) cudaFree(d_FFT0);
-    if (d_FFT1) cudaFree(d_FFT1);
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
@@ -615,6 +639,56 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
+  auto ensureResidentBuffer = [&](DeviceIntBuffer& buffer,
+                                  const vector<int>& host,
+                                  const char* mallocFailure,
+                                  const char* memcpyFailure,
+                                  double& accumulator) -> bool {
+    const size_t requiredBytes = host.size() * sizeof(int);
+
+    if (requiredBytes == 0) {
+      if (buffer.ptr) {
+        cudaFree(buffer.ptr);
+        buffer.ptr = nullptr;
+      }
+      buffer.bytes = 0;
+      buffer.primed = true;
+      return true;
+    }
+
+    if (!buffer.ptr || buffer.bytes < requiredBytes) {
+      if (buffer.ptr) {
+        cudaFree(buffer.ptr);
+      }
+      status = cudaMalloc(&buffer.ptr, requiredBytes);
+      if (status != cudaSuccess) {
+        error = mallocFailure;
+        cleanup();
+        return false;
+      }
+      buffer.bytes = requiredBytes;
+      buffer.primed = false;
+    }
+
+    if (!refreshPersistentMetadata && buffer.primed) {
+      return true;
+    }
+
+    if (!timedMemcpy(buffer.ptr,
+                     host.data(),
+                     requiredBytes,
+                     cudaMemcpyHostToDevice,
+                     memcpyFailure,
+                     accumulator)) {
+      return false;
+    }
+
+    buffer.primed = true;
+    return true;
+  };
+
+  CheckPassMetadataCache& metadataCache = g_checkpass_metadata_cache;
+
   status = cudaMalloc(&d_CNtoVN, matrixBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for CNtoVN buffer";
@@ -627,48 +701,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     cleanup();
     return false;
   }
-  status = cudaMalloc(&d_MatValue, edgesBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for MatValue";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_rowBase, rowBaseBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for rowBase";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_RowDegree, rowDegreeBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for RowDegree";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_DIVGF, gfSquareBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for DIVGF";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_MULGF, gfSquareBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for MULGF";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_FFT0, pairBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for FFT0";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_FFT1, pairBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for FFT1";
-    cleanup();
-    return false;
-  }
   status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for TrueNoiseSynd";
@@ -676,14 +708,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNFlat.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
-    return false;
-  }
+  // CNtoVN is written entirely by the kernel, so we only transfer VNtoCN
+  // to the device to provide the necessary inputs.
   if (!timedMemcpy(d_VNtoCN,
                    VNtoCNFlat.data(),
                    matrixBytes,
@@ -692,60 +718,53 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                    transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_MatValue,
-                   MatValueFlat.data(),
-                   edgesBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MatValue",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.matValue,
+                            MatValueFlat,
+                            "cudaMalloc failed for MatValue",
+                            "cudaMemcpy failed for MatValue",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_rowBase,
-                   rowBase.data(),
-                   rowBaseBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for rowBase",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.rowBase,
+                            rowBase,
+                            "cudaMalloc failed for rowBase",
+                            "cudaMemcpy failed for rowBase",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_RowDegree,
-                   RowDegree.data(),
-                   rowDegreeBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for RowDegree",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.rowDegree,
+                            RowDegree,
+                            "cudaMalloc failed for RowDegree",
+                            "cudaMemcpy failed for RowDegree",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_DIVGF,
-                   DIVGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for DIVGF",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.divGF,
+                            DIVGFFlat,
+                            "cudaMalloc failed for DIVGF",
+                            "cudaMemcpy failed for DIVGF",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_MULGF,
-                   MULGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MULGF",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.mulGF,
+                            MULGFFlat,
+                            "cudaMalloc failed for MULGF",
+                            "cudaMemcpy failed for MULGF",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_FFT0,
-                   FFT0.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT0",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.fft0,
+                            FFT0,
+                            "cudaMalloc failed for FFT0",
+                            "cudaMemcpy failed for FFT0",
+                            transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_FFT1,
-                   FFT1.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT1",
-                   transfer_to_device_ms)) {
+  if (!ensureResidentBuffer(metadataCache.fft1,
+                            FFT1,
+                            "cudaMalloc failed for FFT1",
+                            "cudaMemcpy failed for FFT1",
+                            transfer_to_device_ms)) {
     return false;
   }
   if (!timedMemcpy(d_TrueNoiseSynd,
@@ -806,13 +825,13 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes>>>(
       d_CNtoVN,
       d_VNtoCN,
-      d_MatValue,
-      d_rowBase,
-      d_RowDegree,
-      d_DIVGF,
-      d_MULGF,
-      d_FFT0,
-      d_FFT1,
+      metadataCache.matValue.ptr,
+      metadataCache.rowBase.ptr,
+      metadataCache.rowDegree.ptr,
+      metadataCache.divGF.ptr,
+      metadataCache.mulGF.ptr,
+      metadataCache.fft0.ptr,
+      metadataCache.fft1.ptr,
       d_TrueNoiseSynd,
       M,
       GF,
@@ -854,13 +873,15 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                    transfer_to_host_ms)) {
     return false;
   }
-  if (!timedMemcpy(VNtoCNFlat.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
-    return false;
+  if (copyVNBackToHost) {
+    if (!timedMemcpy(VNtoCNFlat.data(),
+                     d_VNtoCN,
+                     matrixBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for VNtoCN device->host",
+                     transfer_to_host_ms)) {
+      return false;
+    }
   }
 
   if (g_enable_timing_output) {
@@ -1656,6 +1677,16 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
     static vector<int> fft0Buffer;
     static vector<int> fft1Buffer;
     static GFTablesCache gfCache;
+    static bool cnFlatPrimed = false;
+    static bool metadataPrimed = false;
+    static const void* cachedMatValueIdentity = nullptr;
+    static const void* cachedRowDegreeIdentity = nullptr;
+    static const void* cachedFFTSQIdentity = nullptr;
+    static const void* cachedDIVGFIdentity = nullptr;
+    static const void* cachedMULGFIdentity = nullptr;
+    static size_t cachedTotalEdges = 0;
+    static int cachedGF = 0;
+    static int cachedLogGF = 0;
 
     bool gpu_success = false;
     string gpu_error;
@@ -1671,82 +1702,127 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
-        vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+        const size_t matrixEntries = totalEdges * static_cast<size_t>(GF);
+        if (cnFlatBuffer.size() != matrixEntries) {
+            cnFlatBuffer.assign(matrixEntries, 0.0);
+            cnFlatPrimed = false;
+        }
+        vnFlatBuffer.resize(matrixEntries);
+
+        const void* currentMatValueIdentity =
+            MatValue.empty() ? nullptr : static_cast<const void*>(MatValue.data());
+        const void* currentRowDegreeIdentity =
+            RowDegree.empty() ? nullptr : static_cast<const void*>(RowDegree.data());
+        const void* currentFFTSQIdentity =
+            FFTSQ.empty() ? nullptr : static_cast<const void*>(FFTSQ.data());
+        const void* currentDIVGFIdentity =
+            DIVGF.empty() ? nullptr : static_cast<const void*>(DIVGF.data());
+        const void* currentMULGFIdentity =
+            MULGF.empty() ? nullptr : static_cast<const void*>(MULGF.data());
+
+        const bool structureChanged =
+            (totalEdges != cachedTotalEdges) || (GF != cachedGF) ||
+            (logGF != cachedLogGF) || (currentMatValueIdentity != cachedMatValueIdentity) ||
+            (currentRowDegreeIdentity != cachedRowDegreeIdentity) ||
+            (currentFFTSQIdentity != cachedFFTSQIdentity) ||
+            (currentDIVGFIdentity != cachedDIVGFIdentity) ||
+            (currentMULGFIdentity != cachedMULGFIdentity);
+
+        if (structureChanged) {
+            cachedTotalEdges = totalEdges;
+            cachedGF = GF;
+            cachedLogGF = logGF;
+            cachedMatValueIdentity = currentMatValueIdentity;
+            cachedRowDegreeIdentity = currentRowDegreeIdentity;
+            cachedFFTSQIdentity = currentFFTSQIdentity;
+            cachedDIVGFIdentity = currentDIVGFIdentity;
+            cachedMULGFIdentity = currentMULGFIdentity;
+            metadataPrimed = false;
+        }
+
+        const bool refreshPersistentMetadata = !metadataPrimed;
+        const bool needCNFlatten = !cnFlatPrimed;
         for (size_t edge=0; edge<totalEdges; ++edge) {
             if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
             for (int g=0; g<GF; ++g) {
-                cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                if (needCNFlatten) {
+                    cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                }
                 vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
             }
         }
         if (!gpu_error.empty()) {
             break;
         }
+        if (needCNFlatten) {
+            cnFlatPrimed = true;
+        }
 
-        matValueFlatBuffer.resize(totalEdges);
-        for (int mIdx=0; mIdx<M; ++mIdx) {
-            if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
-                gpu_error = "MatValue row shorter than RowDegree";
+        if (refreshPersistentMetadata) {
+            matValueFlatBuffer.resize(totalEdges);
+            for (int mIdx=0; mIdx<M; ++mIdx) {
+                if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx])) {
+                    gpu_error = "MatValue row shorter than RowDegree";
+                    break;
+                }
+                for (int t=0; t<RowDegree[mIdx]; ++t) {
+                    matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
+                }
+            }
+            if (!gpu_error.empty()) {
                 break;
             }
-            for (int t=0; t<RowDegree[mIdx]; ++t) {
-                matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
-            }
-        }
-        if (!gpu_error.empty()) {
-            break;
-        }
 
-        auto ensureGFTablesPacked = [&]() -> bool {
-            if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
-                gpu_error = "CheckPass GPU path requires full GF tables";
-                return false;
-            }
-
-            const size_t expectedSize = static_cast<size_t>(GF) * GF;
-            gfCache.divFlat.resize(expectedSize);
-            gfCache.mulFlat.resize(expectedSize);
-
-            for (int i=0; i<GF; ++i) {
-                if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
-                    gpu_error = "GF lookup tables are incomplete";
+            auto ensureGFTablesPacked = [&]() -> bool {
+                if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF)) {
+                    gpu_error = "CheckPass GPU path requires full GF tables";
                     return false;
                 }
-                for (int j=0; j<GF; ++j) {
-                    const size_t idx = static_cast<size_t>(i) * GF + j;
-                    gfCache.divFlat[idx] = DIVGF[i][j];
-                    gfCache.mulFlat[idx] = MULGF[i][j];
+
+                const size_t expectedSize = static_cast<size_t>(GF) * GF;
+                gfCache.divFlat.resize(expectedSize);
+                gfCache.mulFlat.resize(expectedSize);
+
+                for (int i=0; i<GF; ++i) {
+                    if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF)) {
+                        gpu_error = "GF lookup tables are incomplete";
+                        return false;
+                    }
+                    for (int j=0; j<GF; ++j) {
+                        const size_t idx = static_cast<size_t>(i) * GF + j;
+                        gfCache.divFlat[idx] = DIVGF[i][j];
+                        gfCache.mulFlat[idx] = MULGF[i][j];
+                    }
                 }
-            }
 
-            return true;
-        };
+                return true;
+            };
 
-        if (!ensureGFTablesPacked()) {
-            break;
-        }
-
-        const size_t pairCount = FFTSQ.size();
-        if (logGF > 0 && (pairCount % static_cast<size_t>(logGF)) != 0) {
-            gpu_error = "FFTSQ size must be divisible by logGF";
-            break;
-        }
-        fft0Buffer.resize(pairCount);
-        fft1Buffer.resize(pairCount);
-        for (size_t k=0; k<pairCount; ++k) {
-            if (FFTSQ[k].size() < 2) {
-                gpu_error = "FFTSQ entries must contain two indices";
+            if (!ensureGFTablesPacked()) {
                 break;
             }
-            fft0Buffer[k] = FFTSQ[k][0];
-            fft1Buffer[k] = FFTSQ[k][1];
-        }
-        if (!gpu_error.empty()) {
-            break;
+
+            const size_t pairCount = FFTSQ.size();
+            if (logGF > 0 && (pairCount % static_cast<size_t>(logGF)) != 0) {
+                gpu_error = "FFTSQ size must be divisible by logGF";
+                break;
+            }
+            fft0Buffer.resize(pairCount);
+            fft1Buffer.resize(pairCount);
+            for (size_t k=0; k<pairCount; ++k) {
+                if (FFTSQ[k].size() < 2) {
+                    gpu_error = "FFTSQ entries must contain two indices";
+                    break;
+                }
+                fft0Buffer[k] = FFTSQ[k][0];
+                fft1Buffer[k] = FFTSQ[k][1];
+            }
+            if (!gpu_error.empty()) {
+                break;
+            }
         }
 
         gpu_success = RunCheckPassCUDA(rowBase,
@@ -1762,15 +1838,18 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
                                        M,
                                        GF,
                                        logGF,
+                                       refreshPersistentMetadata,
+                                       /*copyVNBackToHost=*/false,
                                        gpu_error);
         if (!gpu_success) {
             break;
         }
 
+        metadataPrimed = true;
+
         for (size_t edge=0; edge<totalEdges; ++edge) {
             for (int g=0; g<GF; ++g) {
                 CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
             }
         }
 
