@@ -293,6 +293,31 @@ class ScopedTimer {
   std::chrono::steady_clock::time_point start_{};
 };
 
+class ScopedDurationAccumulator {
+ public:
+  explicit ScopedDurationAccumulator(double& accumulator)
+      : accumulator_(accumulator),
+        enabled_(g_enable_timing_output) {
+    if (enabled_) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedDurationAccumulator() {
+    if (!enabled_) {
+      return;
+    }
+    auto end = std::chrono::steady_clock::now();
+    accumulator_ +=
+        std::chrono::duration<double, std::milli>(end - start_).count();
+  }
+
+ private:
+  double& accumulator_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
+
 struct GFTablesCache {
   std::vector<int> divFlat;
   std::vector<int> mulFlat;
@@ -791,6 +816,93 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
       }
     }
     __syncthreads();
+  }
+}
+
+__global__ void DataPassKernel(double* VNtoCNxxx,
+                               const double* CNtoVNxxx,
+                               const double* VNtoChN,
+                               const int* Interleaver,
+                               const int* nodeBase,
+                               const int* ColumnDegree,
+                               int N,
+                               int GF) {
+  const long long blockIndex = blockIdx.x +
+                               static_cast<long long>(gridDim.x) * blockIdx.y +
+                               static_cast<long long>(gridDim.x) * gridDim.y *
+                                   blockIdx.z;
+  const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                gridDim.z;
+
+  extern __shared__ double sharedVec[];
+  __shared__ double warpSums[32];
+  __shared__ double sumShared;
+
+  const int tid = threadIdx.x;
+  const int warpCount = (blockDim.x + warpSize - 1) / warpSize;
+
+  for (long long nodeIndex = blockIndex; nodeIndex < N;
+       nodeIndex += totalBlocks) {
+    const int node = static_cast<int>(nodeIndex);
+    const int degree = ColumnDegree[node];
+    if (degree <= 0) {
+      continue;
+    }
+    const int base = nodeBase[node];
+
+    for (int t = 0; t < degree; ++t) {
+      const int edgeIndex = Interleaver[base + t];
+      double partial = 0.0;
+      for (int g = tid; g < GF; g += blockDim.x) {
+        double value = VNtoChN[node * GF + g];
+        for (int tz = 0; tz < degree; ++tz) {
+          if (tz == t) {
+            continue;
+          }
+          const int otherEdge = Interleaver[base + tz];
+          value *= CNtoVNxxx[static_cast<long long>(otherEdge) * GF + g];
+        }
+        sharedVec[g] = value;
+        partial += value;
+      }
+      __syncthreads();
+
+      double sum = partial;
+      for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+      }
+      if ((threadIdx.x & (warpSize - 1)) == 0) {
+        warpSums[threadIdx.x / warpSize] = sum;
+      }
+      __syncthreads();
+
+      double blockSum = 0.0;
+      if (threadIdx.x < warpSize) {
+        blockSum = (threadIdx.x < warpCount) ? warpSums[threadIdx.x] : 0.0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+          blockSum += __shfl_down_sync(0xffffffff, blockSum, offset);
+        }
+        if (threadIdx.x == 0) {
+          sumShared = blockSum;
+        }
+      }
+      __syncthreads();
+
+      const double total = sumShared;
+      if (total == 0.0) {
+        const double uniform = 1.0 / static_cast<double>(GF);
+        for (int g = tid; g < GF; g += blockDim.x) {
+          VNtoCNxxx[static_cast<long long>(edgeIndex) * GF + g] = uniform;
+        }
+      } else {
+        const double inv = 1.0 / total;
+        for (int g = tid; g < GF; g += blockDim.x) {
+          VNtoCNxxx[static_cast<long long>(edgeIndex) * GF + g] =
+              sharedVec[g] * inv;
+        }
+      }
+      __syncthreads();
+    }
   }
 }
 
@@ -1870,6 +1982,288 @@ void ChannelPass(FlatMatrix& VNtoChN,
 
   cpu_impl();
 }
+#if GD_CSS_ENABLE_CUDA
+static bool RunDataPassCUDA(const vector<int>& ColumnDegree,
+                            const vector<int>& nodeBase,
+                            const vector<int>& Interleaver,
+                            const vector<double>& CNtoVNFlat,
+                            const vector<double>& VNtoChFlat,
+                            vector<double>& VNtoCNFlat,
+                            int N,
+                            int GF,
+                            string& error) {
+  if (N <= 0 || GF <= 0) {
+    return true;
+  }
+
+  const size_t totalEdges = Interleaver.size();
+  if (totalEdges == 0) {
+    return true;
+  }
+
+  double* d_VNtoCN = nullptr;
+  double* d_CNtoVN = nullptr;
+  double* d_VNtoCh = nullptr;
+  int* d_Interleaver = nullptr;
+  int* d_ColumnDegree = nullptr;
+  int* d_nodeBase = nullptr;
+  cudaEvent_t kernelStart = nullptr;
+  cudaEvent_t kernelEnd = nullptr;
+  double transfer_to_device_ms = 0.0;
+  double transfer_to_host_ms = 0.0;
+  double kernel_ms = 0.0;
+  cudaError_t status = cudaSuccess;
+
+  const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+  const size_t channelBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
+  const size_t edgeBytes = totalEdges * sizeof(int);
+  const size_t columnBytes = ColumnDegree.size() * sizeof(int);
+  const size_t baseBytes = nodeBase.size() * sizeof(int);
+
+  auto cleanup = [&]() {
+    if (d_VNtoCN) cudaFree(d_VNtoCN);
+    if (d_CNtoVN) cudaFree(d_CNtoVN);
+    if (d_VNtoCh) cudaFree(d_VNtoCh);
+    if (d_Interleaver) cudaFree(d_Interleaver);
+    if (d_ColumnDegree) cudaFree(d_ColumnDegree);
+    if (d_nodeBase) cudaFree(d_nodeBase);
+    if (kernelStart) cudaEventDestroy(kernelStart);
+    if (kernelEnd) cudaEventDestroy(kernelEnd);
+  };
+
+  auto timedMemcpy = [&](void* dst,
+                         const void* src,
+                         size_t bytes,
+                         cudaMemcpyKind kind,
+                         const char* failure,
+                         double& accumulator) -> bool {
+    auto start = std::chrono::steady_clock::now();
+    status = cudaMemcpy(dst, src, bytes, kind);
+    auto end = std::chrono::steady_clock::now();
+    accumulator +=
+        std::chrono::duration<double, std::milli>(end - start).count();
+    if (status != cudaSuccess) {
+      error = failure;
+      cleanup();
+      return false;
+    }
+    return true;
+  };
+
+  status = cudaMalloc(&d_VNtoCN, matrixBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass VNtoCN buffer";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_CNtoVN, matrixBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass CNtoVN buffer";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_VNtoCh, channelBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass VNtoCh buffer";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_Interleaver, edgeBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass interleaver";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_ColumnDegree, columnBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass ColumnDegree";
+    cleanup();
+    return false;
+  }
+  status = cudaMalloc(&d_nodeBase, baseBytes);
+  if (status != cudaSuccess) {
+    error = "cudaMalloc failed for DataPass node base";
+    cleanup();
+    return false;
+  }
+
+  if (!timedMemcpy(d_CNtoVN,
+                   CNtoVNFlat.data(),
+                   matrixBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DataPass CNtoVN",
+                   transfer_to_device_ms)) {
+    return false;
+  }
+  if (!timedMemcpy(d_VNtoCh,
+                   VNtoChFlat.data(),
+                   channelBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DataPass VNtoCh",
+                   transfer_to_device_ms)) {
+    return false;
+  }
+  if (!timedMemcpy(d_Interleaver,
+                   Interleaver.data(),
+                   edgeBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DataPass interleaver",
+                   transfer_to_device_ms)) {
+    return false;
+  }
+  if (!timedMemcpy(d_ColumnDegree,
+                   ColumnDegree.data(),
+                   columnBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DataPass ColumnDegree",
+                   transfer_to_device_ms)) {
+    return false;
+  }
+  if (!timedMemcpy(d_nodeBase,
+                   nodeBase.data(),
+                   baseBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for DataPass node base",
+                   transfer_to_device_ms)) {
+    return false;
+  }
+
+  int device = 0;
+  status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    error = "cudaGetDevice failed for DataPass";
+    cleanup();
+    return false;
+  }
+
+  int maxSharedBytes = 0;
+  status = cudaDeviceGetAttribute(&maxSharedBytes,
+                                  cudaDevAttrMaxSharedMemoryPerBlock,
+                                  device);
+  if (status != cudaSuccess) {
+    error = "cudaDeviceGetAttribute failed for DataPass";
+    cleanup();
+    return false;
+  }
+
+  const size_t sharedBytes = sizeof(double) * static_cast<size_t>(GF);
+  if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
+    error = "DataPass kernel requires more shared memory than available";
+    cleanup();
+    return false;
+  }
+
+  int threads = 1;
+  while (threads < GF && threads < 1024) {
+    threads <<= 1;
+  }
+  if (threads > 1024) {
+    threads = 1024;
+  }
+  if (threads == 0) {
+    threads = 1;
+  }
+
+  int grid_x = std::min(N, 65535);
+  if (grid_x == 0) {
+    grid_x = 1;
+  }
+  int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+  grid_y = std::min(grid_y, 65535);
+  long long blocks_xy = static_cast<long long>(grid_x) * grid_y;
+  long long grid_z_needed =
+      (static_cast<long long>(N) + blocks_xy - 1) / blocks_xy;
+  if (grid_z_needed < 1) {
+    grid_z_needed = 1;
+  }
+  if (grid_z_needed > 65535) {
+    grid_z_needed = 65535;
+  }
+  dim3 grid(grid_x, grid_y, static_cast<unsigned int>(grid_z_needed));
+  dim3 block(threads);
+
+  status = cudaEventCreate(&kernelStart);
+  if (status != cudaSuccess) {
+    error = "cudaEventCreate failed for DataPass kernelStart";
+    cleanup();
+    return false;
+  }
+  status = cudaEventCreate(&kernelEnd);
+  if (status != cudaSuccess) {
+    error = "cudaEventCreate failed for DataPass kernelEnd";
+    cleanup();
+    return false;
+  }
+  status = cudaEventRecord(kernelStart);
+  if (status != cudaSuccess) {
+    error = "cudaEventRecord failed for DataPass kernelStart";
+    cleanup();
+    return false;
+  }
+
+  cuda_kernels::DataPassKernel<<<grid, block, sharedBytes>>>(d_VNtoCN,
+                                                             d_CNtoVN,
+                                                             d_VNtoCh,
+                                                             d_Interleaver,
+                                                             d_nodeBase,
+                                                             d_ColumnDegree,
+                                                             N,
+                                                             GF);
+
+  status = cudaEventRecord(kernelEnd);
+  if (status != cudaSuccess) {
+    error = "cudaEventRecord failed for DataPass kernelEnd";
+    cleanup();
+    return false;
+  }
+
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    error = "DataPass CUDA kernel launch failed";
+    cleanup();
+    return false;
+  }
+
+  status = cudaEventSynchronize(kernelEnd);
+  if (status != cudaSuccess) {
+    error = "DataPass CUDA kernel execution failed";
+    cleanup();
+    return false;
+  }
+
+  float kernel_ms_f = 0.0f;
+  status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+  if (status == cudaSuccess) {
+    kernel_ms = static_cast<double>(kernel_ms_f);
+  }
+
+  if (!timedMemcpy(VNtoCNFlat.data(),
+                   d_VNtoCN,
+                   matrixBytes,
+                   cudaMemcpyDeviceToHost,
+                   "cudaMemcpy failed for DataPass VNtoCN device->host",
+                   transfer_to_host_ms)) {
+    return false;
+  }
+
+  if (g_enable_timing_output) {
+    std::streamsize previous_precision = std::cout.precision();
+    std::ios::fmtflags previous_flags = std::cout.flags();
+    std::cout << std::fixed << std::setprecision(3)
+              << "DataPass CUDA timing (H2D: " << transfer_to_device_ms
+              << " ms, kernel: " << kernel_ms
+              << " ms, D2H: " << transfer_to_host_ms
+              << " ms, total transfer: "
+              << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+              << std::endl;
+    std::cout.precision(previous_precision);
+    std::cout.flags(previous_flags);
+  }
+
+  cleanup();
+  return true;
+}
+#endif
 // Function: DataPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
@@ -1882,26 +2276,182 @@ void DataPass(FlatMatrix& VNtoCNxxx,
               int GF){
   ScopedTimer timer("DataPass");
 
-  int numB=0;
-  // Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++){
-    // Loop: iterate over a range/collection.
-    for(size_t t=0;t<ColumnDegree[n];t++){
-      int numBint=Interleaver[numB+t];
-      // Loop: iterate over a range/collection.
-      for(size_t g=0;g<GF;g++) VNtoCNxxx[numBint][g]=VNtoChN[n][g];
-      // Loop: iterate over a range/collection.
-      for(size_t tz=0;tz<ColumnDegree[n];tz++){
-        // Conditional branch.
-        if (tz!=t)
-        // Loop: iterate over a range/collection.
-        for(size_t g=0;g<GF;g++)
-        VNtoCNxxx[numBint][g]*=CNtoVNxxx[Interleaver[numB+tz]][g];
+  auto cpu_impl = [&]() {
+    int numB = 0;
+    for (int n = 0; n < N; ++n) {
+      for (int t = 0; t < ColumnDegree[n]; ++t) {
+        const int edgeIndex = Interleaver[numB + t];
+        for (int g = 0; g < GF; ++g) {
+          VNtoCNxxx[edgeIndex][g] = VNtoChN[n][g];
+        }
+        for (int tz = 0; tz < ColumnDegree[n]; ++tz) {
+          if (tz == t) {
+            continue;
+          }
+          const int otherEdge = Interleaver[numB + tz];
+          for (int g = 0; g < GF; ++g) {
+            VNtoCNxxx[edgeIndex][g] *= CNtoVNxxx[otherEdge][g];
+          }
+        }
+        normalize(VNtoCNxxx[edgeIndex], GF);
       }
-      normalize(VNtoCNxxx[numBint],GF);
+      numB += ColumnDegree[n];
     }
-    numB+=ColumnDegree[n];
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  static vector<double> cnFlatBuffer;
+  static vector<double> vnFlatBuffer;
+  static vector<double> chFlatBuffer;
+  static vector<int> interleaverBuffer;
+  static vector<int> columnDegreeBuffer;
+  static vector<int> nodeBaseBuffer;
+
+  bool gpu_success = false;
+  string gpu_error;
+  double host_validation_ms = 0.0;
+  double host_flatten_cn_ms = 0.0;
+  double host_flatten_ch_ms = 0.0;
+  double host_writeback_ms = 0.0;
+  do {
+    if (N <= 0 || GF <= 0) {
+      break;
+    }
+    if (ColumnDegree.size() < static_cast<size_t>(N)) {
+      gpu_error = "ColumnDegree size mismatch for DataPass";
+      break;
+    }
+    const size_t totalEdges = Interleaver.size();
+    if (VNtoCNxxx.size() < totalEdges || CNtoVNxxx.size() < totalEdges) {
+      gpu_error = "Message buffers are smaller than the interleaver for DataPass";
+      break;
+    }
+    if (totalEdges == 0) {
+      gpu_success = true;
+      break;
+    }
+
+    {
+      ScopedDurationAccumulator section(host_validation_ms);
+      long long expectedEdges = 0;
+      nodeBaseBuffer.resize(N);
+      for (int n = 0; n < N; ++n) {
+        nodeBaseBuffer[n] = static_cast<int>(expectedEdges);
+        expectedEdges += ColumnDegree[n];
+      }
+      if (expectedEdges != static_cast<long long>(totalEdges)) {
+        gpu_error = "Interleaver size does not match ColumnDegree sum";
+      }
+
+      columnDegreeBuffer.assign(ColumnDegree.begin(), ColumnDegree.begin() + N);
+      interleaverBuffer.assign(Interleaver.begin(), Interleaver.end());
+      for (size_t idx = 0; idx < totalEdges && gpu_error.empty(); ++idx) {
+        const int edge = interleaverBuffer[idx];
+        if (edge < 0 || static_cast<size_t>(edge) >= totalEdges) {
+          gpu_error = "Interleaver contains out-of-range index";
+          break;
+        }
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    {
+      ScopedDurationAccumulator section(host_flatten_cn_ms);
+      cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+      for (size_t edge = 0; edge < totalEdges; ++edge) {
+        if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF)) {
+          gpu_error = "CNtoVN message shorter than GF";
+          break;
+        }
+        for (int g = 0; g < GF; ++g) {
+          cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+        }
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    {
+      ScopedDurationAccumulator section(host_flatten_ch_ms);
+      chFlatBuffer.resize(static_cast<size_t>(N) * GF);
+      for (int n = 0; n < N; ++n) {
+        if (VNtoChN[n].size() < static_cast<size_t>(GF)) {
+          gpu_error = "VNtoChN vector shorter than GF";
+          break;
+        }
+        for (int g = 0; g < GF; ++g) {
+          chFlatBuffer[static_cast<size_t>(n) * GF + g] = VNtoChN[n][g];
+        }
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+
+    gpu_success = RunDataPassCUDA(columnDegreeBuffer,
+                                  nodeBaseBuffer,
+                                  interleaverBuffer,
+                                  cnFlatBuffer,
+                                  chFlatBuffer,
+                                  vnFlatBuffer,
+                                  N,
+                                  GF,
+                                  gpu_error);
+    if (!gpu_success) {
+      break;
+    }
+
+    {
+      ScopedDurationAccumulator section(host_writeback_ms);
+      for (size_t edge = 0; edge < totalEdges; ++edge) {
+        for (int g = 0; g < GF; ++g) {
+          VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
+        }
+      }
+    }
+
+    if (!reported_cuda_success) {
+      std::cout << "DataPass executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+    if (g_enable_timing_output) {
+      auto previous_precision = std::cout.precision();
+      auto previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "[Timing] DataPass host processing (validation: "
+                << host_validation_ms << " ms, flatten CN: "
+                << host_flatten_cn_ms << " ms, flatten channel: "
+                << host_flatten_ch_ms << " ms, write-back: "
+                << host_writeback_ms
+                << " ms, subtotal: "
+                << (host_validation_ms + host_flatten_cn_ms + host_flatten_ch_ms +
+                    host_writeback_ms)
+                << " ms)" << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+    return;
+  } while (false);
+
+  if (gpu_success) {
+    return;
   }
+
+  if (!gpu_error.empty() && !reported_cuda_failure) {
+    std::cerr << "DataPass GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  cpu_impl();
 }
 // Function: CheckPass
 // Purpose: TODO - describe the function's responsibility succinctly.
