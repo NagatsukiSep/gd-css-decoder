@@ -88,12 +88,14 @@ class FlatMatrix {
   ~FlatMatrix() {
 #if GD_CSS_ENABLE_CUDA
     releaseCudaMapping();
+    releaseCudaDeviceStorage();
 #endif
   }
 
   void resize(size_t rows, size_t cols) {
 #if GD_CSS_ENABLE_CUDA
     releaseCudaMapping();
+    releaseCudaDeviceStorage();
 #endif
     rows_ = rows;
     cols_ = cols;
@@ -172,6 +174,78 @@ class FlatMatrix {
 
   double* cuda_data() const { return cuda_device_ptr_; }
   bool hasCudaMapping() const { return cuda_registered_; }
+
+  bool ensureCudaDeviceStorage(size_t bytes, std::string* error = nullptr) {
+    if (bytes == 0) {
+      releaseCudaDeviceStorage();
+      return true;
+    }
+    if (cuda_device_storage_ && cuda_device_capacity_ >= bytes) {
+      return true;
+    }
+    releaseCudaDeviceStorage();
+    cudaError_t status = cudaMalloc(&cuda_device_storage_, bytes);
+    if (status != cudaSuccess) {
+      if (error) {
+        *error = std::string("cudaMalloc failed for FlatMatrix device storage: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    cuda_device_capacity_ = bytes;
+    return true;
+  }
+
+  bool copyHostToDevice(size_t bytes, std::string* error = nullptr) {
+    if (bytes == 0) {
+      return true;
+    }
+    if (!ensureCudaDeviceStorage(bytes, error)) {
+      return false;
+    }
+    cudaError_t status =
+        cudaMemcpy(cuda_device_storage_, data(), bytes, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+      if (error) {
+        *error = std::string("cudaMemcpy (host->device) failed for FlatMatrix: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  bool copyDeviceToHost(size_t bytes, std::string* error = nullptr) {
+    if (bytes == 0) {
+      return true;
+    }
+    if (!cuda_device_storage_) {
+      if (error) {
+        *error = "FlatMatrix device storage is not allocated";
+      }
+      return false;
+    }
+    cudaError_t status =
+        cudaMemcpy(data(), cuda_device_storage_, bytes, cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      if (error) {
+        *error = std::string("cudaMemcpy (device->host) failed for FlatMatrix: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  void releaseCudaDeviceStorage() {
+    if (cuda_device_storage_) {
+      cudaFree(cuda_device_storage_);
+    }
+    cuda_device_storage_ = nullptr;
+    cuda_device_capacity_ = 0;
+  }
+
+  double* cuda_device_storage() const { return cuda_device_storage_; }
 #endif
 
  private:
@@ -183,6 +257,8 @@ class FlatMatrix {
   double* cuda_host_ptr_ = nullptr;
   size_t cuda_registered_bytes_ = 0;
   bool cuda_registered_ = false;
+  double* cuda_device_storage_ = nullptr;
+  size_t cuda_device_capacity_ = 0;
 #endif
 };
 
@@ -795,9 +871,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   double kernel_ms = 0.0;
   cudaEvent_t kernelStart = nullptr;
   cudaEvent_t kernelEnd = nullptr;
-  bool zero_copy_cn = false;
-  bool zero_copy_vn = false;
-  static bool requested_map_host_flag = false;
 
   const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
   const size_t pairCount = FFT0.size();
@@ -805,8 +878,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   cudaError_t status = cudaSuccess;
 
   auto cleanup = [&]() {
-    if (d_CNtoVN && !zero_copy_cn) cudaFree(d_CNtoVN);
-    if (d_VNtoCN && !zero_copy_vn) cudaFree(d_VNtoCN);
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
@@ -865,60 +936,13 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return false;
   }
 
-  int can_map_host_memory = 0;
-  status = cudaDeviceGetAttribute(&can_map_host_memory,
-                                  cudaDevAttrCanMapHostMemory,
-                                  device);
-  if (status != cudaSuccess) {
-    error = "cudaDeviceGetAttribute failed for host mapping support";
+  if (!CNtoVNxxx.ensureCudaDeviceStorage(matrixBytes, &error) ||
+      !VNtoCNxxx.ensureCudaDeviceStorage(matrixBytes, &error)) {
     cleanup();
     return false;
   }
-  if (can_map_host_memory && !requested_map_host_flag) {
-    cudaError_t set_flag_status = cudaSetDeviceFlags(cudaDeviceMapHost);
-    if (set_flag_status != cudaSuccess &&
-        set_flag_status != cudaErrorSetOnActiveProcess) {
-      can_map_host_memory = 0;
-    }
-    requested_map_host_flag = true;
-    if (set_flag_status == cudaErrorSetOnActiveProcess) {
-      cudaGetLastError();
-    }
-  }
-
-  if (can_map_host_memory && matrixBytes > 0) {
-    if (CNtoVNxxx.ensureCudaMapping(matrixBytes)) {
-      d_CNtoVN = CNtoVNxxx.cuda_data();
-      zero_copy_cn = d_CNtoVN != nullptr;
-    }
-    if (VNtoCNxxx.ensureCudaMapping(matrixBytes)) {
-      d_VNtoCN = VNtoCNxxx.cuda_data();
-      zero_copy_vn = d_VNtoCN != nullptr;
-    }
-    if (!zero_copy_cn) {
-      CNtoVNxxx.releaseCudaMapping();
-    }
-    if (!zero_copy_vn) {
-      VNtoCNxxx.releaseCudaMapping();
-    }
-  }
-
-  if (!zero_copy_cn) {
-    status = cudaMalloc(&d_CNtoVN, matrixBytes);
-    if (status != cudaSuccess) {
-      error = "cudaMalloc failed for CNtoVN buffer";
-      cleanup();
-      return false;
-    }
-  }
-  if (!zero_copy_vn) {
-    status = cudaMalloc(&d_VNtoCN, matrixBytes);
-    if (status != cudaSuccess) {
-      error = "cudaMalloc failed for VNtoCN buffer";
-      cleanup();
-      return false;
-    }
-  }
+  d_CNtoVN = CNtoVNxxx.cuda_device_storage();
+  d_VNtoCN = VNtoCNxxx.cuda_device_storage();
   status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for TrueNoiseSynd";
@@ -990,25 +1014,21 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     gf_tables.gf = GF;
   }
 
-  if (!zero_copy_cn) {
-    if (!timedMemcpy(d_CNtoVN,
-                     CNtoVNxxx.data(),
-                     matrixBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for CNtoVN host->device",
-                     transfer_to_device_ms)) {
-      return false;
-    }
+  if (!timedMemcpy(d_CNtoVN,
+                   CNtoVNxxx.data(),
+                   matrixBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for CNtoVN host->device",
+                   transfer_to_device_ms)) {
+    return false;
   }
-  if (!zero_copy_vn) {
-    if (!timedMemcpy(d_VNtoCN,
-                     VNtoCNxxx.data(),
-                     matrixBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for VNtoCN host->device",
-                     transfer_to_device_ms)) {
-      return false;
-    }
+  if (!timedMemcpy(d_VNtoCN,
+                   VNtoCNxxx.data(),
+                   matrixBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for VNtoCN host->device",
+                   transfer_to_device_ms)) {
+    return false;
   }
   if (!copyConstant(constant_set.matValue,
                     MatValueFlat,
@@ -1127,25 +1147,21 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     kernel_ms = static_cast<double>(kernel_ms_f);
   }
 
-  if (!zero_copy_cn) {
-    if (!timedMemcpy(CNtoVNxxx.data(),
-                     d_CNtoVN,
-                     matrixBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for CNtoVN device->host",
-                     transfer_to_host_ms)) {
-      return false;
-    }
+  if (!timedMemcpy(CNtoVNxxx.data(),
+                   d_CNtoVN,
+                   matrixBytes,
+                   cudaMemcpyDeviceToHost,
+                   "cudaMemcpy failed for CNtoVN device->host",
+                   transfer_to_host_ms)) {
+    return false;
   }
-  if (!zero_copy_vn) {
-    if (!timedMemcpy(VNtoCNxxx.data(),
-                     d_VNtoCN,
-                     matrixBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for VNtoCN device->host",
-                     transfer_to_host_ms)) {
-      return false;
-    }
+  if (!timedMemcpy(VNtoCNxxx.data(),
+                   d_VNtoCN,
+                   matrixBytes,
+                   cudaMemcpyDeviceToHost,
+                   "cudaMemcpy failed for VNtoCN device->host",
+                   transfer_to_host_ms)) {
+    return false;
   }
 
   if (g_enable_timing_output) {
