@@ -88,7 +88,10 @@ Under the hood, the script executes:
 ## ⏱ Measure QBPS by repeating decodes
 
 Use `scripts/measure_qbps.sh` when you want to run the decoder multiple times to
-measure throughput (QBPS). By default the script:
+measure throughput (QBPS). Internally the helper simply loops over the decoder
+binary, so you will see `=== Decode run i/N ===` for each invocation (by
+default `N = 10`). You can raise or lower that count with `--runs`. By default
+the script:
 
 - picks the CUDA build when available (falls back to the CPU build),
 - reuses the same example parameters as `scripts/run_example.sh`,
