@@ -4,6 +4,7 @@
 #include <iostream>
 #include <regex>
 #include <cassert>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -147,6 +148,55 @@ struct GFTablesCache {
   std::vector<int> divFlat;
   std::vector<int> mulFlat;
 };
+
+#if GD_CSS_ENABLE_CUDA
+struct CheckPassMetadataKey {
+  const void* matValue = nullptr;
+  const void* rowDegree = nullptr;
+  const void* fftSq = nullptr;
+
+  bool operator==(const CheckPassMetadataKey& other) const noexcept {
+    return matValue == other.matValue && rowDegree == other.rowDegree &&
+           fftSq == other.fftSq;
+  }
+};
+
+struct CheckPassMetadataKeyHash {
+  size_t operator()(const CheckPassMetadataKey& key) const noexcept {
+    size_t seed = 0;
+    auto mix = [&](const void* ptr) {
+      size_t h = std::hash<const void*>()(ptr);
+      seed ^= h + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    };
+    mix(key.matValue);
+    mix(key.rowDegree);
+    mix(key.fftSq);
+    return seed;
+  }
+};
+
+template <typename T>
+struct DeviceArray {
+  T* ptr = nullptr;
+  size_t capacity = 0;
+  size_t size = 0;
+  bool dirty = true;
+};
+
+struct DeviceConstantSet {
+  DeviceArray<int> matValue;
+  DeviceArray<int> rowBase;
+  DeviceArray<int> rowDegree;
+  DeviceArray<int> fft0;
+  DeviceArray<int> fft1;
+};
+
+struct DeviceGFTables {
+  DeviceArray<int> div;
+  DeviceArray<int> mul;
+  int gf = 0;
+};
+#endif  // GD_CSS_ENABLE_CUDA
 
 }  // namespace
 
@@ -599,6 +649,49 @@ __global__ void CheckPassKernel(double* CNtoVNxxx,
 #endif
 
 #if GD_CSS_ENABLE_CUDA
+static std::unordered_map<CheckPassMetadataKey,
+                          DeviceConstantSet,
+                          CheckPassMetadataKeyHash>
+    g_checkpass_constant_cache;
+static DeviceGFTables g_checkpass_gf_tables;
+
+template <typename T>
+bool EnsureDeviceArray(DeviceArray<T>& buffer,
+                       size_t elements,
+                       cudaError_t& status,
+                       const char* label,
+                       string& error) {
+  if (elements == 0) {
+    if (buffer.ptr) {
+      cudaFree(buffer.ptr);
+      buffer.ptr = nullptr;
+    }
+    buffer.capacity = 0;
+    buffer.size = 0;
+    buffer.dirty = false;
+    return true;
+  }
+  if (buffer.capacity >= elements) {
+    buffer.size = elements;
+    return true;
+  }
+  if (buffer.ptr) {
+    cudaFree(buffer.ptr);
+    buffer.ptr = nullptr;
+    buffer.capacity = 0;
+    buffer.size = 0;
+  }
+  buffer.dirty = true;
+  status = cudaMalloc(&buffer.ptr, elements * sizeof(T));
+  if (status != cudaSuccess) {
+    error = string("cudaMalloc failed for ") + label;
+    return false;
+  }
+  buffer.capacity = elements;
+  buffer.size = elements;
+  return true;
+}
+
 static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              const vector<int>& RowDegree,
                              const vector<int>& MatValueFlat,
@@ -612,6 +705,7 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              int M,
                              int GF,
                              int logGF,
+                             const CheckPassMetadataKey& metadata_key,
                              string& error) {
   const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
@@ -620,14 +714,9 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
 
   double* d_CNtoVN = nullptr;
   double* d_VNtoCN = nullptr;
-  int* d_MatValue = nullptr;
-  int* d_rowBase = nullptr;
-  int* d_RowDegree = nullptr;
-  int* d_DIVGF = nullptr;
-  int* d_MULGF = nullptr;
-  int* d_FFT0 = nullptr;
-  int* d_FFT1 = nullptr;
   int* d_TrueNoiseSynd = nullptr;
+  DeviceConstantSet& constant_set = g_checkpass_constant_cache[metadata_key];
+  DeviceGFTables& gf_tables = g_checkpass_gf_tables;
   double transfer_to_device_ms = 0.0;
   double transfer_to_host_ms = 0.0;
   double kernel_ms = 0.0;
@@ -635,25 +724,13 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   cudaEvent_t kernelEnd = nullptr;
 
   const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
-  const size_t edgesBytes = totalEdges * sizeof(int);
-  const size_t rowBaseBytes = rowBase.size() * sizeof(int);
-  const size_t rowDegreeBytes = RowDegree.size() * sizeof(int);
-  const size_t gfSquareBytes = static_cast<size_t>(GF) * static_cast<size_t>(GF) * sizeof(int);
   const size_t pairCount = FFT0.size();
-  const size_t pairBytes = pairCount * sizeof(int);
   const size_t syndromeBytes = TrueNoiseSynd.size() * sizeof(int);
   cudaError_t status = cudaSuccess;
 
   auto cleanup = [&]() {
     if (d_CNtoVN) cudaFree(d_CNtoVN);
     if (d_VNtoCN) cudaFree(d_VNtoCN);
-    if (d_MatValue) cudaFree(d_MatValue);
-    if (d_rowBase) cudaFree(d_rowBase);
-    if (d_RowDegree) cudaFree(d_RowDegree);
-    if (d_DIVGF) cudaFree(d_DIVGF);
-    if (d_MULGF) cudaFree(d_MULGF);
-    if (d_FFT0) cudaFree(d_FFT0);
-    if (d_FFT1) cudaFree(d_FFT1);
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
@@ -678,6 +755,24 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
+  auto copyConstant = [&](DeviceArray<int>& buffer,
+                          const vector<int>& host,
+                          const char* failure) -> bool {
+    if (buffer.size == 0 || !buffer.dirty) {
+      return true;
+    }
+    if (!timedMemcpy(buffer.ptr,
+                     host.data(),
+                     buffer.size * sizeof(int),
+                     cudaMemcpyHostToDevice,
+                     failure,
+                     transfer_to_device_ms)) {
+      return false;
+    }
+    buffer.dirty = false;
+    return true;
+  };
+
   status = cudaMalloc(&d_CNtoVN, matrixBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for CNtoVN buffer";
@@ -690,53 +785,67 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     cleanup();
     return false;
   }
-  status = cudaMalloc(&d_MatValue, edgesBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for MatValue";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_rowBase, rowBaseBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for rowBase";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_RowDegree, rowDegreeBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for RowDegree";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_DIVGF, gfSquareBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for DIVGF";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_MULGF, gfSquareBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for MULGF";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_FFT0, pairBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for FFT0";
-    cleanup();
-    return false;
-  }
-  status = cudaMalloc(&d_FFT1, pairBytes);
-  if (status != cudaSuccess) {
-    error = "cudaMalloc failed for FFT1";
-    cleanup();
-    return false;
-  }
   status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for TrueNoiseSynd";
     cleanup();
     return false;
+  }
+
+  if (!EnsureDeviceArray(constant_set.matValue,
+                         MatValueFlat.size(),
+                         status,
+                         "MatValue",
+                         error) ||
+      !EnsureDeviceArray(constant_set.rowBase,
+                         rowBase.size(),
+                         status,
+                         "rowBase",
+                         error) ||
+      !EnsureDeviceArray(constant_set.rowDegree,
+                         RowDegree.size(),
+                         status,
+                         "RowDegree",
+                         error) ||
+      !EnsureDeviceArray(constant_set.fft0,
+                         FFT0.size(),
+                         status,
+                         "FFT0",
+                         error) ||
+      !EnsureDeviceArray(constant_set.fft1,
+                         FFT1.size(),
+                         status,
+                         "FFT1",
+                         error)) {
+    cleanup();
+    return false;
+  }
+
+  const size_t expectedGFTableSize =
+      static_cast<size_t>(GF) * static_cast<size_t>(GF);
+  if (DIVGFFlat.size() != expectedGFTableSize ||
+      MULGFFlat.size() != expectedGFTableSize) {
+    error = "GF lookup tables are incomplete";
+    cleanup();
+    return false;
+  }
+  if (!EnsureDeviceArray(gf_tables.div,
+                         expectedGFTableSize,
+                         status,
+                         "DIVGF",
+                         error) ||
+      !EnsureDeviceArray(gf_tables.mul,
+                         expectedGFTableSize,
+                         status,
+                         "MULGF",
+                         error)) {
+    cleanup();
+    return false;
+  }
+  if (gf_tables.gf != GF) {
+    gf_tables.div.dirty = true;
+    gf_tables.mul.dirty = true;
+    gf_tables.gf = GF;
   }
 
   if (!timedMemcpy(d_CNtoVN,
@@ -755,60 +864,39 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                    transfer_to_device_ms)) {
     return false;
   }
-  if (!timedMemcpy(d_MatValue,
-                   MatValueFlat.data(),
-                   edgesBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MatValue",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(constant_set.matValue,
+                    MatValueFlat,
+                    "cudaMemcpy failed for MatValue")) {
     return false;
   }
-  if (!timedMemcpy(d_rowBase,
-                   rowBase.data(),
-                   rowBaseBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for rowBase",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(constant_set.rowBase,
+                    rowBase,
+                    "cudaMemcpy failed for rowBase")) {
     return false;
   }
-  if (!timedMemcpy(d_RowDegree,
-                   RowDegree.data(),
-                   rowDegreeBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for RowDegree",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(constant_set.rowDegree,
+                    RowDegree,
+                    "cudaMemcpy failed for RowDegree")) {
     return false;
   }
-  if (!timedMemcpy(d_DIVGF,
-                   DIVGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for DIVGF",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(gf_tables.div,
+                    DIVGFFlat,
+                    "cudaMemcpy failed for DIVGF")) {
     return false;
   }
-  if (!timedMemcpy(d_MULGF,
-                   MULGFFlat.data(),
-                   gfSquareBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for MULGF",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(gf_tables.mul,
+                    MULGFFlat,
+                    "cudaMemcpy failed for MULGF")) {
     return false;
   }
-  if (!timedMemcpy(d_FFT0,
-                   FFT0.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT0",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(constant_set.fft0,
+                    FFT0,
+                    "cudaMemcpy failed for FFT0")) {
     return false;
   }
-  if (!timedMemcpy(d_FFT1,
-                   FFT1.data(),
-                   pairBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for FFT1",
-                   transfer_to_device_ms)) {
+  if (!copyConstant(constant_set.fft1,
+                    FFT1,
+                    "cudaMemcpy failed for FFT1")) {
     return false;
   }
   if (!timedMemcpy(d_TrueNoiseSynd,
@@ -819,6 +907,14 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                    transfer_to_device_ms)) {
     return false;
   }
+
+  int* d_MatValue = constant_set.matValue.ptr;
+  int* d_rowBase = constant_set.rowBase.ptr;
+  int* d_RowDegree = constant_set.rowDegree.ptr;
+  int* d_FFT0 = constant_set.fft0.ptr;
+  int* d_FFT1 = constant_set.fft1.ptr;
+  int* d_DIVGF = gf_tables.div.ptr;
+  int* d_MULGF = gf_tables.mul.ptr;
 
   int device = 0;
   status = cudaGetDevice(&device);
@@ -1828,6 +1924,9 @@ void CheckPass(FlatMatrix& CNtoVNxxx,
             break;
         }
 
+        CheckPassMetadataKey metadata_key{static_cast<const void*>(&MatValue),
+                                          static_cast<const void*>(&RowDegree),
+                                          static_cast<const void*>(&FFTSQ)};
         gpu_success = RunCheckPassCUDA(rowBase,
                                        RowDegree,
                                        matValueFlatBuffer,
@@ -1841,6 +1940,7 @@ void CheckPass(FlatMatrix& CNtoVNxxx,
                                        M,
                                        GF,
                                        logGF,
+                                       metadata_key,
                                        gpu_error);
         if (!gpu_success) {
             break;
