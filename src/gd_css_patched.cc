@@ -943,6 +943,18 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   }
   d_CNtoVN = CNtoVNxxx.cuda_device_storage();
   d_VNtoCN = VNtoCNxxx.cuda_device_storage();
+
+  auto tryPinHostMatrix = [&](FlatMatrix& matrix, const char* label) {
+    std::string pin_error;
+    if (!matrix.ensureCudaMapping(matrixBytes, &pin_error) &&
+        g_enable_timing_output) {
+      std::cerr << "Warning: failed to pin host buffer for " << label
+                << ": " << pin_error << std::endl;
+    }
+  };
+
+  tryPinHostMatrix(CNtoVNxxx, "CNtoVN");
+  tryPinHostMatrix(VNtoCNxxx, "VNtoCN");
   status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for TrueNoiseSynd";
