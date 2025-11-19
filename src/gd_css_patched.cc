@@ -549,6 +549,7 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                              int M,
                              int GF,
                              int logGF,
+                             bool copyVNBackToHost,
                              string& error) {
   const size_t totalEdges = MatValueFlat.size();
   if (totalEdges == 0 || M == 0) {
@@ -848,13 +849,15 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
                    transfer_to_host_ms)) {
     return false;
   }
-  if (!timedMemcpy(VNtoCNFlat.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
-    return false;
+  if (copyVNBackToHost) {
+    if (!timedMemcpy(VNtoCNFlat.data(),
+                     d_VNtoCN,
+                     matrixBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for VNtoCN device->host",
+                     transfer_to_host_ms)) {
+      return false;
+    }
   }
 
   if (g_enable_timing_output) {
@@ -1767,6 +1770,7 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
                                        M,
                                        GF,
                                        logGF,
+                                       /*copyVNBackToHost=*/false,
                                        gpu_error);
         if (!gpu_success) {
             break;
@@ -1775,7 +1779,6 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
         for (size_t edge=0; edge<totalEdges; ++edge) {
             for (int g=0; g<GF; ++g) {
                 CNtoVNxxx[edge][g] = cnFlatBuffer[edge * GF + g];
-                VNtoCNxxx[edge][g] = vnFlatBuffer[edge * GF + g];
             }
         }
 
