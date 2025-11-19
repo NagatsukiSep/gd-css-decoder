@@ -1650,6 +1650,7 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
     static vector<int> fft0Buffer;
     static vector<int> fft1Buffer;
     static GFTablesCache gfCache;
+    static bool cnFlatPrimed = false;
 
     bool gpu_success = false;
     string gpu_error;
@@ -1665,21 +1666,30 @@ void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNx
             break;
         }
 
-        cnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
-        vnFlatBuffer.resize(totalEdges * static_cast<size_t>(GF));
+        const size_t matrixEntries = totalEdges * static_cast<size_t>(GF);
+        if (cnFlatBuffer.size() != matrixEntries) {
+            cnFlatBuffer.assign(matrixEntries, 0.0);
+            cnFlatPrimed = false;
+        }
+        vnFlatBuffer.resize(matrixEntries);
+        const bool needCNFlatten = !cnFlatPrimed;
         for (size_t edge=0; edge<totalEdges; ++edge) {
             if (CNtoVNxxx[edge].size() < static_cast<size_t>(GF) || VNtoCNxxx[edge].size() < static_cast<size_t>(GF)) {
                 gpu_error = "GF dimension mismatch in message buffers";
                 break;
             }
             for (int g=0; g<GF; ++g) {
-                // CNtoVN is produced entirely inside the CUDA kernel, so there is no
-                // need to copy the host-side values into the flat buffer beforehand.
+                if (needCNFlatten) {
+                    cnFlatBuffer[edge * GF + g] = CNtoVNxxx[edge][g];
+                }
                 vnFlatBuffer[edge * GF + g] = VNtoCNxxx[edge][g];
             }
         }
         if (!gpu_error.empty()) {
             break;
+        }
+        if (needCNFlatten) {
+            cnFlatPrimed = true;
         }
 
         matValueFlatBuffer.resize(totalEdges);
