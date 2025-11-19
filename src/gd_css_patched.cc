@@ -894,6 +894,43 @@ __global__ void DataPassKernel(double* VNtoCNxxx,
   }
 }
 
+__global__ void ComputeAPPKernel(double* APP,
+                                 double* ChNtoVN,
+                                 const double* CNtoVNxxx,
+                                 const double* VNtoChN,
+                                 const int* interleaver,
+                                 const int* columnDegree,
+                                 const int* nodeBase,
+                                 int N,
+                                 int GF) {
+  const long long blockIndex = blockIdx.x +
+                               static_cast<long long>(gridDim.x) * blockIdx.y +
+                               static_cast<long long>(gridDim.x) * gridDim.y *
+                                   blockIdx.z;
+  const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                gridDim.z;
+
+  const int tid = threadIdx.x;
+
+  for (long long nodeIndex = blockIndex; nodeIndex < N;
+       nodeIndex += totalBlocks) {
+    const int node = static_cast<int>(nodeIndex);
+    const int degree = columnDegree[node];
+    const int base = nodeBase[node];
+
+    for (int g = tid; g < GF; g += blockDim.x) {
+      double value = 1.0;
+      for (int t = 0; t < degree; ++t) {
+        const int edgeIndex = interleaver[base + t];
+        value *= CNtoVNxxx[static_cast<long long>(edgeIndex) * GF + g];
+      }
+      const double appValue = value * VNtoChN[node * GF + g];
+      ChNtoVN[node * GF + g] = value;
+      APP[node * GF + g] = appValue;
+    }
+  }
+}
+
 }  // namespace cuda_kernels
 #endif
 
@@ -1600,20 +1637,337 @@ void ComputeAPP(FlatMatrix &APP,
                 int N,
                 int GF) {
   ScopedTimer timer("ComputeAPP");
-  int numB = 0;
-  // Loop: iterate over a range/collection.
-  for (int n = 0; n < N; ++n) {
-    // Loop: iterate over a range/collection.
-    for (int g = 0; g < GF; ++g) {
-      ChNtoVN[n][g] = 1.0;
-      // Loop: iterate over a range/collection.
-      for (int t = numB; t < numB + ColDeg[n]; ++t) {
-        ChNtoVN[n][g] *= CNtoVNxxx[Interleaver[t]][g];
+  auto cpu_impl = [&]() {
+    int numB = 0;
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < GF; ++g) {
+        ChNtoVN[n][g] = 1.0;
+        for (int t = numB; t < numB + ColDeg[n]; ++t) {
+          ChNtoVN[n][g] *= CNtoVNxxx[Interleaver[t]][g];
+        }
+        APP[n][g] = ChNtoVN[n][g] * VNtoChN[n][g];
       }
-      APP[n][g] = ChNtoVN[n][g] * VNtoChN[n][g];
+      numB += ColDeg[n];
     }
-    numB += ColDeg[n];
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do {
+    if (N <= 0 || GF <= 0) {
+      break;
+    }
+    if (ColDeg.size() < static_cast<size_t>(N)) {
+      gpu_error = "ComputeAPP GPU path received insufficient column degrees";
+      break;
+    }
+
+    vector<int> nodeBase(std::max(N, 0));
+    int prefix = 0;
+    for (int n = 0; n < N; ++n) {
+      nodeBase[n] = prefix;
+      prefix += ColDeg[n];
+    }
+    const size_t totalEdges = static_cast<size_t>(prefix);
+    if (Interleaver.size() < totalEdges) {
+      gpu_error = "ComputeAPP GPU path received insufficient interleaver entries";
+      break;
+    }
+    if (CNtoVNxxx.rows() < totalEdges ||
+        CNtoVNxxx.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "ComputeAPP GPU path received undersized CNtoVN buffer";
+      break;
+    }
+    if (ChNtoVN.rows() < static_cast<size_t>(N) ||
+        ChNtoVN.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "ComputeAPP GPU path received undersized ChNtoVN buffer";
+      break;
+    }
+    if (APP.rows() < static_cast<size_t>(N) ||
+        APP.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "ComputeAPP GPU path received undersized APP buffer";
+      break;
+    }
+    if (VNtoChN.rows() < static_cast<size_t>(N) ||
+        VNtoChN.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "ComputeAPP GPU path received undersized VNtoChN buffer";
+      break;
+    }
+
+    DataPassMetadataKey metadata_key{static_cast<const void*>(&Interleaver),
+                                     static_cast<const void*>(&ColDeg)};
+    DataPassConstantSet& constant_set = g_datapass_constant_cache[metadata_key];
+
+    const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+    const size_t nodeBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
+
+    double* d_CNtoVN = nullptr;
+    double* d_VNtoCh = nullptr;
+    double* d_ChNtoVN = nullptr;
+    double* d_APP = nullptr;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
+    cudaError_t status = cudaSuccess;
+
+    auto cleanup = [&]() {
+      if (d_CNtoVN) cudaFree(d_CNtoVN);
+      if (d_VNtoCh) cudaFree(d_VNtoCh);
+      if (d_ChNtoVN) cudaFree(d_ChNtoVN);
+      if (d_APP) cudaFree(d_APP);
+      if (kernelStart) cudaEventDestroy(kernelStart);
+      if (kernelEnd) cudaEventDestroy(kernelEnd);
+      d_CNtoVN = nullptr;
+      d_VNtoCh = nullptr;
+      d_ChNtoVN = nullptr;
+      d_APP = nullptr;
+      kernelStart = nullptr;
+      kernelEnd = nullptr;
+    };
+
+    auto timedMemcpy = [&](void* dst,
+                           const void* src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char* failure,
+                           double& accumulator) -> bool {
+      if (bytes == 0) {
+        return true;
+      }
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess) {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
+
+    if (matrixBytes > 0) {
+      status = cudaMalloc(&d_CNtoVN, matrixBytes);
+      if (status != cudaSuccess) {
+        gpu_error = "cudaMalloc failed for ComputeAPP CNtoVN buffer";
+        cleanup();
+        break;
+      }
+    }
+    status = cudaMalloc(&d_VNtoCh, nodeBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ComputeAPP VNtoChN buffer";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_ChNtoVN, nodeBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ComputeAPP ChNtoVN buffer";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_APP, nodeBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ComputeAPP APP buffer";
+      cleanup();
+      break;
+    }
+
+    if (!EnsureDeviceArray(constant_set.interleaver,
+                           totalEdges,
+                           status,
+                           "ComputeAPP interleaver",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.columnDegree,
+                           N,
+                           status,
+                           "ComputeAPP columnDegree",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.nodeBase,
+                           N,
+                           status,
+                           "ComputeAPP nodeBase",
+                           gpu_error)) {
+      cleanup();
+      break;
+    }
+
+    constant_set.nodeBase.dirty = true;
+
+    auto copyVector = [&](DeviceArray<int>& buffer,
+                          const vector<int>& host,
+                          const char* failure) -> bool {
+      if (buffer.size == 0 || !buffer.dirty) {
+        return true;
+      }
+      if (host.size() < buffer.size) {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      if (!timedMemcpy(buffer.ptr,
+                       host.data(),
+                       buffer.size * sizeof(int),
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms)) {
+        return false;
+      }
+      buffer.dirty = false;
+      return true;
+    };
+
+    if (!copyVector(constant_set.interleaver,
+                    Interleaver,
+                    "cudaMemcpy failed for ComputeAPP interleaver") ||
+        !copyVector(constant_set.columnDegree,
+                    ColDeg,
+                    "cudaMemcpy failed for ComputeAPP column degrees") ||
+        !copyVector(constant_set.nodeBase,
+                    nodeBase,
+                    "cudaMemcpy failed for ComputeAPP node base")) {
+      break;
+    }
+
+    if (matrixBytes > 0 &&
+        !timedMemcpy(d_CNtoVN,
+                     CNtoVNxxx.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ComputeAPP CNtoVN",
+                     transfer_to_device_ms)) {
+      break;
+    }
+    if (!timedMemcpy(d_VNtoCh,
+                     VNtoChN.data(),
+                     nodeBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ComputeAPP VNtoChN",
+                     transfer_to_device_ms)) {
+      break;
+    }
+
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ComputeAPP kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventCreate failed for ComputeAPP kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ComputeAPP kernelStart";
+      cleanup();
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    int grid_x = std::min(N, 65535);
+    if (grid_x == 0) {
+      grid_x = 1;
+    }
+    int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+    grid_y = std::min(grid_y, 65535);
+    dim3 grid(grid_x, grid_y);
+    dim3 block(threads);
+
+    cuda_kernels::ComputeAPPKernel<<<grid, block>>>(
+        d_APP,
+        d_ChNtoVN,
+        d_CNtoVN,
+        d_VNtoCh,
+        constant_set.interleaver.ptr,
+        constant_set.columnDegree.ptr,
+        constant_set.nodeBase.ptr,
+        N,
+        GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaEventRecord failed for ComputeAPP kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ComputeAPP CUDA kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaEventSynchronize(kernelEnd);
+    if (status != cudaSuccess) {
+      gpu_error = "ComputeAPP CUDA kernel execution failed";
+      cleanup();
+      break;
+    }
+
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess) {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    if (!timedMemcpy(ChNtoVN.data(),
+                     d_ChNtoVN,
+                     nodeBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for ComputeAPP ChNtoVN",
+                     transfer_to_host_ms) ||
+        !timedMemcpy(APP.data(),
+                     d_APP,
+                     nodeBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for ComputeAPP APP",
+                     transfer_to_host_ms)) {
+      break;
+    }
+
+    cleanup();
+
+    if (g_enable_timing_output) {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "ComputeAPP CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "ComputeAPP executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success) {
+    return;
   }
+  if (!gpu_error.empty() && !reported_cuda_failure) {
+    std::cerr << "ComputeAPP GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  cpu_impl();
 }
 // Function: computeUnion
 // Purpose: TODO - describe the function's responsibility succinctly.
