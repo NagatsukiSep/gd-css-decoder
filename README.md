@@ -85,6 +85,32 @@ Under the hood, the script executes:
 ./gd_css 500   data/apm_css/DEG_APM_Gamma_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   data/apm_css/DEG_APM_Delta_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   DEG_APM_J2_L6_P6500   0.0640   0   101
 ```
 
+## ⏱ Measure QBPS by repeating decodes
+
+Use `scripts/measure_qbps.sh` when you want to run the decoder multiple times to
+measure throughput (QBPS). By default the script:
+
+- picks the CUDA build when available (falls back to the CPU build),
+- reuses the same example parameters as `scripts/run_example.sh`,
+- runs **10 consecutive decodes**, and
+- prints the elapsed time per run as well as a summary.
+
+You can customise it, for example:
+
+```bash
+# Run 10 decodes with the default example parameters and report QBPS assuming
+# 163840 logical qubits (N × logGF) are processed per run.
+scripts/measure_qbps.sh --qubits-per-run 163840
+
+# Run 5 decodes of a custom configuration using an explicit binary.
+scripts/measure_qbps.sh --binary ./gd_css --runs 5 \
+  500 data/...Gamma...  data/...Delta...  DEG_APM_J2_L6_P6500  0.0640  0  101
+```
+
+Pass `-h`/`--help` to see all options. If you know the number of logical qubits
+handled in a single decode, provide it through `--qubits-per-run` so that the
+script can compute QBPS automatically.
+
 ---
 
 ## 📊 Output
