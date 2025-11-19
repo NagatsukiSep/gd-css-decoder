@@ -22,7 +22,28 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <chrono>
+#include <string>
 using namespace std;
+
+class ScopedTimer {
+ public:
+  explicit ScopedTimer(const std::string &label)
+      : label_(label), start_(std::chrono::steady_clock::now()) {}
+
+  ~ScopedTimer() {
+    const auto end = std::chrono::steady_clock::now();
+    const double elapsed_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            end - start_)
+            .count();
+    printf("[Timing] %s: %.3f ms\n", label_.c_str(), elapsed_ms);
+  }
+
+ private:
+  std::string label_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
 struct SM_StateRef {
@@ -330,6 +351,7 @@ const std::vector<std::vector<double>> &VNtoChN,
 const std::vector<int> &Interleaver,
 const std::vector<int> &ColDeg,
 int N, int GF) {
+  ScopedTimer timer("ComputeAPP");
   int numB = 0;
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
@@ -370,6 +392,7 @@ void Decision(std::vector<int> &Decision,
 std::vector<int> &Updated_EstmNoise_History,
 const std::vector<std::vector<double>> &APP,
 int N, int GF) {
+  ScopedTimer timer("Decision");
   Updated_EstmNoise_History.clear();
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
@@ -418,25 +441,42 @@ void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,do
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eigen, vector<vector<double>>& ChNtoVN, int N, int GF){// Loop: iterate over a range/collection.
+  ScopedTimer timer("ChannelPass");
+  double h2d_ms = 0.0;
+  double kernel_ms = 0.0;
+  double d2h_ms = 0.0;
   for(size_t n=0;n<N;n++){
     vector<double> input(GF);
+    Eigen::VectorXd vec(GF),res(GF);
+    const auto h2d_start = std::chrono::steady_clock::now();
 // Loop: iterate over a range/collection.
     for(size_t g=0;g<GF;g++){input[g]=ChNtoVN[n][g];}
     normalize(input,GF);
-    Eigen::VectorXd vec(GF),res(GF);
     // Loop: iterate over a range/collection.
     for(size_t e=0;e<GF;e++){vec(e)=input[e];}
-    res=f_VNtoChN_eigen.transpose()*vec;
+    const auto h2d_end = std::chrono::steady_clock::now();
+    h2d_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(h2d_end - h2d_start).count();
 
+    const auto kernel_start = std::chrono::steady_clock::now();
+    res=f_VNtoChN_eigen.transpose()*vec;
+    const auto kernel_end = std::chrono::steady_clock::now();
+    kernel_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(kernel_end - kernel_start).count();
+
+    const auto d2h_start = std::chrono::steady_clock::now();
     // Loop: iterate over a range/collection.
     for(size_t e=0;e<GF;e++){VNtoChN[n][e]=res(e);}
     normalize(VNtoChN[n],GF);
+    const auto d2h_end = std::chrono::steady_clock::now();
+    d2h_ms += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(d2h_end - d2h_start).count();
   }
+  printf("ChannelPass CUDA timing (H2D: %.3f ms, kernel: %.3f ms, D2H: %.3f ms, total transfer: %.3f ms)\n",
+         h2d_ms, kernel_ms, d2h_ms, h2d_ms + d2h_ms);
 }
 // Function: DataPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoChN,vector<int>& Interleaver,vector<int>& ColumnDegree,int N,int GF){
+  ScopedTimer timer("DataPass");
 
   int numB=0;
   // Loop: iterate over a range/collection.
@@ -463,6 +503,7 @@ void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxx
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+  ScopedTimer timer("CheckPass");
 
   int           tz,t,k,m,g,numB;
   int           logGF;
