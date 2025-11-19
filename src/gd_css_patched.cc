@@ -19,6 +19,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <tuple>
 #include <math.h>
 #include <stdio.h>
@@ -84,7 +85,16 @@ class FlatMatrix {
 
   FlatMatrix() : rows_(0), cols_(0) {}
 
+  ~FlatMatrix() {
+#if GD_CSS_ENABLE_CUDA
+    releaseCudaMapping();
+#endif
+  }
+
   void resize(size_t rows, size_t cols) {
+#if GD_CSS_ENABLE_CUDA
+    releaseCudaMapping();
+#endif
     rows_ = rows;
     cols_ = cols;
     data_.assign(rows_ * cols_, 0.0);
@@ -107,10 +117,73 @@ class FlatMatrix {
   double* data() { return data_.data(); }
   const double* data() const { return data_.data(); }
 
+#if GD_CSS_ENABLE_CUDA
+  bool ensureCudaMapping(size_t bytes, std::string* error = nullptr) {
+    if (bytes == 0) {
+      releaseCudaMapping();
+      return true;
+    }
+    double* host_ptr = data();
+    if (!host_ptr) {
+      if (error) {
+        *error = "FlatMatrix has no backing storage";
+      }
+      return false;
+    }
+    if (cuda_registered_ && cuda_host_ptr_ == host_ptr &&
+        cuda_registered_bytes_ == bytes) {
+      return true;
+    }
+    releaseCudaMapping();
+    cudaError_t status = cudaHostRegister(
+        host_ptr, bytes,
+        cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (status != cudaSuccess) {
+      if (error) {
+        *error = std::string("cudaHostRegister failed: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    status = cudaHostGetDevicePointer(&cuda_device_ptr_, host_ptr, 0);
+    if (status != cudaSuccess) {
+      cudaHostUnregister(host_ptr);
+      if (error) {
+        *error = std::string("cudaHostGetDevicePointer failed: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    cuda_registered_ = true;
+    cuda_host_ptr_ = host_ptr;
+    cuda_registered_bytes_ = bytes;
+    return true;
+  }
+
+  void releaseCudaMapping() {
+    if (cuda_registered_ && cuda_host_ptr_) {
+      cudaHostUnregister(cuda_host_ptr_);
+    }
+    cuda_registered_ = false;
+    cuda_host_ptr_ = nullptr;
+    cuda_device_ptr_ = nullptr;
+    cuda_registered_bytes_ = 0;
+  }
+
+  double* cuda_data() const { return cuda_device_ptr_; }
+  bool hasCudaMapping() const { return cuda_registered_; }
+#endif
+
  private:
   std::vector<double> data_;
   size_t rows_;
   size_t cols_;
+#if GD_CSS_ENABLE_CUDA
+  double* cuda_device_ptr_ = nullptr;
+  double* cuda_host_ptr_ = nullptr;
+  size_t cuda_registered_bytes_ = 0;
+  bool cuda_registered_ = false;
+#endif
 };
 
 namespace {
@@ -722,6 +795,9 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   double kernel_ms = 0.0;
   cudaEvent_t kernelStart = nullptr;
   cudaEvent_t kernelEnd = nullptr;
+  bool zero_copy_cn = false;
+  bool zero_copy_vn = false;
+  static bool requested_map_host_flag = false;
 
   const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
   const size_t pairCount = FFT0.size();
@@ -729,8 +805,8 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   cudaError_t status = cudaSuccess;
 
   auto cleanup = [&]() {
-    if (d_CNtoVN) cudaFree(d_CNtoVN);
-    if (d_VNtoCN) cudaFree(d_VNtoCN);
+    if (d_CNtoVN && !zero_copy_cn) cudaFree(d_CNtoVN);
+    if (d_VNtoCN && !zero_copy_vn) cudaFree(d_VNtoCN);
     if (d_TrueNoiseSynd) cudaFree(d_TrueNoiseSynd);
     if (kernelStart) cudaEventDestroy(kernelStart);
     if (kernelEnd) cudaEventDestroy(kernelEnd);
@@ -773,21 +849,87 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
-  status = cudaMalloc(&d_CNtoVN, matrixBytes);
+  int device = 0;
+  status = cudaGetDevice(&device);
   if (status != cudaSuccess) {
-    error = "cudaMalloc failed for CNtoVN buffer";
+    error = "cudaGetDevice failed";
     cleanup();
     return false;
   }
-  status = cudaMalloc(&d_VNtoCN, matrixBytes);
+
+  int maxSharedBytes = 0;
+  status = cudaDeviceGetAttribute(&maxSharedBytes, cudaDevAttrMaxSharedMemoryPerBlock, device);
   if (status != cudaSuccess) {
-    error = "cudaMalloc failed for VNtoCN buffer";
+    error = "cudaDeviceGetAttribute failed";
     cleanup();
     return false;
+  }
+
+  int can_map_host_memory = 0;
+  status = cudaDeviceGetAttribute(&can_map_host_memory,
+                                  cudaDevAttrCanMapHostMemory,
+                                  device);
+  if (status != cudaSuccess) {
+    error = "cudaDeviceGetAttribute failed for host mapping support";
+    cleanup();
+    return false;
+  }
+  if (can_map_host_memory && !requested_map_host_flag) {
+    cudaError_t set_flag_status = cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (set_flag_status != cudaSuccess &&
+        set_flag_status != cudaErrorSetOnActiveProcess) {
+      can_map_host_memory = 0;
+    }
+    requested_map_host_flag = true;
+    if (set_flag_status == cudaErrorSetOnActiveProcess) {
+      cudaGetLastError();
+    }
+  }
+
+  if (can_map_host_memory && matrixBytes > 0) {
+    if (CNtoVNxxx.ensureCudaMapping(matrixBytes)) {
+      d_CNtoVN = CNtoVNxxx.cuda_data();
+      zero_copy_cn = d_CNtoVN != nullptr;
+    }
+    if (VNtoCNxxx.ensureCudaMapping(matrixBytes)) {
+      d_VNtoCN = VNtoCNxxx.cuda_data();
+      zero_copy_vn = d_VNtoCN != nullptr;
+    }
+    if (!zero_copy_cn) {
+      CNtoVNxxx.releaseCudaMapping();
+    }
+    if (!zero_copy_vn) {
+      VNtoCNxxx.releaseCudaMapping();
+    }
+  }
+
+  if (!zero_copy_cn) {
+    status = cudaMalloc(&d_CNtoVN, matrixBytes);
+    if (status != cudaSuccess) {
+      error = "cudaMalloc failed for CNtoVN buffer";
+      cleanup();
+      return false;
+    }
+  }
+  if (!zero_copy_vn) {
+    status = cudaMalloc(&d_VNtoCN, matrixBytes);
+    if (status != cudaSuccess) {
+      error = "cudaMalloc failed for VNtoCN buffer";
+      cleanup();
+      return false;
+    }
   }
   status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
   if (status != cudaSuccess) {
     error = "cudaMalloc failed for TrueNoiseSynd";
+    cleanup();
+    return false;
+  }
+
+  const size_t sharedBytes =
+      (sizeof(double) * 2ULL) * static_cast<size_t>(GF);
+  if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
+    error = "CheckPass CUDA kernel requires more shared memory than available";
     cleanup();
     return false;
   }
@@ -848,21 +990,25 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     gf_tables.gf = GF;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
-    return false;
+  if (!zero_copy_cn) {
+    if (!timedMemcpy(d_CNtoVN,
+                     CNtoVNxxx.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for CNtoVN host->device",
+                     transfer_to_device_ms)) {
+      return false;
+    }
   }
-  if (!timedMemcpy(d_VNtoCN,
-                   VNtoCNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for VNtoCN host->device",
-                   transfer_to_device_ms)) {
-    return false;
+  if (!zero_copy_vn) {
+    if (!timedMemcpy(d_VNtoCN,
+                     VNtoCNxxx.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for VNtoCN host->device",
+                     transfer_to_device_ms)) {
+      return false;
+    }
   }
   if (!copyConstant(constant_set.matValue,
                     MatValueFlat,
@@ -915,30 +1061,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
   int* d_FFT1 = constant_set.fft1.ptr;
   int* d_DIVGF = gf_tables.div.ptr;
   int* d_MULGF = gf_tables.mul.ptr;
-
-  int device = 0;
-  status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    error = "cudaGetDevice failed";
-    cleanup();
-    return false;
-  }
-
-  int maxSharedBytes = 0;
-  status = cudaDeviceGetAttribute(&maxSharedBytes, cudaDevAttrMaxSharedMemoryPerBlock, device);
-  if (status != cudaSuccess) {
-    error = "cudaDeviceGetAttribute failed";
-    cleanup();
-    return false;
-  }
-
-  const size_t sharedBytes =
-      (sizeof(double) * 2ULL) * static_cast<size_t>(GF);
-  if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
-    error = "CheckPass CUDA kernel requires more shared memory than available";
-    cleanup();
-    return false;
-  }
 
   const int threads = std::min(256, std::max(1, GF));
   dim3 grid(M);
@@ -1005,21 +1127,25 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     kernel_ms = static_cast<double>(kernel_ms_f);
   }
 
-  if (!timedMemcpy(CNtoVNxxx.data(),
-                   d_CNtoVN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for CNtoVN device->host",
-                   transfer_to_host_ms)) {
-    return false;
+  if (!zero_copy_cn) {
+    if (!timedMemcpy(CNtoVNxxx.data(),
+                     d_CNtoVN,
+                     matrixBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for CNtoVN device->host",
+                     transfer_to_host_ms)) {
+      return false;
+    }
   }
-  if (!timedMemcpy(VNtoCNxxx.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
-    return false;
+  if (!zero_copy_vn) {
+    if (!timedMemcpy(VNtoCNxxx.data(),
+                     d_VNtoCN,
+                     matrixBytes,
+                     cudaMemcpyDeviceToHost,
+                     "cudaMemcpy failed for VNtoCN device->host",
+                     transfer_to_host_ms)) {
+      return false;
+    }
   }
 
   if (g_enable_timing_output) {
