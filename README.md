@@ -85,6 +85,17 @@ Under the hood, the script executes:
 ./gd_css 500   data/apm_css/DEG_APM_Gamma_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   data/apm_css/DEG_APM_Delta_J2_L6_P6500_RQ0.333333_alpha2_GF256_GIRTH16_SEED1014   DEG_APM_J2_L6_P6500   0.0640   0   101
 ```
 
+Append optional arguments when you need additional diagnostics:
+
+- `timing_debug` (8th argument) — set to `1` to enable verbose timing traces inside a single decode.
+- `measurement_runs` (9th argument) — set to a positive integer (for example, `10`) to ask the program itself to time that many consecutive decodes. The decoder stops automatically after completing the requested number of runs and prints the aggregate duration, per-run average, and the QBPS figure computed from `N × logGF` logical qubits per decode.
+
+Example: time 10 decode runs of the default configuration without the helper script:
+
+```
+./gd_css 500 data/...Gamma... data/...Delta... DEG_APM_J2_L6_P6500 0.0640 0 101 0 10
+```
+
 ## ⏱ Measure QBPS by repeating decodes
 
 Use `scripts/measure_qbps.sh` when you want to run the decoder multiple times to
@@ -97,6 +108,11 @@ the script:
 - reuses the same example parameters as `scripts/run_example.sh`,
 - runs **10 consecutive decodes**, and
 - prints the elapsed time per run as well as a summary.
+
+If you prefer to keep everything in a single process, pass the optional
+`measurement_runs` argument directly to `gd_css` (see the section above). The
+binary will time itself internally and report the same QBPS calculation without
+requiring the helper shell script.
 
 You can customise it, for example:
 
