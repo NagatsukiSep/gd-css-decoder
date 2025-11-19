@@ -1769,17 +1769,18 @@ void ComputeAPP(FlatMatrix &APP,
       return true;
     };
 
-    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+    auto ensureMatrixInput = [&](const FlatMatrix& matrix,
                                  size_t bytes,
                                  const char* failure) -> double* {
+      FlatMatrix& mutableMatrix = const_cast<FlatMatrix&>(matrix);
       if (bytes == 0) {
         return nullptr;
       }
-      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+      if (!mutableMatrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
         cleanup();
         return nullptr;
       }
-      double* ptr = matrix.cuda_device_storage();
+      double* ptr = mutableMatrix.cuda_device_storage();
       if (!matrix.hasValidDeviceData()) {
         if (!timedMemcpy(ptr,
                          matrix.data(),
@@ -1789,7 +1790,7 @@ void ComputeAPP(FlatMatrix &APP,
                          transfer_to_device_ms)) {
           return nullptr;
         }
-        matrix.markDeviceDataValid();
+        mutableMatrix.markDeviceDataValid();
       }
       return ptr;
     };
