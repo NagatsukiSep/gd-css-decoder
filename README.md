@@ -96,6 +96,20 @@ Example: time 10 decode runs of the default configuration without the helper scr
 ./gd_css 500 data/...Gamma... data/...Delta... DEG_APM_J2_L6_P6500 0.0640 0 101 0 10
 ```
 
+When measurement mode finishes you will see a single-line summary like
+
+```
+Measurement summary: runs=10 total_time[s]=153.819749 avg_per_run[s]=15.381975 logical_qubits_per_run=312000.000000 QBPS=20283.481347
+```
+
+Interpret the fields as follows:
+
+- `runs` – how many decode iterations were actually completed.
+- `total_time[s]` – wall-clock time in seconds consumed by those runs.
+- `avg_per_run[s]` – arithmetic mean duration of a single decode (`total_time / runs`).
+- `logical_qubits_per_run` – the `N × logGF` value provided (or implied) when starting the measurement run; multiply this by `runs` to get the total number of logical qubits processed.
+- `QBPS` – the derived throughput, i.e. `(logical_qubits_per_run × runs) / total_time`.
+
 ## ⏱ Measure QBPS by repeating decodes
 
 Use `scripts/measure_qbps.sh` when you want to run the decoder multiple times to
