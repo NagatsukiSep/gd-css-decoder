@@ -15,7 +15,7 @@ done
 OUTPUT=${1:-gd_css_cuda}
 
 $NVCC -x cu -std=c++17 -O3 -Xcompiler "-fopenmp" -Xcompiler "-D_Alignof=alignof" \
-  -arch=${CUDA_ARCH} -lcudart -lm -DGD_CSS_CUDA_BUILD $INC \
+  -arch=${CUDA_ARCH} -lcublas -lcudart -lm -DGD_CSS_CUDA_BUILD $INC \
   src/gd_css_patched.cc -o "$OUTPUT"
 
 echo "✅ CUDA build complete: ./$OUTPUT"
