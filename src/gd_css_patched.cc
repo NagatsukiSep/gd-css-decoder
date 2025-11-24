@@ -949,6 +949,58 @@ __global__ void ComputeAPPKernel(double* APP,
   }
 }
 
+__global__ void DecisionKernel(const double* APP,
+                               int* decision,
+                               int N,
+                               int GF) {
+  const int node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (node >= N) {
+    return;
+  }
+
+  const int base = node * GF;
+  double max_val = APP[base];
+  int max_idx = 0;
+  for (int g = 1; g < GF; ++g) {
+    const double value = APP[base + g];
+    if (value >= max_val) {
+      max_val = value;
+      max_idx = g;
+    }
+  }
+
+  decision[node] = max_idx;
+}
+
+__global__ void SyndromeKernel(const int* mat,
+                               const int* matValue,
+                               const int* rowBase,
+                               const int* rowDegree,
+                               const int* addGF,
+                               const int* mulGF,
+                               const int* estNoise,
+                               int M,
+                               int GF,
+                               int* outSyndrome) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= M) {
+    return;
+  }
+
+  const int base = rowBase[row];
+  const int degree = rowDegree[row];
+
+  int syndrome = 0;
+  for (int t = 0; t < degree; ++t) {
+    const int col = mat[base + t];
+    const int h = matValue[base + t];
+    const int product = mulGF[h * GF + estNoise[col]];
+    syndrome = addGF[syndrome * GF + product];
+  }
+
+  outSyndrome[row] = syndrome;
+}
+
 }  // namespace cuda_kernels
 #endif
 
@@ -962,6 +1014,7 @@ static std::unordered_map<DataPassMetadataKey,
                           DataPassConstantSet,
                           DataPassMetadataKeyHash>
     g_datapass_constant_cache;
+static DeviceArray<int> g_decision_buffer;
 
 template <typename T>
 bool EnsureDeviceArray(DeviceArray<T>& buffer,
@@ -1079,6 +1132,29 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
+  auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                               size_t bytes,
+                               const char* failure,
+                               double*& device_ptr) -> bool {
+    if (!matrix.ensureCudaDeviceStorage(bytes, &error)) {
+      cleanup();
+      return false;
+    }
+    device_ptr = matrix.cuda_device_storage();
+    if (!matrix.hasValidDeviceData()) {
+      if (!timedMemcpy(device_ptr,
+                       matrix.data(),
+                       bytes,
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms)) {
+        return false;
+      }
+      matrix.markDeviceDataValid();
+    }
+    return true;
+  };
+
   int device = 0;
   status = cudaGetDevice(&device);
   if (status != cudaSuccess) {
@@ -1185,20 +1261,16 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     gf_tables.gf = GF;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
+  if (!ensureMatrixInput(CNtoVNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for CNtoVN host->device",
+                         d_CNtoVN)) {
     return false;
   }
-  if (!timedMemcpy(d_VNtoCN,
-                   VNtoCNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for VNtoCN host->device",
-                   transfer_to_device_ms)) {
+  if (!ensureMatrixInput(VNtoCNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for VNtoCN host->device",
+                         d_VNtoCN)) {
     return false;
   }
   if (!copyConstant(constant_set.matValue,
@@ -1320,22 +1392,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
 
   CNtoVNxxx.markDeviceDataValid();
   VNtoCNxxx.markDeviceDataValid();
-  if (!timedMemcpy(CNtoVNxxx.data(),
-                   d_CNtoVN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for CNtoVN device->host",
-                   transfer_to_host_ms)) {
-    return false;
-  }
-  if (!timedMemcpy(VNtoCNxxx.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
-    return false;
-  }
 
   if (g_enable_timing_output) {
     std::streamsize previous_precision = std::cout.precision();
@@ -1650,8 +1706,8 @@ int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>
 
 void ComputeAPP(FlatMatrix &APP,
                 FlatMatrix &ChNtoVN,
-                const FlatMatrix &CNtoVNxxx,
-                const FlatMatrix &VNtoChN,
+                FlatMatrix &CNtoVNxxx,
+                FlatMatrix &VNtoChN,
                 const std::vector<int> &Interleaver,
                 const std::vector<int> &ColDeg,
                 int N,
@@ -1769,18 +1825,17 @@ void ComputeAPP(FlatMatrix &APP,
       return true;
     };
 
-    auto ensureMatrixInput = [&](const FlatMatrix& matrix,
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
                                  size_t bytes,
                                  const char* failure) -> double* {
-      FlatMatrix& mutableMatrix = const_cast<FlatMatrix&>(matrix);
       if (bytes == 0) {
         return nullptr;
       }
-      if (!mutableMatrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
         cleanup();
         return nullptr;
       }
-      double* ptr = mutableMatrix.cuda_device_storage();
+      double* ptr = matrix.cuda_device_storage();
       if (!matrix.hasValidDeviceData()) {
         if (!timedMemcpy(ptr,
                          matrix.data(),
@@ -1790,7 +1845,7 @@ void ComputeAPP(FlatMatrix &APP,
                          transfer_to_device_ms)) {
           return nullptr;
         }
-        mutableMatrix.markDeviceDataValid();
+        matrix.markDeviceDataValid();
       }
       return ptr;
     };
@@ -1962,20 +2017,6 @@ void ComputeAPP(FlatMatrix &APP,
 
     ChNtoVN.markDeviceDataValid();
     APP.markDeviceDataValid();
-    if (!timedMemcpy(ChNtoVN.data(),
-                     d_ChNtoVN,
-                     nodeBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ComputeAPP ChNtoVN",
-                     transfer_to_host_ms) ||
-        !timedMemcpy(APP.data(),
-                     d_APP,
-                     nodeBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ComputeAPP APP",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
@@ -2039,6 +2080,101 @@ void Decision(std::vector<int> &Decision,
               int N,
               int GF) {
   ScopedTimer timer("Decision");
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do {
+    if (N <= 0 || GF <= 0) {
+      break;
+    }
+    if (APP.rows() < static_cast<size_t>(N) ||
+        APP.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "Decision GPU path received undersized APP buffer";
+      break;
+    }
+
+    cudaError_t status = cudaSuccess;
+    const size_t appBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) *
+                            sizeof(double);
+
+    if (!const_cast<FlatMatrix&>(APP)
+             .ensureCudaDeviceStorage(appBytes, &gpu_error)) {
+      break;
+    }
+    if (!APP.hasValidDeviceData()) {
+      if (!const_cast<FlatMatrix&>(APP).copyHostToDevice(appBytes, &gpu_error)) {
+        break;
+      }
+    }
+
+    if (!EnsureDeviceArray(g_decision_buffer,
+                           static_cast<size_t>(N),
+                           status,
+                           "Decision output",
+                           gpu_error)) {
+      break;
+    }
+
+    const double* d_APP = APP.cuda_device_storage();
+    if (!d_APP) {
+      gpu_error = "Decision APP device pointer unavailable";
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    const int blocks = (N + threads - 1) / threads;
+
+    cuda_kernels::DecisionKernel<<<blocks, threads>>>(
+        d_APP, g_decision_buffer.ptr, N, GF);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "Decision CUDA kernel launch failed";
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "Decision CUDA kernel execution failed";
+      break;
+    }
+
+    std::vector<int> newDecision(static_cast<size_t>(N));
+    status = cudaMemcpy(newDecision.data(),
+                        g_decision_buffer.ptr,
+                        static_cast<size_t>(N) * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMemcpy failed for Decision output";
+      break;
+    }
+
+    Updated_EstmNoise_History.clear();
+    for (int n = 0; n < N; ++n) {
+      if (Decision[n] != newDecision[n]) {
+        Updated_EstmNoise_History.push_back(n);
+      }
+      Decision[n] = newDecision[n];
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "Decision executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success) {
+    return;
+  }
+  if (!gpu_error.empty() && !reported_cuda_failure) {
+    std::cerr << "Decision GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
   Updated_EstmNoise_History.clear();
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
@@ -2329,14 +2465,6 @@ void ChannelPass(FlatMatrix& VNtoChN,
     }
 
     VNtoChN.markDeviceDataValid();
-    if (!timedMemcpy(VNtoChN.data(),
-                     d_output,
-                     vectorBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ChannelPass output",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
@@ -2503,6 +2631,31 @@ void DataPass(FlatMatrix& VNtoCNxxx,
       return true;
     };
 
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                                 size_t bytes,
+                                 const char* failure) -> double* {
+      if (bytes == 0) {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        cleanup();
+        return nullptr;
+      }
+      double* ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData()) {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms)) {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
+    };
+
     if (!VNtoCNxxx.ensureCudaDeviceStorage(matrixBytes, &gpu_error) ||
         !CNtoVNxxx.ensureCudaDeviceStorage(matrixBytes, &gpu_error) ||
         !VNtoChN.ensureCudaDeviceStorage(channelBytes, &gpu_error)) {
@@ -2565,21 +2718,13 @@ void DataPass(FlatMatrix& VNtoCNxxx,
     }
 
     double* d_VNtoCN = VNtoCNxxx.cuda_device_storage();
-    double* d_CNtoVN = CNtoVNxxx.cuda_device_storage();
-    double* d_VNtoCh = VNtoChN.cuda_device_storage();
-
-    if (!timedMemcpy(d_CNtoVN,
-                     CNtoVNxxx.data(),
-                     matrixBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for DataPass CNtoVN",
-                     transfer_to_device_ms) ||
-        !timedMemcpy(d_VNtoCh,
-                     VNtoChN.data(),
-                     channelBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for DataPass VNtoChN",
-                     transfer_to_device_ms)) {
+    double* d_CNtoVN = ensureMatrixInput(CNtoVNxxx,
+                                         matrixBytes,
+                                         "cudaMemcpy failed for DataPass CNtoVN");
+    double* d_VNtoCh = ensureMatrixInput(VNtoChN,
+                                         channelBytes,
+                                         "cudaMemcpy failed for DataPass VNtoChN");
+    if ((!d_CNtoVN && matrixBytes > 0) || (!d_VNtoCh && channelBytes > 0)) {
       break;
     }
 
@@ -2674,14 +2819,6 @@ void DataPass(FlatMatrix& VNtoCNxxx,
     }
 
     VNtoCNxxx.markDeviceDataValid();
-    if (!timedMemcpy(VNtoCNxxx.data(),
-                     d_VNtoCN,
-                     matrixBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for DataPass output",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
@@ -2956,23 +3093,203 @@ void calcSyndrome(vector<int>& Synd, int M,vector<int>& EstmNoise,vector<vector<
 
 int IsSyndromeSatisfied(vector<int>& TrueNoiseSynd,vector<int>& EstmNoiseSynd,vector<int>& USS, int M,vector<int>& EstmNoise,vector<vector<int>>& MatValue,vector<int>& RowDegree,vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& Mat){
 
-  USS.clear();
-  calcSyndrome(EstmNoiseSynd, M,EstmNoise,MatValue,RowDegree,ADDGF, MULGF,Mat);
-  // Loop: iterate over a range/collection.
-  for(size_t k=0;k<M;k++){
-    // Conditional branch.
-    if(EstmNoiseSynd[k]!=TrueNoiseSynd[k]){
-      USS.push_back(k);
+  auto finalize_results = [&]() -> int {
+    USS.clear();
+    for (size_t k = 0; k < static_cast<size_t>(M); k++) {
+      if (EstmNoiseSynd[k] != TrueNoiseSynd[k]) {
+        USS.push_back(static_cast<int>(k));
+      }
     }
-  }
-  // Loop: iterate over a range/collection.
-  for(size_t k=0;k<M;k++){
-    // Conditional branch.
-    if(EstmNoiseSynd[k]!=TrueNoiseSynd[k]){
-      return 0;
+    for (size_t k = 0; k < static_cast<size_t>(M); k++) {
+      if (EstmNoiseSynd[k] != TrueNoiseSynd[k]) {
+        return 0;
+      }
     }
+    return 1;
+  };
+
+  auto cpu_impl = [&]() -> int {
+    calcSyndrome(EstmNoiseSynd, M,EstmNoise,MatValue,RowDegree,ADDGF, MULGF,Mat);
+    return finalize_results();
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static DeviceArray<int> d_mat;
+  static DeviceArray<int> d_matValue;
+  static DeviceArray<int> d_rowBase;
+  static DeviceArray<int> d_rowDegree;
+  static DeviceArray<int> d_addGF;
+  static DeviceArray<int> d_mulGF;
+  static DeviceArray<int> d_estNoise;
+  static DeviceArray<int> d_estSynd;
+
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+  cudaError_t status = cudaSuccess;
+
+  do {
+    const int N = static_cast<int>(EstmNoise.size());
+    if (M <= 0 || N <= 0) {
+      break;
+    }
+    if (Mat.size() < static_cast<size_t>(M) ||
+        MatValue.size() < static_cast<size_t>(M) ||
+        RowDegree.size() < static_cast<size_t>(M) ||
+        ADDGF.empty() || MULGF.empty() ||
+        ADDGF.size() != MULGF.size()) {
+      gpu_error = "IsSyndromeSatisfied GPU path received inconsistent dimensions";
+      break;
+    }
+
+    vector<int> rowBase(M + 1, 0);
+    for (int m = 1; m <= M; ++m) {
+      rowBase[m] = rowBase[m - 1] + RowDegree[m - 1];
+    }
+    const size_t totalEdges = static_cast<size_t>(rowBase.back());
+
+    if (totalEdges == 0) {
+      EstmNoiseSynd.assign(M, 0);
+      gpu_success = true;
+      break;
+    }
+
+    vector<int> matFlat(totalEdges);
+    vector<int> matValueFlat(totalEdges);
+    for (int m = 0; m < M; ++m) {
+      const int degree = RowDegree[m];
+      if (Mat[m].size() < static_cast<size_t>(degree) ||
+          MatValue[m].size() < static_cast<size_t>(degree)) {
+        gpu_error = "IsSyndromeSatisfied GPU path received short Mat/MatValue rows";
+        break;
+      }
+      for (int t = 0; t < degree; ++t) {
+        const size_t idx = static_cast<size_t>(rowBase[m]) + t;
+        matFlat[idx] = Mat[m][t];
+        matValueFlat[idx] = MatValue[m][t];
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    const int gf = static_cast<int>(ADDGF.size());
+    const size_t gf_table_elems = static_cast<size_t>(gf) * gf;
+    vector<int> addFlat(gf_table_elems);
+    vector<int> mulFlat(gf_table_elems);
+    for (int i = 0; i < gf; ++i) {
+      if (ADDGF[i].size() < static_cast<size_t>(gf) ||
+          MULGF[i].size() < static_cast<size_t>(gf)) {
+        gpu_error = "IsSyndromeSatisfied GPU path requires full GF tables";
+        break;
+      }
+      for (int j = 0; j < gf; ++j) {
+        const size_t idx = static_cast<size_t>(i) * gf + j;
+        addFlat[idx] = ADDGF[i][j];
+        mulFlat[idx] = MULGF[i][j];
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    auto ensureBuffer = [&](DeviceArray<int>& buffer,
+                            size_t elements,
+                            const char* label) -> bool {
+      if (!EnsureDeviceArray(buffer, elements, status, label, gpu_error)) {
+        return false;
+      }
+      return true;
+    };
+
+    if (!ensureBuffer(d_mat, totalEdges, "IsSyndromeSatisfied mat") ||
+        !ensureBuffer(d_matValue, totalEdges, "IsSyndromeSatisfied MatValue") ||
+        !ensureBuffer(d_rowBase, rowBase.size(), "IsSyndromeSatisfied rowBase") ||
+        !ensureBuffer(d_rowDegree, RowDegree.size(), "IsSyndromeSatisfied RowDegree") ||
+        !ensureBuffer(d_addGF, addFlat.size(), "IsSyndromeSatisfied ADDGF") ||
+        !ensureBuffer(d_mulGF, mulFlat.size(), "IsSyndromeSatisfied MULGF") ||
+        !ensureBuffer(d_estNoise, EstmNoise.size(), "IsSyndromeSatisfied EstmNoise") ||
+        !ensureBuffer(d_estSynd, M, "IsSyndromeSatisfied EstmNoiseSynd")) {
+      break;
+    }
+
+    auto copyBuffer = [&](DeviceArray<int>& buffer,
+                          const void* src,
+                          size_t count,
+                          const char* label) -> bool {
+      status = cudaMemcpy(buffer.ptr, src, count * sizeof(int),
+                          cudaMemcpyHostToDevice);
+      if (status != cudaSuccess) {
+        gpu_error = string("cudaMemcpy failed for ") + label;
+        return false;
+      }
+      return true;
+    };
+
+    if (!copyBuffer(d_mat, matFlat.data(), totalEdges, "Mat") ||
+        !copyBuffer(d_matValue, matValueFlat.data(), totalEdges, "MatValue") ||
+        !copyBuffer(d_rowBase, rowBase.data(), rowBase.size(), "rowBase") ||
+        !copyBuffer(d_rowDegree, RowDegree.data(), RowDegree.size(), "RowDegree") ||
+        !copyBuffer(d_addGF, addFlat.data(), addFlat.size(), "ADDGF") ||
+        !copyBuffer(d_mulGF, mulFlat.data(), mulFlat.size(), "MULGF") ||
+        !copyBuffer(d_estNoise, EstmNoise.data(), EstmNoise.size(), "EstmNoise")) {
+      break;
+    }
+
+    const int threads = 256;
+    const int grid = (M + threads - 1) / threads;
+    cuda_kernels::SyndromeKernel<<<grid, threads>>>(d_mat.ptr,
+                                                   d_matValue.ptr,
+                                                   d_rowBase.ptr,
+                                                   d_rowDegree.ptr,
+                                                   d_addGF.ptr,
+                                                   d_mulGF.ptr,
+                                                   d_estNoise.ptr,
+                                                   M,
+                                                   gf,
+                                                   d_estSynd.ptr);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "IsSyndromeSatisfied CUDA kernel launch failed";
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "IsSyndromeSatisfied CUDA kernel execution failed";
+      break;
+    }
+
+    EstmNoiseSynd.resize(static_cast<size_t>(M));
+    status = cudaMemcpy(EstmNoiseSynd.data(),
+                        d_estSynd.ptr,
+                        static_cast<size_t>(M) * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMemcpy failed for EstmNoiseSynd";
+      break;
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "IsSyndromeSatisfied executed with CUDA acceleration."
+                << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success) {
+    return finalize_results();
   }
-  return 1;
+  if (!gpu_error.empty() && !reported_cuda_failure) {
+    std::cerr << "IsSyndromeSatisfied GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  return cpu_impl();
 }
 // Function: count_errors
 // Purpose: TODO - describe the function's responsibility succinctly.
