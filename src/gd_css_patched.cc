@@ -6,6 +6,7 @@
 #include <cassert>
 #include <functional>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -1804,7 +1805,24 @@ void ComputeAPP(FlatMatrix &APP,
 #if GD_CSS_ENABLE_CUDA
   static bool reported_cuda_success = false;
   static bool reported_cuda_failure = false;
+  static bool reported_cuda_skip = false;
+  const int64_t work_items = static_cast<int64_t>(N) * GF;
+  static int64_t min_work_for_gpu = []() {
+    const char* env = std::getenv("GD_CSS_CHANNELPASS_GPU_MIN_WORK");
+    if (env) {
+      try {
+        long long parsed = std::stoll(env);
+        if (parsed >= 0) {
+          return static_cast<int64_t>(parsed);
+        }
+      } catch (...) {
+        // Ignore parse errors and fall back to the default.
+      }
+    }
+    return static_cast<int64_t>(4096);
+  }();
   bool gpu_success = false;
+  bool gpu_skipped_for_size = false;
   string gpu_error;
 
   do {
@@ -2343,6 +2361,10 @@ void ChannelPass(FlatMatrix& VNtoChN,
     if (N <= 0 || GF <= 0) {
       break;
     }
+    if (work_items < min_work_for_gpu) {
+      gpu_skipped_for_size = true;
+      break;
+    }
     if (VNtoChN.rows() < static_cast<size_t>(N) ||
         ChNtoVN.rows() < static_cast<size_t>(N)) {
       gpu_error = "ChannelPass GPU path received inconsistent row counts";
@@ -2626,7 +2648,14 @@ void ChannelPass(FlatMatrix& VNtoChN,
   } while (false);
 
   if (!gpu_success) {
-    if (!gpu_error.empty() && !reported_cuda_failure) {
+    if (gpu_skipped_for_size) {
+      if (!reported_cuda_skip) {
+        std::cout << "ChannelPass GPU path skipped: workload (" << work_items
+                  << ") below threshold (" << min_work_for_gpu
+                  << ")." << std::endl;
+        reported_cuda_skip = true;
+      }
+    } else if (!gpu_error.empty() && !reported_cuda_failure) {
       std::cerr << "ChannelPass GPU path failed: " << gpu_error
                 << ". Falling back to CPU implementation." << std::endl;
       reported_cuda_failure = true;
