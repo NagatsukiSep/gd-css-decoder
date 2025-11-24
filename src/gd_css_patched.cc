@@ -2243,21 +2243,21 @@ void ChannelPass(FlatMatrix& VNtoChN,
   ScopedTimer timer("ChannelPass");
 
   auto cpu_impl = [&]() {
+    Eigen::MatrixXd f_transpose = f_VNtoChN_eigen.transpose();
+    std::vector<double> input_buffer(static_cast<size_t>(GF));
+    std::vector<double> output_buffer(static_cast<size_t>(GF));
+    Eigen::Map<Eigen::VectorXd> input_vec(input_buffer.data(), GF);
+    Eigen::Map<Eigen::VectorXd> output_vec(output_buffer.data(), GF);
+
     for (int n = 0; n < N; ++n) {
-      vector<double> input(GF);
-      for (int g = 0; g < GF; ++g) {
-        input[g] = ChNtoVN[n][g];
-      }
-      normalize(input, GF);
-      Eigen::VectorXd vec(GF), res(GF);
-      for (int e = 0; e < GF; ++e) {
-        vec(e) = input[e];
-      }
-      res = f_VNtoChN_eigen.transpose() * vec;
-      for (int e = 0; e < GF; ++e) {
-        VNtoChN[n][e] = res(e);
-      }
-      normalize(VNtoChN[n], GF);
+      const double* ch_row = ChNtoVN[n].data();
+      std::copy(ch_row, ch_row + GF, input_buffer.begin());
+      normalize_buffer(input_buffer.data(), GF);
+
+      output_vec.noalias() = f_transpose * input_vec;
+
+      normalize_buffer(output_buffer.data(), GF);
+      std::copy(output_buffer.begin(), output_buffer.end(), VNtoChN[n].data());
     }
 #if GD_CSS_ENABLE_CUDA
     VNtoChN.markDeviceDataInvalid();
