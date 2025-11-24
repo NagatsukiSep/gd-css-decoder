@@ -2243,21 +2243,30 @@ void ChannelPass(FlatMatrix& VNtoChN,
   ScopedTimer timer("ChannelPass");
 
   auto cpu_impl = [&]() {
+    static Eigen::MatrixXd cached_transpose;
+    static const double* cached_data_ptr = nullptr;
+    static int cached_rows = -1;
+    static int cached_cols = -1;
+
+    const double* current_ptr = f_VNtoChN_eigen.data();
+    if (current_ptr != cached_data_ptr || cached_rows != f_VNtoChN_eigen.rows() ||
+        cached_cols != f_VNtoChN_eigen.cols()) {
+      cached_transpose = f_VNtoChN_eigen.transpose();
+      cached_data_ptr = current_ptr;
+      cached_rows = static_cast<int>(f_VNtoChN_eigen.rows());
+      cached_cols = static_cast<int>(f_VNtoChN_eigen.cols());
+    }
+
+    Eigen::VectorXd input_vec(GF);
+
     for (int n = 0; n < N; ++n) {
-      vector<double> input(GF);
-      for (int g = 0; g < GF; ++g) {
-        input[g] = ChNtoVN[n][g];
-      }
-      normalize(input, GF);
-      Eigen::VectorXd vec(GF), res(GF);
-      for (int e = 0; e < GF; ++e) {
-        vec(e) = input[e];
-      }
-      res = f_VNtoChN_eigen.transpose() * vec;
-      for (int e = 0; e < GF; ++e) {
-        VNtoChN[n][e] = res(e);
-      }
-      normalize(VNtoChN[n], GF);
+      input_vec = Eigen::Map<const Eigen::VectorXd>(ChNtoVN[n].data(), GF);
+      normalize_buffer(input_vec.data(), GF);
+
+      Eigen::Map<Eigen::VectorXd> output_vec(VNtoChN[n].data(), GF);
+      output_vec.noalias() = cached_transpose * input_vec;
+
+      normalize_buffer(output_vec.data(), GF);
     }
 #if GD_CSS_ENABLE_CUDA
     VNtoChN.markDeviceDataInvalid();
