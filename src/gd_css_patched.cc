@@ -5429,10 +5429,10 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
 
     const int threads = 256;
     const int decisionBlocks = (N + threads - 1) / threads;
-    DecisionKernel<<<decisionBlocks, threads>>>(d_APP,
-                                                decision_buffer.ptr,
-                                                N,
-                                                GF);
+    cuda_kernels::DecisionKernel<<<decisionBlocks, threads>>>(d_APP,
+                                                              decision_buffer.ptr,
+                                                              N,
+                                                              GF);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
       gpu_error = "Decision CUDA kernel launch failed";
@@ -5440,16 +5440,17 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
     }
 
     const int syndromeBlocks = (M + threads - 1) / threads;
-    CalcSyndromeKernel<<<syndromeBlocks, threads>>>(decision_buffer.ptr,
-                                                    constants.mat.ptr,
-                                                    constants.matValue.ptr,
-                                                    constants.rowBase.ptr,
-                                                    constants.rowDegree.ptr,
-                                                    constants.addGF.ptr,
-                                                    constants.mulGF.ptr,
-                                                    estm_syndrome_buffer.ptr,
-                                                    M,
-                                                    GF);
+    cuda_kernels::CalcSyndromeKernel<<<syndromeBlocks, threads>>>(
+        decision_buffer.ptr,
+        constants.mat.ptr,
+        constants.matValue.ptr,
+        constants.rowBase.ptr,
+        constants.rowDegree.ptr,
+        constants.addGF.ptr,
+        constants.mulGF.ptr,
+        estm_syndrome_buffer.ptr,
+        M,
+        GF);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
       gpu_error = "Syndrome CUDA kernel launch failed";
