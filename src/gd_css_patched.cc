@@ -5377,11 +5377,25 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
       break;
     }
 
+    // Transfer strategy for DecodeIteration:
+    // - Parity structure and GF tables (mat/matValue/rowBase/rowDegree/addGF/mulGF)
+    //   are treated as immutable for a metadata key: upload once and reuse unless
+    //   the shape changes.
+    // - APP is produced on the host each iteration, but uploads are skipped if the
+    //   device cache is already marked valid.
+    // - Decision/syndrome staging buffers live on the GPU; only the final
+    //   host-visible results are copied back.
     auto ensureArray = [&](DeviceArray<int>& buffer,
                            size_t elements,
                            const char* label) -> bool {
-      buffer.dirty = true;
-      return EnsureDeviceArray(buffer, elements, status, label, gpu_error);
+      const bool size_changed = buffer.size != elements;
+      if (!EnsureDeviceArray(buffer, elements, status, label, gpu_error)) {
+        return false;
+      }
+      if (size_changed) {
+        buffer.dirty = true;
+      }
+      return true;
     };
 
     if (!ensureArray(constants.mat, matFlat.size(), "DecodeIteration mat") ||
@@ -5396,7 +5410,7 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
     auto copyVector = [&](DeviceArray<int>& buffer,
                           const vector<int>& host,
                           const char* failure) -> bool {
-      if (buffer.size == 0) {
+      if (buffer.size == 0 || !buffer.dirty) {
         return true;
       }
       status = cudaMemcpy(buffer.ptr,
