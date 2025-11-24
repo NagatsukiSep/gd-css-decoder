@@ -537,16 +537,37 @@ using NodeList = vector<int>;
 #if GD_CSS_COMPILED_WITH_NVCC
 namespace cuda_kernels {
 
-__device__ double BlockReduceSum(double* scratch, double value) {
-  const int tid = threadIdx.x;
-  scratch[tid] = value;
-  __syncthreads();
-  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-    if (tid < offset) {
-      scratch[tid] += scratch[tid + offset];
-    }
-    __syncthreads();
+__device__ double WarpReduceSum(double value) {
+  unsigned mask = 0xffffffffu;
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(mask, value, offset);
   }
+  return value;
+}
+
+__device__ double BlockReduceSum(double* scratch, double value) {
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x >> 5;
+
+  value = WarpReduceSum(value);
+
+  if (lane == 0) {
+    scratch[warp] = value;
+  }
+  __syncthreads();
+
+  double block_sum = 0.0;
+  if (warp == 0) {
+    const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+    block_sum = (lane < warp_count) ? scratch[lane] : 0.0;
+    block_sum = WarpReduceSum(block_sum);
+  }
+
+  if (lane == 0 && warp == 0) {
+    scratch[0] = block_sum;
+  }
+
+  __syncthreads();
   return scratch[0];
 }
 
