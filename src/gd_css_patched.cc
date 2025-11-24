@@ -1964,20 +1964,6 @@ void ComputeAPP(FlatMatrix &APP,
 
     ChNtoVN.markDeviceDataValid();
     APP.markDeviceDataValid();
-    if (!timedMemcpy(ChNtoVN.data(),
-                     d_ChNtoVN,
-                     nodeBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ComputeAPP ChNtoVN",
-                     transfer_to_host_ms) ||
-        !timedMemcpy(APP.data(),
-                     d_APP,
-                     nodeBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ComputeAPP APP",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
@@ -2331,14 +2317,6 @@ void ChannelPass(FlatMatrix& VNtoChN,
     }
 
     VNtoChN.markDeviceDataValid();
-    if (!timedMemcpy(VNtoChN.data(),
-                     d_output,
-                     vectorBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ChannelPass output",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
