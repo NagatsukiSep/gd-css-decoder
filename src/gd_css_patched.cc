@@ -2734,6 +2734,11 @@ void DataPass(FlatMatrix& VNtoCNxxx,
     }
 
     VNtoCNxxx.markDeviceDataValid();
+    // DataPass feeds CheckPass and ComputeAPP, both of which still read the
+    // VN→CN messages from host memory whenever their CPU paths run (including
+    // mixed GPU/CPU runs when a GPU kernel fails). Keep the host mirror in
+    // sync here so the next stage can proceed without forcing an implicit
+    // upload later.
     if (!timedMemcpy(VNtoCNxxx.data(),
                      d_VNtoCN,
                      matrixBytes,
