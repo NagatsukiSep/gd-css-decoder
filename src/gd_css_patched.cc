@@ -949,6 +949,29 @@ __global__ void ComputeAPPKernel(double* APP,
   }
 }
 
+__global__ void DecisionKernel(const double* APP,
+                               int* decision,
+                               int N,
+                               int GF) {
+  const int node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (node >= N) {
+    return;
+  }
+
+  const int base = node * GF;
+  double max_val = APP[base];
+  int max_idx = 0;
+  for (int g = 1; g < GF; ++g) {
+    const double value = APP[base + g];
+    if (value >= max_val) {
+      max_val = value;
+      max_idx = g;
+    }
+  }
+
+  decision[node] = max_idx;
+}
+
 __global__ void SyndromeKernel(const int* mat,
                                const int* matValue,
                                const int* rowBase,
@@ -991,6 +1014,7 @@ static std::unordered_map<DataPassMetadataKey,
                           DataPassConstantSet,
                           DataPassMetadataKeyHash>
     g_datapass_constant_cache;
+static DeviceArray<int> g_decision_buffer;
 
 template <typename T>
 bool EnsureDeviceArray(DeviceArray<T>& buffer,
@@ -2056,6 +2080,101 @@ void Decision(std::vector<int> &Decision,
               int N,
               int GF) {
   ScopedTimer timer("Decision");
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do {
+    if (N <= 0 || GF <= 0) {
+      break;
+    }
+    if (APP.rows() < static_cast<size_t>(N) ||
+        APP.cols() < static_cast<size_t>(GF)) {
+      gpu_error = "Decision GPU path received undersized APP buffer";
+      break;
+    }
+
+    cudaError_t status = cudaSuccess;
+    const size_t appBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) *
+                            sizeof(double);
+
+    if (!const_cast<FlatMatrix&>(APP)
+             .ensureCudaDeviceStorage(appBytes, &gpu_error)) {
+      break;
+    }
+    if (!APP.hasValidDeviceData()) {
+      if (!const_cast<FlatMatrix&>(APP).copyHostToDevice(appBytes, &gpu_error)) {
+        break;
+      }
+    }
+
+    if (!EnsureDeviceArray(g_decision_buffer,
+                           static_cast<size_t>(N),
+                           status,
+                           "Decision output",
+                           gpu_error)) {
+      break;
+    }
+
+    const double* d_APP = APP.cuda_device_storage();
+    if (!d_APP) {
+      gpu_error = "Decision APP device pointer unavailable";
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    const int blocks = (N + threads - 1) / threads;
+
+    cuda_kernels::DecisionKernel<<<blocks, threads>>>(
+        d_APP, g_decision_buffer.ptr, N, GF);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "Decision CUDA kernel launch failed";
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "Decision CUDA kernel execution failed";
+      break;
+    }
+
+    std::vector<int> newDecision(static_cast<size_t>(N));
+    status = cudaMemcpy(newDecision.data(),
+                        g_decision_buffer.ptr,
+                        static_cast<size_t>(N) * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMemcpy failed for Decision output";
+      break;
+    }
+
+    Updated_EstmNoise_History.clear();
+    for (int n = 0; n < N; ++n) {
+      if (Decision[n] != newDecision[n]) {
+        Updated_EstmNoise_History.push_back(n);
+      }
+      Decision[n] = newDecision[n];
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "Decision executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success) {
+    return;
+  }
+  if (!gpu_error.empty() && !reported_cuda_failure) {
+    std::cerr << "Decision GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
   Updated_EstmNoise_History.clear();
   // Loop: iterate over a range/collection.
   for (int n = 0; n < N; ++n) {
