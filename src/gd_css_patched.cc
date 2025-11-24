@@ -6,6 +6,7 @@
 #include <cassert>
 #include <functional>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -30,6 +31,7 @@
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #define GD_CSS_COMPILED_WITH_NVCC 1
 #else
 #define GD_CSS_COMPILED_WITH_NVCC 0
@@ -627,6 +629,74 @@ __global__ void ChannelPassKernel(double* VNtoChN,
       VNtoChN[row * GF + g] = output[g];
     }
     __syncthreads();
+  }
+}
+
+__global__ void NormalizeAndTransposeInput(const double* rowMajor,
+                                            double* columnMajor,
+                                            int N,
+                                            int GF) {
+  const long long blockIndex = blockIdx.x +
+                               static_cast<long long>(gridDim.x) * blockIdx.y +
+                               static_cast<long long>(gridDim.x) * gridDim.y *
+                                   blockIdx.z;
+  const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                gridDim.z;
+
+  extern __shared__ double scratch[];
+  for (long long rowIndex = blockIndex; rowIndex < N; rowIndex += totalBlocks) {
+    const int row = static_cast<int>(rowIndex);
+    double partial = 0.0;
+    for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+      partial += rowMajor[row * GF + g];
+    }
+
+    const double sum = BlockReduceSum(scratch, partial);
+    if (sum == 0.0) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+        columnMajor[g + row * GF] = uniform;
+      }
+    } else {
+      const double inv = 1.0 / sum;
+      for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+        columnMajor[g + row * GF] = rowMajor[row * GF + g] * inv;
+      }
+    }
+  }
+}
+
+__global__ void NormalizeAndTransposeOutput(const double* columnMajor,
+                                             double* rowMajor,
+                                             int N,
+                                             int GF) {
+  const long long blockIndex = blockIdx.x +
+                               static_cast<long long>(gridDim.x) * blockIdx.y +
+                               static_cast<long long>(gridDim.x) * gridDim.y *
+                                   blockIdx.z;
+  const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                gridDim.z;
+
+  extern __shared__ double scratch[];
+  for (long long rowIndex = blockIndex; rowIndex < N; rowIndex += totalBlocks) {
+    const int row = static_cast<int>(rowIndex);
+    double partial = 0.0;
+    for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+      partial += columnMajor[g + row * GF];
+    }
+
+    const double sum = BlockReduceSum(scratch, partial);
+    if (sum == 0.0) {
+      const double uniform = 1.0 / static_cast<double>(GF);
+      for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+        rowMajor[row * GF + g] = uniform;
+      }
+    } else {
+      const double inv = 1.0 / sum;
+      for (int g = threadIdx.x; g < GF; g += blockDim.x) {
+        rowMajor[row * GF + g] = columnMajor[g + row * GF] * inv;
+      }
+    }
   }
 }
 
@@ -1735,7 +1805,24 @@ void ComputeAPP(FlatMatrix &APP,
 #if GD_CSS_ENABLE_CUDA
   static bool reported_cuda_success = false;
   static bool reported_cuda_failure = false;
+  static bool reported_cuda_skip = false;
+  const int64_t work_items = static_cast<int64_t>(N) * GF;
+  static int64_t min_work_for_gpu = []() {
+    const char* env = std::getenv("GD_CSS_CHANNELPASS_GPU_MIN_WORK");
+    if (env) {
+      try {
+        long long parsed = std::stoll(env);
+        if (parsed >= 0) {
+          return static_cast<int64_t>(parsed);
+        }
+      } catch (...) {
+        // Ignore parse errors and fall back to the default.
+      }
+    }
+    return static_cast<int64_t>(4096);
+  }();
   bool gpu_success = false;
+  bool gpu_skipped_for_size = false;
   string gpu_error;
 
   do {
@@ -2274,6 +2361,10 @@ void ChannelPass(FlatMatrix& VNtoChN,
     if (N <= 0 || GF <= 0) {
       break;
     }
+    if (work_items < min_work_for_gpu) {
+      gpu_skipped_for_size = true;
+      break;
+    }
     if (VNtoChN.rows() < static_cast<size_t>(N) ||
         ChNtoVN.rows() < static_cast<size_t>(N)) {
       gpu_error = "ChannelPass GPU path received inconsistent row counts";
@@ -2293,15 +2384,20 @@ void ChannelPass(FlatMatrix& VNtoChN,
     }
 
     vector<double> matrixFlat(static_cast<size_t>(GF) * GF);
-    for (int e = 0; e < GF; ++e) {
-      for (int d = 0; d < GF; ++d) {
-        matrixFlat[static_cast<size_t>(e) * GF + d] = f_VNtoChN_eigen(e, d);
+    for (int col = 0; col < GF; ++col) {
+      for (int row = 0; row < GF; ++row) {
+        matrixFlat[static_cast<size_t>(row) +
+                   static_cast<size_t>(col) * static_cast<size_t>(GF)] =
+            f_VNtoChN_eigen(col, row);
       }
     }
 
     double* d_input = nullptr;
     double* d_output = nullptr;
     double* d_matrix = nullptr;
+    double* d_normalized_input = nullptr;
+    double* d_gemm_output = nullptr;
+    cublasHandle_t cublas = nullptr;
     cudaEvent_t kernelStart = nullptr;
     cudaEvent_t kernelEnd = nullptr;
     double transfer_to_device_ms = 0.0;
@@ -2310,6 +2406,12 @@ void ChannelPass(FlatMatrix& VNtoChN,
     auto cleanup = [&]() {
       if (d_matrix) cudaFree(d_matrix);
       d_matrix = nullptr;
+      if (d_normalized_input) cudaFree(d_normalized_input);
+      d_normalized_input = nullptr;
+      if (d_gemm_output) cudaFree(d_gemm_output);
+      d_gemm_output = nullptr;
+      if (cublas) cublasDestroy(cublas);
+      cublas = nullptr;
       if (kernelStart) {
         cudaEventDestroy(kernelStart);
         kernelStart = nullptr;
@@ -2320,8 +2422,11 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
     };
 
-    const size_t vectorBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
+    const size_t vectorBytes =
+        static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
     const size_t matrixBytes = matrixFlat.size() * sizeof(double);
+    const size_t gemmBytes =
+        static_cast<size_t>(GF) * static_cast<size_t>(N) * sizeof(double);
     cudaError_t status = cudaSuccess;
 
     auto timedMemcpy = [&](void* dst,
@@ -2370,12 +2475,33 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
 
+    status = cudaMalloc(&d_normalized_input, gemmBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass normalized input";
+      cleanup();
+      break;
+    }
+
+    status = cudaMalloc(&d_gemm_output, gemmBytes);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass GEMM output";
+      cleanup();
+      break;
+    }
+
     if (!timedMemcpy(d_matrix,
                      matrixFlat.data(),
                      matrixBytes,
                      cudaMemcpyHostToDevice,
                      "cudaMemcpy failed for ChannelPass matrix",
                      transfer_to_device_ms)) {
+      break;
+    }
+
+    cublasStatus_t blas_status = cublasCreate(&cublas);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+      gpu_error = "cublasCreate failed for ChannelPass";
+      cleanup();
       break;
     }
 
@@ -2394,8 +2520,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
     grid_y = std::min(grid_y, 65535);
     dim3 grid(grid_x, grid_y);
     dim3 block(threads);
-    const size_t sharedBytes = sizeof(double) *
-                               (2 * static_cast<size_t>(GF) + block.x);
+    const size_t sharedBytes = sizeof(double) * static_cast<size_t>(block.x);
 
     int device = 0;
     status = cudaGetDevice(&device);
@@ -2414,7 +2539,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
     if (sharedBytes > static_cast<size_t>(maxSharedBytes)) {
-      gpu_error = "ChannelPass kernel requires more shared memory than available";
+      gpu_error = "ChannelPass normalization requires more shared memory than available";
       cleanup();
       break;
     }
@@ -2438,8 +2563,40 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
 
-    cuda_kernels::ChannelPassKernel<<<grid, block, sharedBytes>>>(
-        d_output, d_input, d_matrix, N, GF);
+    cuda_kernels::NormalizeAndTransposeInput<<<grid, block, sharedBytes>>>(
+        d_input, d_normalized_input, N, GF);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass input normalization launch failed";
+      cleanup();
+      break;
+    }
+
+    const double alpha = 1.0;
+    const double beta = 0.0;
+    blas_status = cublasDgemm(cublas,
+                              CUBLAS_OP_N,
+                              CUBLAS_OP_N,
+                              GF,
+                              N,
+                              GF,
+                              &alpha,
+                              d_matrix,
+                              GF,
+                              d_normalized_input,
+                              GF,
+                              &beta,
+                              d_gemm_output,
+                              GF);
+    if (blas_status != CUBLAS_STATUS_SUCCESS) {
+      gpu_error = "cublasDgemm failed for ChannelPass";
+      cleanup();
+      break;
+    }
+
+    cuda_kernels::NormalizeAndTransposeOutput<<<grid, block, sharedBytes>>>(
+        d_gemm_output, d_output, N, GF);
 
     status = cudaEventRecord(kernelEnd);
     if (status != cudaSuccess) {
@@ -2449,7 +2606,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
     }
     status = cudaGetLastError();
     if (status != cudaSuccess) {
-      gpu_error = "ChannelPass kernel launch failed";
+      gpu_error = "ChannelPass output normalization launch failed";
       cleanup();
       break;
     }
@@ -2491,7 +2648,14 @@ void ChannelPass(FlatMatrix& VNtoChN,
   } while (false);
 
   if (!gpu_success) {
-    if (!gpu_error.empty() && !reported_cuda_failure) {
+    if (gpu_skipped_for_size) {
+      if (!reported_cuda_skip) {
+        std::cout << "ChannelPass GPU path skipped: workload (" << work_items
+                  << ") below threshold (" << min_work_for_gpu
+                  << ")." << std::endl;
+        reported_cuda_skip = true;
+      }
+    } else if (!gpu_error.empty() && !reported_cuda_failure) {
       std::cerr << "ChannelPass GPU path failed: " << gpu_error
                 << ". Falling back to CPU implementation." << std::endl;
       reported_cuda_failure = true;

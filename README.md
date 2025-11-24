@@ -57,6 +57,14 @@ use the dedicated build script:
 scripts/build_cuda.sh
 ```
 
+The CUDA build links against cuBLAS for the ChannelPass GEMM path, so make sure the
+CUDA toolkit (and cuBLAS) are available on your system.
+
+ChannelPass only uses the GPU when the workload is large enough to overcome
+transfer overhead. The default threshold is 4096 elements (`N * GF`). You can
+override this by setting `GD_CSS_CHANNELPASS_GPU_MIN_WORK` to force or further
+restrict GPU usage.
+
 By default, the script targets `sm_70`. You can override the GPU architecture and the
 output binary name via environment variables and arguments, for example:
 ```
