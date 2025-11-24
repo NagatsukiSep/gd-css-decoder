@@ -858,8 +858,8 @@ __global__ void DataPassKernel(double* VNtoCNxxx,
   const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
                                 gridDim.z;
 
-  extern __shared__ double shared[];
-  double* channel = shared;
+  extern __shared__ double dataShared[];
+  double* channel = dataShared;
   double* scratch = channel + GF;
 
   const int tid = threadIdx.x;
