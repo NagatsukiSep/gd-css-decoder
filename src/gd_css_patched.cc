@@ -5913,7 +5913,7 @@ int main(int argc, char * argv[]){
   char *name      =(char *)malloc(500);
   int max_num_iteration;
   int max_num_error;
-  int measurement_runs = 0;
+  int measurement_runs = -1;
   printf("argc=%d\n",argc);
   // Conditional branch.
   if(argc<8 || argc>10){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed [timing_debug] [measurement_runs]" << endl; exit(0);}
@@ -5929,27 +5929,30 @@ int main(int argc, char * argv[]){
   }
   if (argc == 10) {
     measurement_runs = atoi(argv[9]);
-    if (measurement_runs < 0) {
-      measurement_runs = 0;
-    }
   }
   if (g_enable_timing_output) {
     std::cout << "Timing debug output enabled." << std::endl;
   }
-  if (measurement_runs > 0) {
+  if (measurement_runs == 0) {
+    std::cout << "Measurement mode disabled." << std::endl;
+  } else if (measurement_runs > 0) {
     std::cout << "Measurement mode: timing " << measurement_runs
               << " decode run(s)." << std::endl;
+  } else {
+    std::cout << "Measurement mode: timing decode runs until stopped." << std::endl;
   }
   srand48(seed);
   const int USS_error_floor_threshold = 100;
   const int USS_stagnation_check_interval = 50;
   check_code_parameters_equal(MatrixFilePrefix_C, MatrixFilePrefix_D, M, N, GF, logGF);
 
-  const bool measurement_mode = measurement_runs > 0;
+  const bool measurement_mode = measurement_runs != 0;
+  const bool measurement_infinite = measurement_runs < 0;
   std::vector<double> measurement_durations;
-  if (measurement_mode) {
+  if (measurement_mode && !measurement_infinite && measurement_runs > 0) {
     measurement_durations.reserve(measurement_runs);
   }
+  double measurement_total_seconds = 0.0;
   size_t measurement_completed_runs = 0;
 
   P = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'P'));
@@ -6244,7 +6247,10 @@ itr,eS,TdS,seed);
     auto decode_end = std::chrono::steady_clock::now();
     if (measurement_mode) {
       double seconds = std::chrono::duration<double>(decode_end - decode_start).count();
-      measurement_durations.push_back(seconds);
+      measurement_total_seconds += seconds;
+      if (!measurement_infinite && measurement_runs > 0) {
+        measurement_durations.push_back(seconds);
+      }
       measurement_completed_runs++;
     }
 
@@ -6298,21 +6304,20 @@ if(transmission%1==0){
 if(DEBUG_transmission){
   break;
 }
-if(measurement_mode && measurement_completed_runs >= static_cast<size_t>(measurement_runs)){
+if(measurement_mode && !measurement_infinite && measurement_completed_runs >= static_cast<size_t>(measurement_runs)){
   std::cout << "Measurement target reached (" << measurement_completed_runs
             << " run(s))." << std::endl;
   break;
 }
 }
 
-if (measurement_mode && !measurement_durations.empty()) {
-  double total_seconds = std::accumulate(measurement_durations.begin(), measurement_durations.end(), 0.0);
-  double average_seconds = total_seconds / measurement_durations.size();
-  double total_qubits = logical_qubits_per_decode * measurement_durations.size();
-  double qbps = total_qubits / total_seconds;
+if (measurement_mode && measurement_completed_runs > 0 && measurement_total_seconds > 0.0) {
+  double average_seconds = measurement_total_seconds / static_cast<double>(measurement_completed_runs);
+  double total_qubits = logical_qubits_per_decode * static_cast<double>(measurement_completed_runs);
+  double qbps = total_qubits / measurement_total_seconds;
   std::cout << std::fixed << std::setprecision(6);
-  std::cout << "Measurement summary: runs=" << measurement_durations.size()
-            << " total_time[s]=" << total_seconds
+  std::cout << "Measurement summary: runs=" << measurement_completed_runs
+            << " total_time[s]=" << measurement_total_seconds
             << " avg_per_run[s]=" << average_seconds
             << " logical_qubits_per_run=" << logical_qubits_per_decode
             << " QBPS=" << qbps << std::endl;
