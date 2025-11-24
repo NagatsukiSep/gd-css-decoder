@@ -381,6 +381,15 @@ struct DeviceConstantSet {
   DeviceArray<int> fft1;
 };
 
+struct SyndromeConstantSet {
+  DeviceArray<int> mat;
+  DeviceArray<int> matValue;
+  DeviceArray<int> rowBase;
+  DeviceArray<int> rowDegree;
+  DeviceArray<int> addGF;
+  DeviceArray<int> mulGF;
+};
+
 struct DeviceGFTables {
   DeviceArray<int> div;
   DeviceArray<int> mul;
@@ -949,6 +958,53 @@ __global__ void ComputeAPPKernel(double* APP,
   }
 }
 
+__global__ void DecisionKernel(const double* APP,
+                               int* decision,
+                               int N,
+                               int GF) {
+  const int node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (node >= N) {
+    return;
+  }
+  const long long base = static_cast<long long>(node) * GF;
+  double max_val = APP[base];
+  int best = 0;
+  for (int g = 1; g < GF; ++g) {
+    const double v = APP[base + g];
+    if (v >= max_val) {
+      max_val = v;
+      best = g;
+    }
+  }
+  decision[node] = best;
+}
+
+__global__ void CalcSyndromeKernel(const int* estmNoise,
+                                   const int* mat,
+                                   const int* matValue,
+                                   const int* rowBase,
+                                   const int* rowDegree,
+                                   const int* addGF,
+                                   const int* mulGF,
+                                   int* synd,
+                                   int M,
+                                   int GF) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= M) {
+    return;
+  }
+  const int degree = rowDegree[row];
+  const int base = rowBase[row];
+  int s = 0;
+  for (int t = 0; t < degree; ++t) {
+    const int n = mat[base + t];
+    const int H = matValue[base + t];
+    const int x = mulGF[H * GF + estmNoise[n]];
+    s = addGF[s * GF + x];
+  }
+  synd[row] = s;
+}
+
 }  // namespace cuda_kernels
 #endif
 
@@ -962,6 +1018,10 @@ static std::unordered_map<DataPassMetadataKey,
                           DataPassConstantSet,
                           DataPassMetadataKeyHash>
     g_datapass_constant_cache;
+static std::unordered_map<CheckPassMetadataKey,
+                          SyndromeConstantSet,
+                          CheckPassMetadataKeyHash>
+    g_syndrome_constant_cache;
 
 template <typename T>
 bool EnsureDeviceArray(DeviceArray<T>& buffer,
@@ -5215,7 +5275,271 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
   DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
   CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
   ComputeAPP(VNtoChN, ChNtoVN, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
 
+  do {
+    if (N <= 0 || M <= 0 || GF <= 0) {
+      gpu_success = true;
+      break;
+    }
+    if (static_cast<size_t>(N) > EstmNoise.size()) {
+      gpu_error = "DecodeIteration GPU path received undersized EstmNoise buffer";
+      break;
+    }
+    if (static_cast<size_t>(M) > Synd.size()) {
+      gpu_error = "DecodeIteration GPU path received undersized syndrome buffer";
+      break;
+    }
+
+    vector<int> previousEstmNoise = EstmNoise;
+
+    CheckPassMetadataKey metadata_key{static_cast<const void*>(&MatValue),
+                                      static_cast<const void*>(&RowDeg),
+                                      static_cast<const void*>(&FFTSQ)};
+    SyndromeConstantSet& constants = g_syndrome_constant_cache[metadata_key];
+
+    const size_t decisionBytes = static_cast<size_t>(N) * sizeof(int);
+    const size_t syndromeBytes = static_cast<size_t>(M) * sizeof(int);
+    const size_t gfElements = static_cast<size_t>(GF) * static_cast<size_t>(GF);
+    const size_t appBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
+
+    size_t totalEdges = 0;
+    for (int deg : RowDeg) {
+      totalEdges += static_cast<size_t>(deg);
+    }
+    if (totalEdges == 0 && M > 0) {
+      gpu_error = "DecodeIteration GPU path computed zero edges";
+      break;
+    }
+
+    vector<int> rowBase(M);
+    vector<int> matFlat(totalEdges);
+    vector<int> matValueFlat(totalEdges);
+    size_t prefix = 0;
+    for (int k = 0; k < M; ++k) {
+      rowBase[k] = static_cast<int>(prefix);
+      const int degree = RowDeg[k];
+      for (int t = 0; t < degree; ++t) {
+        const size_t idx = prefix + t;
+        matFlat[idx] = Mat[k][t];
+        matValueFlat[idx] = MatValue[k][t];
+      }
+      prefix += static_cast<size_t>(degree);
+    }
+
+    vector<int> addFlat(gfElements);
+    vector<int> mulFlat(gfElements);
+    for (int i = 0; i < GF; ++i) {
+      if (ADDGF[i].size() < static_cast<size_t>(GF) ||
+          MULGF[i].size() < static_cast<size_t>(GF)) {
+        gpu_error = "DecodeIteration GF lookup tables are incomplete";
+        break;
+      }
+      for (int j = 0; j < GF; ++j) {
+        const size_t idx = static_cast<size_t>(i) * GF + j;
+        addFlat[idx] = ADDGF[i][j];
+        mulFlat[idx] = MULGF[i][j];
+      }
+    }
+    if (!gpu_error.empty()) {
+      break;
+    }
+
+    cudaError_t status = cudaSuccess;
+
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                                 size_t bytes,
+                                 const char* failure) -> double* {
+      if (bytes == 0) {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        return nullptr;
+      }
+      double* ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData()) {
+        status = cudaMemcpy(ptr, matrix.data(), bytes, cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) {
+          gpu_error = failure;
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
+    };
+
+    double* d_APP = ensureMatrixInput(APP, appBytes, "cudaMemcpy failed for APP device upload");
+    if (!d_APP && appBytes > 0) {
+      break;
+    }
+
+    auto ensureArray = [&](DeviceArray<int>& buffer,
+                           size_t elements,
+                           const char* label) -> bool {
+      buffer.dirty = true;
+      return EnsureDeviceArray(buffer, elements, status, label, gpu_error);
+    };
+
+    if (!ensureArray(constants.mat, matFlat.size(), "DecodeIteration mat") ||
+        !ensureArray(constants.matValue, matValueFlat.size(), "DecodeIteration matValue") ||
+        !ensureArray(constants.rowBase, rowBase.size(), "DecodeIteration rowBase") ||
+        !ensureArray(constants.rowDegree, RowDeg.size(), "DecodeIteration rowDegree") ||
+        !ensureArray(constants.addGF, addFlat.size(), "DecodeIteration ADDGF") ||
+        !ensureArray(constants.mulGF, mulFlat.size(), "DecodeIteration MULGF")) {
+      break;
+    }
+
+    auto copyVector = [&](DeviceArray<int>& buffer,
+                          const vector<int>& host,
+                          const char* failure) -> bool {
+      if (buffer.size == 0) {
+        return true;
+      }
+      status = cudaMemcpy(buffer.ptr,
+                           host.data(),
+                           buffer.size * sizeof(int),
+                           cudaMemcpyHostToDevice);
+      if (status != cudaSuccess) {
+        gpu_error = failure;
+        return false;
+      }
+      buffer.dirty = false;
+      return true;
+    };
+
+    if (!copyVector(constants.mat, matFlat, "cudaMemcpy failed for mat") ||
+        !copyVector(constants.matValue, matValueFlat, "cudaMemcpy failed for matValue") ||
+        !copyVector(constants.rowBase, rowBase, "cudaMemcpy failed for rowBase") ||
+        !copyVector(constants.rowDegree, RowDeg, "cudaMemcpy failed for rowDegree") ||
+        !copyVector(constants.addGF, addFlat, "cudaMemcpy failed for ADDGF") ||
+        !copyVector(constants.mulGF, mulFlat, "cudaMemcpy failed for MULGF")) {
+      break;
+    }
+
+    static DeviceArray<int> decision_buffer;
+    static DeviceArray<int> estm_syndrome_buffer;
+    if (!ensureArray(decision_buffer, N, "DecodeIteration decision buffer") ||
+        !ensureArray(estm_syndrome_buffer, M, "DecodeIteration syndrome buffer")) {
+      break;
+    }
+
+    const int threads = 256;
+    const int decisionBlocks = (N + threads - 1) / threads;
+    DecisionKernel<<<decisionBlocks, threads>>>(d_APP,
+                                                decision_buffer.ptr,
+                                                N,
+                                                GF);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "Decision CUDA kernel launch failed";
+      break;
+    }
+
+    const int syndromeBlocks = (M + threads - 1) / threads;
+    CalcSyndromeKernel<<<syndromeBlocks, threads>>>(decision_buffer.ptr,
+                                                    constants.mat.ptr,
+                                                    constants.matValue.ptr,
+                                                    constants.rowBase.ptr,
+                                                    constants.rowDegree.ptr,
+                                                    constants.addGF.ptr,
+                                                    constants.mulGF.ptr,
+                                                    estm_syndrome_buffer.ptr,
+                                                    M,
+                                                    GF);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "Syndrome CUDA kernel launch failed";
+      break;
+    }
+
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "DecodeIteration CUDA kernels failed";
+      break;
+    }
+
+    EstmNoise.resize(N);
+    status = cudaMemcpy(EstmNoise.data(),
+                        decision_buffer.ptr,
+                        decisionBytes,
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMemcpy failed for decision download";
+      break;
+    }
+
+    Synd.resize(M);
+    status = cudaMemcpy(Synd.data(),
+                        estm_syndrome_buffer.ptr,
+                        syndromeBytes,
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMemcpy failed for syndrome download";
+      break;
+    }
+
+    UpdatedDecision.clear();
+    UpdatedDecision.reserve(N);
+    for (int n = 0; n < N; ++n) {
+      if (n < static_cast<int>(previousEstmNoise.size()) &&
+          previousEstmNoise[n] != EstmNoise[n]) {
+        UpdatedDecision.push_back(n);
+      }
+    }
+
+    // Evaluate syndrome satisfaction on the host using the GPU results.
+    USS.clear();
+    SyndromeIsSatisfied = 1;
+    for (int k = 0; k < M; ++k) {
+      if (Synd[k] != TrueNoiseSynd[k]) {
+        USS.push_back(k);
+        SyndromeIsSatisfied = 0;
+      }
+    }
+
+    if (SyndromeIsSatisfied) {
+      // Loop: iterate over a range/collection.
+      for (int n = 0; n < N; n++) {
+        // Loop: iterate over a range/collection.
+        for (int g = 0; g < GF; g++) { ChNtoVN[n][g] = 0; }
+        int g_hat = EstmNoise[n];
+        ChNtoVN[n][g_hat] = 1;
+      }
+      ChNtoVN.markDeviceDataInvalid();
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success) {
+      std::cout << "DecodeIteration executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (!gpu_success) {
+    if (!gpu_error.empty() && !reported_cuda_failure) {
+      std::cerr << "DecodeIteration GPU path failed: " << gpu_error
+                << ". Falling back to CPU implementation." << std::endl;
+      reported_cuda_failure = true;
+    }
+    Decision(EstmNoise, UpdatedDecision, VNtoChN, N, GF);
+    SyndromeIsSatisfied = IsSyndromeSatisfied(TrueNoiseSynd, Synd, USS, M, EstmNoise, MatValue, RowDeg, ADDGF, MULGF, Mat);
+    // Conditional branch.
+    if (SyndromeIsSatisfied) {
+      // Loop: iterate over a range/collection.
+      for (int n = 0; n < N; n++) {
+        // Loop: iterate over a range/collection.
+        for (int g = 0; g < GF; g++) { ChNtoVN[n][g] = 0; }
+        int g_hat = EstmNoise[n];
+        ChNtoVN[n][g_hat] = 1;
+      }
+      ChNtoVN.markDeviceDataInvalid();
+    }
+  }
+#else
   Decision(EstmNoise, UpdatedDecision, VNtoChN, N, GF);
   SyndromeIsSatisfied = IsSyndromeSatisfied(TrueNoiseSynd, Synd, USS, M, EstmNoise, MatValue, RowDeg, ADDGF, MULGF, Mat);
   // Conditional branch.
@@ -5231,6 +5555,7 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
     ChNtoVN.markDeviceDataInvalid();
 #endif
   }
+#endif
 }
 // Function: load_size
 // Purpose: TODO - describe the function's responsibility succinctly.
