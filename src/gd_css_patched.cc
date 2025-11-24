@@ -563,7 +563,12 @@ __device__ double BlockReduceSum(double* scratch, double value) {
     block_sum = WarpReduceSum(block_sum);
   }
 
-  return __shfl_sync(0xffffffffu, block_sum, 0);
+  if (lane == 0 && warp == 0) {
+    scratch[0] = block_sum;
+  }
+
+  __syncthreads();
+  return scratch[0];
 }
 
 __global__ void ChannelPassKernel(double* VNtoChN,
