@@ -1653,8 +1653,8 @@ int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>
 
 void ComputeAPP(FlatMatrix &APP,
                 FlatMatrix &ChNtoVN,
-                const FlatMatrix &CNtoVNxxx,
-                const FlatMatrix &VNtoChN,
+                FlatMatrix &CNtoVNxxx,
+                FlatMatrix &VNtoChN,
                 const std::vector<int> &Interleaver,
                 const std::vector<int> &ColDeg,
                 int N,
