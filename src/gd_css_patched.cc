@@ -1079,6 +1079,29 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     return true;
   };
 
+  auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                               size_t bytes,
+                               const char* failure,
+                               double*& device_ptr) -> bool {
+    if (!matrix.ensureCudaDeviceStorage(bytes, &error)) {
+      cleanup();
+      return false;
+    }
+    device_ptr = matrix.cuda_device_storage();
+    if (!matrix.hasValidDeviceData()) {
+      if (!timedMemcpy(device_ptr,
+                       matrix.data(),
+                       bytes,
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms)) {
+        return false;
+      }
+      matrix.markDeviceDataValid();
+    }
+    return true;
+  };
+
   int device = 0;
   status = cudaGetDevice(&device);
   if (status != cudaSuccess) {
@@ -1185,20 +1208,16 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
     gf_tables.gf = GF;
   }
 
-  if (!timedMemcpy(d_CNtoVN,
-                   CNtoVNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for CNtoVN host->device",
-                   transfer_to_device_ms)) {
+  if (!ensureMatrixInput(CNtoVNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for CNtoVN host->device",
+                         d_CNtoVN)) {
     return false;
   }
-  if (!timedMemcpy(d_VNtoCN,
-                   VNtoCNxxx.data(),
-                   matrixBytes,
-                   cudaMemcpyHostToDevice,
-                   "cudaMemcpy failed for VNtoCN host->device",
-                   transfer_to_device_ms)) {
+  if (!ensureMatrixInput(VNtoCNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for VNtoCN host->device",
+                         d_VNtoCN)) {
     return false;
   }
   if (!copyConstant(constant_set.matValue,
@@ -1320,22 +1339,6 @@ static bool RunCheckPassCUDA(const vector<int>& rowBase,
 
   CNtoVNxxx.markDeviceDataValid();
   VNtoCNxxx.markDeviceDataValid();
-  if (!timedMemcpy(CNtoVNxxx.data(),
-                   d_CNtoVN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for CNtoVN device->host",
-                   transfer_to_host_ms)) {
-    return false;
-  }
-  if (!timedMemcpy(VNtoCNxxx.data(),
-                   d_VNtoCN,
-                   matrixBytes,
-                   cudaMemcpyDeviceToHost,
-                   "cudaMemcpy failed for VNtoCN device->host",
-                   transfer_to_host_ms)) {
-    return false;
-  }
 
   if (g_enable_timing_output) {
     std::streamsize previous_precision = std::cout.precision();
@@ -1767,6 +1770,31 @@ void ComputeAPP(FlatMatrix &APP,
         return false;
       }
       return true;
+    };
+
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                                 size_t bytes,
+                                 const char* failure) -> double* {
+      if (bytes == 0) {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        cleanup();
+        return nullptr;
+      }
+      double* ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData()) {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms)) {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
     };
 
     auto ensureMatrixInput = [&](const FlatMatrix& matrix,
@@ -2565,21 +2593,13 @@ void DataPass(FlatMatrix& VNtoCNxxx,
     }
 
     double* d_VNtoCN = VNtoCNxxx.cuda_device_storage();
-    double* d_CNtoVN = CNtoVNxxx.cuda_device_storage();
-    double* d_VNtoCh = VNtoChN.cuda_device_storage();
-
-    if (!timedMemcpy(d_CNtoVN,
-                     CNtoVNxxx.data(),
-                     matrixBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for DataPass CNtoVN",
-                     transfer_to_device_ms) ||
-        !timedMemcpy(d_VNtoCh,
-                     VNtoChN.data(),
-                     channelBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for DataPass VNtoChN",
-                     transfer_to_device_ms)) {
+    double* d_CNtoVN = ensureMatrixInput(CNtoVNxxx,
+                                         matrixBytes,
+                                         "cudaMemcpy failed for DataPass CNtoVN");
+    double* d_VNtoCh = ensureMatrixInput(VNtoChN,
+                                         channelBytes,
+                                         "cudaMemcpy failed for DataPass VNtoChN");
+    if ((!d_CNtoVN && matrixBytes > 0) || (!d_VNtoCh && channelBytes > 0)) {
       break;
     }
 
@@ -2674,14 +2694,6 @@ void DataPass(FlatMatrix& VNtoCNxxx,
     }
 
     VNtoCNxxx.markDeviceDataValid();
-    if (!timedMemcpy(VNtoCNxxx.data(),
-                     d_VNtoCN,
-                     matrixBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for DataPass output",
-                     transfer_to_host_ms)) {
-      break;
-    }
 
     cleanup();
 
