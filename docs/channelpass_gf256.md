@@ -15,5 +15,9 @@ This note summarizes which of the earlier optimization ideas typically help when
 - **Grid restructuring brings little benefit.** Because the chosen grid covers all `N` rows, the kernel’s outer loop rarely iterates more than once. Changing grid dimensions alone won’t meaningfully reduce per-row work. 【F:src/gd_css_patched.cc†L557-L630】【F:src/gd_css_patched.cc†L2389-L2395】
 - **Caching the matrix is not feasible.** At 512 KB, the channel matrix exceeds constant-memory capacity and would exhaust per-block shared memory, so caching it on-chip is impractical without changing data precision or tiling strategy. 【F:src/gd_css_patched.cc†L2295-L2400】
 
+## Kernel bottleneck at GF=256
+- The dominant per-row cost is the dense `GF×GF` matrix multiply inside the kernel: each thread computes one or more output entries and walks the full `matrixT` column while reading the normalized `input`, resulting in ~65K multiply-adds per row for GF=256. This arithmetic and the global-memory traffic for `matrixT` dwarf the normalization reductions. 【F:src/gd_css_patched.cc†L586-L610】
+- Because `matrixT` lives in global memory and is accessed in a column-wise pattern (`matrixT[e * GF + d]`), the loads have limited cache reuse across threads. Without tiling `matrixT` into shared memory (which would exceed the available ~48–96 KB per block for doubles at GF=256), the matrix read bandwidth remains the main bottleneck. 【F:src/gd_css_patched.cc†L586-L611】【F:src/gd_css_patched.cc†L2396-L2399】
+
 ## Practical takeaway
 For `GF=256`, the most impactful kernel-only change (no extra transfers or host work) is to introduce warp-level reductions for the two normalization steps. The existing block sizing and grid setup are already near-optimal, and matrix caching is constrained by size.
