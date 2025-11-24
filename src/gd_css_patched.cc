@@ -6007,7 +6007,8 @@ int main(int argc, char * argv[]){
   vector<int> fail_transmission;
   vector<int> degenerate_success_transmission;
   transmission=0;
-  const double logical_qubits_per_decode = static_cast<double>(N) * logGF;
+  const double code_rate = (N > 0) ? (1.0 - static_cast<double>(M) / static_cast<double>(N)) : 0.0;
+  const double logical_qubits_per_decode = logGF * static_cast<double>(P) * static_cast<double>(L) * code_rate;
 
   // Conditional branch.
   if(DEBUG_transmission){
