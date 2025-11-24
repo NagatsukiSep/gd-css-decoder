@@ -89,12 +89,36 @@ Under the hood, the script executes:
 
 ## 📊 Output
 
-During decoding, the program prints progress information such as iteration count,  
-syndrome satisfaction, and error statistics.  
+During decoding, the program prints progress information such as iteration count,
+syndrome satisfaction, and error statistics.
 Results are also written to log files in the working directory:
 
-- `LOG_*` → decoding statistics (FER/SER, iterations, etc.)  
+- `LOG_*` → decoding statistics (FER/SER, iterations, etc.)
 - `EF_LOG_*` → detailed debugging information (error-floor analysis)
+
+### Measurement mode (latency & throughput)
+
+You can measure per-decode latency and logical qubit throughput with the optional
+`measurement_runs` argument:
+
+```
+./gd_css max_iter filename_C filename_D logfile f_m DEBUG_transmission seed [timing_debug] [measurement_runs]
+```
+
+- `timing_debug` (optional): set to `1` to enable verbose timing prints.
+- `measurement_runs` (optional):
+  - `> 0` — measure exactly this many decode runs, then stop.
+  - `0` — disable measurement (legacy behavior).
+  - `< 0` or omitted — measure indefinitely until you manually stop the process.
+
+The measurement summary reports total/average runtime per decode and the
+logical-qubits-per-second throughput computed as:
+
+```
+logical_qubits_per_decode = logGF * P * L * (M / N)
+```
+
+where `P`, `L`, `M`, `N`, and `logGF` are derived from the input matrices.
 
 ---
 
