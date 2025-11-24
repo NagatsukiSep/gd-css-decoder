@@ -1797,32 +1797,6 @@ void ComputeAPP(FlatMatrix &APP,
       return ptr;
     };
 
-    auto ensureMatrixInput = [&](const FlatMatrix& matrix,
-                                 size_t bytes,
-                                 const char* failure) -> double* {
-      FlatMatrix& mutableMatrix = const_cast<FlatMatrix&>(matrix);
-      if (bytes == 0) {
-        return nullptr;
-      }
-      if (!mutableMatrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
-        cleanup();
-        return nullptr;
-      }
-      double* ptr = mutableMatrix.cuda_device_storage();
-      if (!matrix.hasValidDeviceData()) {
-        if (!timedMemcpy(ptr,
-                         matrix.data(),
-                         bytes,
-                         cudaMemcpyHostToDevice,
-                         failure,
-                         transfer_to_device_ms)) {
-          return nullptr;
-        }
-        mutableMatrix.markDeviceDataValid();
-      }
-      return ptr;
-    };
-
     auto prepareMatrixOutput = [&](FlatMatrix& matrix,
                                    size_t bytes,
                                    const char* label) -> double* {
@@ -2529,6 +2503,31 @@ void DataPass(FlatMatrix& VNtoCNxxx,
         return false;
       }
       return true;
+    };
+
+    auto ensureMatrixInput = [&](FlatMatrix& matrix,
+                                 size_t bytes,
+                                 const char* failure) -> double* {
+      if (bytes == 0) {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error)) {
+        cleanup();
+        return nullptr;
+      }
+      double* ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData()) {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms)) {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
     };
 
     if (!VNtoCNxxx.ensureCudaDeviceStorage(matrixBytes, &gpu_error) ||
