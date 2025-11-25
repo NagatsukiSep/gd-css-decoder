@@ -28,6 +28,8 @@
 #include <chrono>
 #include <numeric>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -52,6 +54,69 @@
 #define GD_CSS_ENABLE_CUDA 0
 #endif
 using namespace std;
+
+class SingleTaskThread {
+ public:
+  SingleTaskThread() { worker_ = std::thread([this]() { threadLoop(); }); }
+
+  ~SingleTaskThread() { shutdown(); }
+
+  void run(std::function<void()> task) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_ready_.wait(lock, [this]() { return !has_task_ || stop_; });
+    if (stop_) {
+      return;
+    }
+    task_ = std::move(task);
+    task_done_ = false;
+    has_task_ = true;
+    cv_ready_.notify_all();
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_done_.wait(lock, [this]() { return task_done_ || stop_; });
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+      cv_ready_.notify_all();
+      cv_done_.notify_all();
+    }
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  void threadLoop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      cv_ready_.wait(lock, [this]() { return has_task_ || stop_; });
+      if (stop_) {
+        break;
+      }
+      std::function<void()> task = std::move(task_);
+      has_task_ = false;
+      lock.unlock();
+      task();
+      lock.lock();
+      task_done_ = true;
+      cv_done_.notify_all();
+    }
+  }
+
+  std::thread worker_;
+  std::mutex mutex_;
+  std::condition_variable cv_ready_;
+  std::condition_variable cv_done_;
+  std::function<void()> task_;
+  bool stop_ = false;
+  bool has_task_ = false;
+  bool task_done_ = false;
+};
 
 class FlatMatrix {
  public:
@@ -6156,6 +6221,8 @@ int main(int argc, char * argv[]){
     vector<int> Candidate_Covering_Cycle_Rows_C;
     vector<int> Candidate_Covering_Cycle_Rows_D;
     bool stagnated = false;
+    SingleTaskThread workerC;
+    SingleTaskThread workerD;
     EF_LOG.clear();
     do{
       // Conditional branch.
@@ -6187,10 +6254,10 @@ int main(int argc, char * argv[]){
       EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
     };
 
-    std::thread threadC(decodeC);
-    std::thread threadD(decodeD);
-    threadC.join();
-    threadD.join();
+    workerC.run(decodeC);
+    workerD.run(decodeD);
+    workerC.wait();
+    workerD.wait();
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
