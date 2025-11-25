@@ -99,11 +99,12 @@ class SingleTaskThread {
         break;
       }
       std::function<void()> task = std::move(task_);
-      has_task_ = false;
       lock.unlock();
       task();
       lock.lock();
       task_done_ = true;
+      has_task_ = false;
+      cv_ready_.notify_all();
       cv_done_.notify_all();
     }
   }
