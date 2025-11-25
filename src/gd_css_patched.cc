@@ -67,6 +67,7 @@ class SingleTaskThread {
     if (stop_) {
       return;
     }
+    current_task_id_ = next_task_id_++;
     task_ = std::move(task);
     task_done_ = false;
     has_task_ = true;
@@ -75,7 +76,11 @@ class SingleTaskThread {
 
   void wait() {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_done_.wait(lock, [this]() { return task_done_ || stop_; });
+    const uint64_t waiting_for = current_task_id_;
+    cv_done_.wait(lock, [this, waiting_for]() {
+      return ((task_done_ && completed_task_id_ >= waiting_for) ||
+              (stop_ && !has_task_));
+    });
   }
 
   void shutdown() {
@@ -95,15 +100,23 @@ class SingleTaskThread {
     std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
       cv_ready_.wait(lock, [this]() { return has_task_ || stop_; });
-      if (stop_) {
+      if (stop_ && !has_task_) {
         break;
       }
+      if (!has_task_) {
+        continue;
+      }
+
       std::function<void()> task = std::move(task_);
+      const uint64_t executing_task_id = current_task_id_;
       lock.unlock();
       task();
       lock.lock();
+
       task_done_ = true;
+      completed_task_id_ = executing_task_id;
       has_task_ = false;
+      task_ = {};
       cv_ready_.notify_all();
       cv_done_.notify_all();
     }
@@ -117,6 +130,9 @@ class SingleTaskThread {
   bool stop_ = false;
   bool has_task_ = false;
   bool task_done_ = false;
+  uint64_t current_task_id_ = 0;
+  uint64_t completed_task_id_ = 0;
+  uint64_t next_task_id_ = 1;
 };
 
 class FlatMatrix {
