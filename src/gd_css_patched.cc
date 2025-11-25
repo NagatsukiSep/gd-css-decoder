@@ -2505,6 +2505,8 @@ void ChannelPass(FlatMatrix& VNtoChN,
       normalize(VNtoChN[n], GF);
     }
 
+    // Keep the host copy authoritative; if a later GPU stage needs it, it must
+    // re-upload rather than relying on a potentially stale device buffer.
     VNtoChN.markDeviceDataInvalid();
 
     if (g_enable_timing_output) {
