@@ -27,7 +27,6 @@
 #include <exception>
 #include <chrono>
 #include <numeric>
-#include <future>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -6189,14 +6188,16 @@ int main(int argc, char * argv[]){
     };
 
 #if GD_CSS_ENABLE_CUDA
-    auto future_c = std::async(std::launch::async, decode_c);
-    auto future_d = std::async(std::launch::async, decode_d);
-    future_c.get();
-    future_d.get();
-#else
+    // NOTE: Running these two decoders concurrently on CUDA looks tempting, but
+    // FlatMatrix uses a single device-mapping flag per instance with no
+    // synchronization. Both passes touch mapped host buffers (e.g. VNtoChN_* and
+    // ChNtoVN_*), perform host-device state flips, and rely on the default
+    // stream. Launching them on separate futures races those state transitions
+    // and results in corrupted device pointers, so we keep the CUDA path
+    // sequential for correctness.
+#endif
     decode_c();
     decode_d();
-#endif
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
