@@ -27,6 +27,7 @@
 #include <exception>
 #include <chrono>
 #include <numeric>
+#include <thread>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -6167,20 +6168,35 @@ int main(int argc, char * argv[]){
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
     }
 
-    DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
-                    VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
-    N, M, GF, logGF, MatValue_C, RowDeg_C,
-    TrueNoiseSynd_C, EstmNoiseSynd_C,
-    USSHistory_C[itr%HistoryLength],
-    Updated_EstmNoise_History_C[itr%HistoryLength],
-    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
-    DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
-                    VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
-    N, M, GF, logGF, MatValue_D, RowDeg_D,
-    TrueNoiseSynd_D, EstmNoiseSynd_D,
-    USSHistory_D[itr%HistoryLength],
-    Updated_EstmNoise_History_D[itr%HistoryLength],
-    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    auto decode_c = [&]() {
+      DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
+                      VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
+                      N, M, GF, logGF, MatValue_C, RowDeg_C,
+                      TrueNoiseSynd_C, EstmNoiseSynd_C,
+                      USSHistory_C[itr%HistoryLength],
+                      Updated_EstmNoise_History_C[itr%HistoryLength],
+                      EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
+    };
+
+    auto decode_d = [&]() {
+      DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
+                      VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
+                      N, M, GF, logGF, MatValue_D, RowDeg_D,
+                      TrueNoiseSynd_D, EstmNoiseSynd_D,
+                      USSHistory_D[itr%HistoryLength],
+                      Updated_EstmNoise_History_D[itr%HistoryLength],
+                      EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    };
+
+#if GD_CSS_ENABLE_CUDA
+    std::thread thread_c(decode_c);
+    std::thread thread_d(decode_d);
+    thread_c.join();
+    thread_d.join();
+#else
+    decode_c();
+    decode_d();
+#endif
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
