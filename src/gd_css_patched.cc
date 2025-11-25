@@ -27,7 +27,7 @@
 #include <exception>
 #include <chrono>
 #include <numeric>
-#include <thread>
+#include <future>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -6189,10 +6189,10 @@ int main(int argc, char * argv[]){
     };
 
 #if GD_CSS_ENABLE_CUDA
-    std::thread thread_c(decode_c);
-    std::thread thread_d(decode_d);
-    thread_c.join();
-    thread_d.join();
+    auto future_c = std::async(std::launch::async, decode_c);
+    auto future_d = std::async(std::launch::async, decode_d);
+    future_c.get();
+    future_d.get();
 #else
     decode_c();
     decode_d();
