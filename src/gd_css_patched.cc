@@ -537,7 +537,8 @@ using NodeList = vector<int>;
 #if GD_CSS_COMPILED_WITH_NVCC
 namespace cuda_kernels {
 
-__device__ double BlockReduceSum(double* scratch, double value) {
+template <typename T>
+__device__ T BlockReduceSum(T* scratch, T value) {
   const int tid = threadIdx.x;
   scratch[tid] = value;
   __syncthreads();
@@ -550,9 +551,9 @@ __device__ double BlockReduceSum(double* scratch, double value) {
   return scratch[0];
 }
 
-__global__ void ChannelPassKernel(double* VNtoChN,
-                                  const double* ChNtoVN,
-                                  const double* matrixT,
+__global__ void ChannelPassKernel(float* VNtoChN,
+                                  const float* ChNtoVN,
+                                  const float* matrixT,
                                   int N,
                                   int GF) {
   const long long blockIndex = blockIdx.x +
@@ -562,10 +563,10 @@ __global__ void ChannelPassKernel(double* VNtoChN,
   const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
                                 gridDim.z;
 
-  extern __shared__ double shared[];
-  double* input = shared;
-  double* output = input + GF;
-  double* scratch = output + GF;
+  extern __shared__ float shared[];
+  float* input = shared;
+  float* output = input + GF;
+  float* scratch = output + GF;
 
   const int tid = threadIdx.x;
 
@@ -576,19 +577,19 @@ __global__ void ChannelPassKernel(double* VNtoChN,
     }
     __syncthreads();
 
-    double partial = 0.0;
+    float partial = 0.0f;
     for (int g = tid; g < GF; g += blockDim.x) {
       partial += input[g];
     }
-    const double sum = BlockReduceSum(scratch, partial);
+    const float sum = BlockReduceSum(scratch, partial);
 
-    if (sum == 0.0) {
-      const double uniform = 1.0 / static_cast<double>(GF);
+    if (sum == 0.0f) {
+      const float uniform = 1.0f / static_cast<float>(GF);
       for (int g = tid; g < GF; g += blockDim.x) {
         input[g] = uniform;
       }
     } else {
-      const double inv = 1.0 / sum;
+      const float inv = 1.0f / sum;
       for (int g = tid; g < GF; g += blockDim.x) {
         input[g] *= inv;
       }
@@ -596,7 +597,7 @@ __global__ void ChannelPassKernel(double* VNtoChN,
     __syncthreads();
 
     for (int d = tid; d < GF; d += blockDim.x) {
-      double accum = 0.0;
+      float accum = 0.0f;
       for (int e = 0; e < GF; ++e) {
         accum += matrixT[e * GF + d] * input[e];
       }
@@ -604,19 +605,19 @@ __global__ void ChannelPassKernel(double* VNtoChN,
     }
     __syncthreads();
 
-    partial = 0.0;
+    partial = 0.0f;
     for (int g = tid; g < GF; g += blockDim.x) {
       partial += output[g];
     }
-    const double out_sum = BlockReduceSum(scratch, partial);
+    const float out_sum = BlockReduceSum(scratch, partial);
 
-    if (out_sum == 0.0) {
-      const double uniform = 1.0 / static_cast<double>(GF);
+    if (out_sum == 0.0f) {
+      const float uniform = 1.0f / static_cast<float>(GF);
       for (int g = tid; g < GF; g += blockDim.x) {
         output[g] = uniform;
       }
     } else {
-      const double inv = 1.0 / out_sum;
+      const float inv = 1.0f / out_sum;
       for (int g = tid; g < GF; g += blockDim.x) {
         output[g] *= inv;
       }
@@ -627,6 +628,24 @@ __global__ void ChannelPassKernel(double* VNtoChN,
       VNtoChN[row * GF + g] = output[g];
     }
     __syncthreads();
+  }
+}
+
+__global__ void CastDoubleToFloat(const double* src,
+                                  float* dst,
+                                  size_t count) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    dst[idx] = static_cast<float>(src[idx]);
+  }
+}
+
+__global__ void CastFloatToDouble(const float* src,
+                                  double* dst,
+                                  size_t count) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    dst[idx] = static_cast<double>(src[idx]);
   }
 }
 
@@ -857,8 +876,8 @@ __global__ void DataPassKernel(double* VNtoCNxxx,
   const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
                                 gridDim.z;
 
-  extern __shared__ double shared[];
-  double* channel = shared;
+  extern __shared__ double dataShared[];
+  double* channel = dataShared;
   double* scratch = channel + GF;
 
   const int tid = threadIdx.x;
@@ -1644,20 +1663,21 @@ double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BING
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 namespace {
-void normalize_buffer(double* input, int n) {
-  double sum = 0.0;
+template <typename T>
+void normalize_buffer(T* input, int n) {
+  T sum = 0.0;
   for (int i = 0; i < n; ++i) {
     sum += input[i];
   }
   if (sum == 0.0) {
     cout << "divided by zero" << endl;
-    const double uniform = 1.0 / static_cast<double>(n);
+    const T uniform = static_cast<T>(1.0) / static_cast<T>(n);
     for (int i = 0; i < n; ++i) {
       input[i] = uniform;
     }
     return;
   }
-  const double inv = 1.0 / sum;
+  const T inv = static_cast<T>(1.0) / sum;
   for (int i = 0; i < n; ++i) {
     input[i] *= inv;
   }
@@ -1665,6 +1685,10 @@ void normalize_buffer(double* input, int n) {
 }  // namespace
 
 void normalize(vector<double>& input, int n){
+  normalize_buffer(input.data(), n);
+}
+
+void normalize(vector<float>& input, int n){
   normalize_buffer(input.data(), n);
 }
 
@@ -2243,19 +2267,20 @@ void ChannelPass(FlatMatrix& VNtoChN,
   ScopedTimer timer("ChannelPass");
 
   auto cpu_impl = [&]() {
+    Eigen::MatrixXf f_VNtoChN_eigen_f = f_VNtoChN_eigen.cast<float>();
     for (int n = 0; n < N; ++n) {
-      vector<double> input(GF);
+      vector<float> input(GF);
       for (int g = 0; g < GF; ++g) {
-        input[g] = ChNtoVN[n][g];
+        input[g] = static_cast<float>(ChNtoVN[n][g]);
       }
       normalize(input, GF);
-      Eigen::VectorXd vec(GF), res(GF);
+      Eigen::VectorXf vec(GF), res(GF);
       for (int e = 0; e < GF; ++e) {
         vec(e) = input[e];
       }
-      res = f_VNtoChN_eigen.transpose() * vec;
+      res = f_VNtoChN_eigen_f.transpose() * vec;
       for (int e = 0; e < GF; ++e) {
-        VNtoChN[n][e] = res(e);
+        VNtoChN[n][e] = static_cast<double>(res(e));
       }
       normalize(VNtoChN[n], GF);
     }
@@ -2292,22 +2317,31 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
 
-    vector<double> matrixFlat(static_cast<size_t>(GF) * GF);
+    vector<float> matrixFlat(static_cast<size_t>(GF) * GF);
     for (int e = 0; e < GF; ++e) {
       for (int d = 0; d < GF; ++d) {
-        matrixFlat[static_cast<size_t>(e) * GF + d] = f_VNtoChN_eigen(e, d);
+        matrixFlat[static_cast<size_t>(e) * GF + d] =
+            static_cast<float>(f_VNtoChN_eigen(e, d));
       }
     }
 
-    double* d_input = nullptr;
-    double* d_output = nullptr;
-    double* d_matrix = nullptr;
+    const size_t elementCount = static_cast<size_t>(N) * GF;
+    const size_t vectorBytesFloat = elementCount * sizeof(float);
+    const size_t vectorBytesDouble = elementCount * sizeof(double);
+
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    float* d_matrix = nullptr;
     cudaEvent_t kernelStart = nullptr;
     cudaEvent_t kernelEnd = nullptr;
     double transfer_to_device_ms = 0.0;
     double transfer_to_host_ms = 0.0;
     double kernel_ms = 0.0;
     auto cleanup = [&]() {
+      if (d_input) cudaFree(d_input);
+      d_input = nullptr;
+      if (d_output) cudaFree(d_output);
+      d_output = nullptr;
       if (d_matrix) cudaFree(d_matrix);
       d_matrix = nullptr;
       if (kernelStart) {
@@ -2320,8 +2354,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
     };
 
-    const size_t vectorBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
-    const size_t matrixBytes = matrixFlat.size() * sizeof(double);
+    const size_t matrixBytes = matrixFlat.size() * sizeof(float);
     cudaError_t status = cudaSuccess;
 
     auto timedMemcpy = [&](void* dst,
@@ -2343,17 +2376,16 @@ void ChannelPass(FlatMatrix& VNtoChN,
       return true;
     };
 
-    if (!ChNtoVN.ensureCudaDeviceStorage(vectorBytes, &gpu_error) ||
-        !VNtoChN.ensureCudaDeviceStorage(vectorBytes, &gpu_error)) {
+    if (!ChNtoVN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error) ||
+        !VNtoChN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error)) {
       cleanup();
       break;
     }
-    d_input = ChNtoVN.cuda_device_storage();
-    d_output = VNtoChN.cuda_device_storage();
-    if (vectorBytes > 0 && !ChNtoVN.hasValidDeviceData()) {
-      if (!timedMemcpy(d_input,
+
+    if (!ChNtoVN.hasValidDeviceData()) {
+      if (!timedMemcpy(ChNtoVN.cuda_device_storage(),
                        ChNtoVN.data(),
-                       vectorBytes,
+                       vectorBytesDouble,
                        cudaMemcpyHostToDevice,
                        "cudaMemcpy failed for ChannelPass input",
                        transfer_to_device_ms)) {
@@ -2361,11 +2393,40 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
       ChNtoVN.markDeviceDataValid();
     }
-    VNtoChN.markDeviceDataInvalid();
 
+    status = cudaMalloc(&d_input, vectorBytesFloat);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass input";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_output, vectorBytesFloat);
+    if (status != cudaSuccess) {
+      gpu_error = "cudaMalloc failed for ChannelPass output";
+      cleanup();
+      break;
+    }
     status = cudaMalloc(&d_matrix, matrixBytes);
     if (status != cudaSuccess) {
       gpu_error = "cudaMalloc failed for ChannelPass matrix";
+      cleanup();
+      break;
+    }
+
+    const int cast_threads = 256;
+    const int cast_blocks =
+        static_cast<int>((elementCount + cast_threads - 1) / cast_threads);
+    cuda_kernels::CastDoubleToFloat<<<cast_blocks, cast_threads>>>(
+        ChNtoVN.cuda_device_storage(), d_input, elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass input cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass input cast kernel execution failed";
       cleanup();
       break;
     }
@@ -2394,7 +2455,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
     grid_y = std::min(grid_y, 65535);
     dim3 grid(grid_x, grid_y);
     dim3 block(threads);
-    const size_t sharedBytes = sizeof(double) *
+    const size_t sharedBytes = sizeof(float) *
                                (2 * static_cast<size_t>(GF) + block.x);
 
     int device = 0;
@@ -2463,6 +2524,21 @@ void ChannelPass(FlatMatrix& VNtoChN,
     status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
     if (status == cudaSuccess) {
       kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    cuda_kernels::CastFloatToDouble<<<cast_blocks, cast_threads>>>(
+        d_output, VNtoChN.cuda_device_storage(), elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass output cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass output cast kernel execution failed";
+      cleanup();
+      break;
     }
 
     VNtoChN.markDeviceDataValid();
