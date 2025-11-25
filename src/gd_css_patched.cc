@@ -71,11 +71,15 @@ class SingleTaskThread {
     task_ = std::move(task);
     task_done_ = false;
     has_task_ = true;
+    task_started_ = true;
     cv_ready_.notify_all();
   }
 
   void wait() {
     std::unique_lock<std::mutex> lock(mutex_);
+    if (!has_task_ && !task_started_) {
+      return;
+    }
     const uint64_t waiting_for = current_task_id_;
     cv_done_.wait(lock, [this, waiting_for]() {
       return ((task_done_ && completed_task_id_ >= waiting_for) ||
@@ -130,6 +134,7 @@ class SingleTaskThread {
   bool stop_ = false;
   bool has_task_ = false;
   bool task_done_ = false;
+  bool task_started_ = false;
   uint64_t current_task_id_ = 0;
   uint64_t completed_task_id_ = 0;
   uint64_t next_task_id_ = 1;
@@ -6240,8 +6245,14 @@ int main(int argc, char * argv[]){
     bool stagnated = false;
     SingleTaskThread workerC;
     SingleTaskThread workerD;
+    bool first_iteration = true;
     EF_LOG.clear();
     do{
+      if (!first_iteration) {
+        workerC.wait();
+        workerD.wait();
+      }
+      first_iteration = false;
       // Conditional branch.
       if(itr==0){
         ChannelPass_zero(VNtoChN_DC,N,GF,logGF,f_m,  BINGF);
