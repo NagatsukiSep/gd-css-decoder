@@ -27,6 +27,7 @@
 #include <exception>
 #include <chrono>
 #include <numeric>
+#include <thread>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -6155,6 +6156,7 @@ int main(int argc, char * argv[]){
     vector<int> Candidate_Covering_Cycle_Rows_C;
     vector<int> Candidate_Covering_Cycle_Rows_D;
     bool stagnated = false;
+    const bool parallel_decode = std::thread::hardware_concurrency() > 1;
     EF_LOG.clear();
     do{
       // Conditional branch.
@@ -6167,20 +6169,33 @@ int main(int argc, char * argv[]){
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
     }
 
-    DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
-                    VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
-    N, M, GF, logGF, MatValue_C, RowDeg_C,
-    TrueNoiseSynd_C, EstmNoiseSynd_C,
-    USSHistory_C[itr%HistoryLength],
-    Updated_EstmNoise_History_C[itr%HistoryLength],
-    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
-    DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
-                    VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
-    N, M, GF, logGF, MatValue_D, RowDeg_D,
-    TrueNoiseSynd_D, EstmNoiseSynd_D,
-    USSHistory_D[itr%HistoryLength],
-    Updated_EstmNoise_History_D[itr%HistoryLength],
-    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    auto run_decode_C = [&]{
+      DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
+                      VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
+          N, M, GF, logGF, MatValue_C, RowDeg_C,
+          TrueNoiseSynd_C, EstmNoiseSynd_C,
+          USSHistory_C[itr%HistoryLength],
+          Updated_EstmNoise_History_C[itr%HistoryLength],
+          EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
+    };
+    auto run_decode_D = [&]{
+      DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
+                      VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
+          N, M, GF, logGF, MatValue_D, RowDeg_D,
+          TrueNoiseSynd_D, EstmNoiseSynd_D,
+          USSHistory_D[itr%HistoryLength],
+          Updated_EstmNoise_History_D[itr%HistoryLength],
+          EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    };
+    if (parallel_decode) {
+      std::thread decode_C(run_decode_C);
+      std::thread decode_D(run_decode_D);
+      decode_C.join();
+      decode_D.join();
+    } else {
+      run_decode_C();
+      run_decode_D();
+    }
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
