@@ -2416,7 +2416,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
     const int cast_threads = 256;
     const int cast_blocks =
         static_cast<int>((elementCount + cast_threads - 1) / cast_threads);
-    CastDoubleToFloat<<<cast_blocks, cast_threads>>>(
+    cuda_kernels::CastDoubleToFloat<<<cast_blocks, cast_threads>>>(
         ChNtoVN.cuda_device_storage(), d_input, elementCount);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -2526,7 +2526,7 @@ void ChannelPass(FlatMatrix& VNtoChN,
       kernel_ms = static_cast<double>(kernel_ms_f);
     }
 
-    CastFloatToDouble<<<cast_blocks, cast_threads>>>(
+    cuda_kernels::CastFloatToDouble<<<cast_blocks, cast_threads>>>(
         d_output, VNtoChN.cuda_device_storage(), elementCount);
     status = cudaGetLastError();
     if (status != cudaSuccess) {
