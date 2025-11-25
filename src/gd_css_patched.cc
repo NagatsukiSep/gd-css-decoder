@@ -27,6 +27,10 @@
 #include <exception>
 #include <chrono>
 #include <numeric>
+#include <thread>
+#include <future>
+#include <condition_variable>
+#include <mutex>
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -51,6 +55,112 @@
 #define GD_CSS_ENABLE_CUDA 0
 #endif
 using namespace std;
+
+class SingleTaskThread {
+ public:
+  SingleTaskThread() { worker_ = std::thread([this]() { threadLoop(); }); }
+
+  ~SingleTaskThread() { shutdown(); }
+
+  void run(std::function<void()> task) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_ready_.wait(lock, [this]() { return !has_task_ || stop_; });
+    if (stop_) {
+      return;
+    }
+    active_promise_ = std::make_shared<std::promise<void>>();
+    active_future_ = active_promise_->get_future().share();
+    current_task_id_ = next_task_id_++;
+    task_ = std::move(task);
+    task_done_ = false;
+    has_task_ = true;
+    task_started_ = true;
+    cv_ready_.notify_all();
+  }
+
+  void wait() {
+    std::shared_future<void> future;
+    uint64_t waiting_for = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!has_task_ && !task_started_) {
+      return;
+    }
+    waiting_for = current_task_id_;
+    if (task_done_ && completed_task_id_ >= waiting_for) {
+      return;
+    }
+    future = active_future_;
+    lock.unlock();
+    if (future.valid()) {
+      future.wait();
+    }
+    lock.lock();
+    cv_done_.wait(lock, [this, waiting_for]() {
+      return ((task_done_ && completed_task_id_ >= waiting_for) ||
+              (stop_ && !has_task_));
+    });
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+      cv_ready_.notify_all();
+      cv_done_.notify_all();
+    }
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  void threadLoop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      cv_ready_.wait(lock, [this]() { return has_task_ || stop_; });
+      if (stop_ && !has_task_) {
+        break;
+      }
+      if (!has_task_) {
+        continue;
+      }
+
+      std::function<void()> task = std::move(task_);
+      std::shared_ptr<std::promise<void>> promise = active_promise_;
+      const uint64_t executing_task_id = current_task_id_;
+      lock.unlock();
+      task();
+      if (promise) {
+        promise->set_value();
+      }
+      lock.lock();
+
+      task_done_ = true;
+      completed_task_id_ = executing_task_id;
+      has_task_ = false;
+      task_ = {};
+      active_promise_.reset();
+      active_future_ = std::shared_future<void>();
+      cv_ready_.notify_all();
+      cv_done_.notify_all();
+    }
+  }
+
+  std::thread worker_;
+  std::mutex mutex_;
+  std::condition_variable cv_ready_;
+  std::condition_variable cv_done_;
+  std::function<void()> task_;
+  std::shared_ptr<std::promise<void>> active_promise_;
+  std::shared_future<void> active_future_;
+  bool stop_ = false;
+  bool has_task_ = false;
+  bool task_done_ = false;
+  bool task_started_ = false;
+  uint64_t current_task_id_ = 0;
+  uint64_t completed_task_id_ = 0;
+  uint64_t next_task_id_ = 1;
+};
 
 class FlatMatrix {
  public:
@@ -6155,8 +6265,16 @@ int main(int argc, char * argv[]){
     vector<int> Candidate_Covering_Cycle_Rows_C;
     vector<int> Candidate_Covering_Cycle_Rows_D;
     bool stagnated = false;
+    SingleTaskThread workerC;
+    SingleTaskThread workerD;
+    bool first_iteration = true;
     EF_LOG.clear();
     do{
+      if (!first_iteration) {
+        workerC.wait();
+        workerD.wait();
+      }
+      first_iteration = false;
       // Conditional branch.
       if(itr==0){
         ChannelPass_zero(VNtoChN_DC,N,GF,logGF,f_m,  BINGF);
@@ -6167,20 +6285,29 @@ int main(int argc, char * argv[]){
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
     }
 
-    DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
-                    VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
-    N, M, GF, logGF, MatValue_C, RowDeg_C,
-    TrueNoiseSynd_C, EstmNoiseSynd_C,
-    USSHistory_C[itr%HistoryLength],
-    Updated_EstmNoise_History_C[itr%HistoryLength],
-    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
-    DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
-                    VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
-    N, M, GF, logGF, MatValue_D, RowDeg_D,
-    TrueNoiseSynd_D, EstmNoiseSynd_D,
-    USSHistory_D[itr%HistoryLength],
-    Updated_EstmNoise_History_D[itr%HistoryLength],
-    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    auto decodeC = [&]() {
+      DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
+                      VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
+      N, M, GF, logGF, MatValue_C, RowDeg_C,
+      TrueNoiseSynd_C, EstmNoiseSynd_C,
+      USSHistory_C[itr%HistoryLength],
+      Updated_EstmNoise_History_C[itr%HistoryLength],
+      EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
+    };
+    auto decodeD = [&]() {
+      DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
+                      VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
+      N, M, GF, logGF, MatValue_D, RowDeg_D,
+      TrueNoiseSynd_D, EstmNoiseSynd_D,
+      USSHistory_D[itr%HistoryLength],
+      Updated_EstmNoise_History_D[itr%HistoryLength],
+      EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+    };
+
+    workerC.run(decodeC);
+    workerD.run(decodeD);
+    workerC.wait();
+    workerD.wait();
     // Conditional branch.
     if(itr==0){
       Updated_EstmNoise_History_C[0].clear();
