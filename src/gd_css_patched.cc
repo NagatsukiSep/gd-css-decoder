@@ -631,6 +631,24 @@ __global__ void ChannelPassKernel(float* VNtoChN,
   }
 }
 
+__global__ void CastDoubleToFloat(const double* src,
+                                  float* dst,
+                                  size_t count) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    dst[idx] = static_cast<float>(src[idx]);
+  }
+}
+
+__global__ void CastFloatToDouble(const float* src,
+                                  double* dst,
+                                  size_t count) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    dst[idx] = static_cast<double>(src[idx]);
+  }
+}
+
 __global__ void VNtoChNKernel(double* out,
                               const int* B0,
                               const int* B1,
@@ -2307,13 +2325,9 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
     }
 
-    vector<float> inputFlat(static_cast<size_t>(N) * GF);
-    for (int n = 0; n < N; ++n) {
-      for (int g = 0; g < GF; ++g) {
-        inputFlat[static_cast<size_t>(n) * GF + g] =
-            static_cast<float>(ChNtoVN[n][g]);
-      }
-    }
+    const size_t elementCount = static_cast<size_t>(N) * GF;
+    const size_t vectorBytesFloat = elementCount * sizeof(float);
+    const size_t vectorBytesDouble = elementCount * sizeof(double);
 
     float* d_input = nullptr;
     float* d_output = nullptr;
@@ -2340,7 +2354,6 @@ void ChannelPass(FlatMatrix& VNtoChN,
       }
     };
 
-    const size_t vectorBytes = inputFlat.size() * sizeof(float);
     const size_t matrixBytes = matrixFlat.size() * sizeof(float);
     cudaError_t status = cudaSuccess;
 
@@ -2363,13 +2376,31 @@ void ChannelPass(FlatMatrix& VNtoChN,
       return true;
     };
 
-    status = cudaMalloc(&d_input, vectorBytes);
+    if (!ChNtoVN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error) ||
+        !VNtoChN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error)) {
+      cleanup();
+      break;
+    }
+
+    if (!ChNtoVN.hasValidDeviceData()) {
+      if (!timedMemcpy(ChNtoVN.cuda_device_storage(),
+                       ChNtoVN.data(),
+                       vectorBytesDouble,
+                       cudaMemcpyHostToDevice,
+                       "cudaMemcpy failed for ChannelPass input",
+                       transfer_to_device_ms)) {
+        break;
+      }
+      ChNtoVN.markDeviceDataValid();
+    }
+
+    status = cudaMalloc(&d_input, vectorBytesFloat);
     if (status != cudaSuccess) {
       gpu_error = "cudaMalloc failed for ChannelPass input";
       cleanup();
       break;
     }
-    status = cudaMalloc(&d_output, vectorBytes);
+    status = cudaMalloc(&d_output, vectorBytesFloat);
     if (status != cudaSuccess) {
       gpu_error = "cudaMalloc failed for ChannelPass output";
       cleanup();
@@ -2382,12 +2413,21 @@ void ChannelPass(FlatMatrix& VNtoChN,
       break;
     }
 
-    if (!timedMemcpy(d_input,
-                     inputFlat.data(),
-                     vectorBytes,
-                     cudaMemcpyHostToDevice,
-                     "cudaMemcpy failed for ChannelPass input",
-                     transfer_to_device_ms)) {
+    const int cast_threads = 256;
+    const int cast_blocks =
+        static_cast<int>((elementCount + cast_threads - 1) / cast_threads);
+    CastDoubleToFloat<<<cast_blocks, cast_threads>>>(
+        ChNtoVN.cuda_device_storage(), d_input, elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass input cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass input cast kernel execution failed";
+      cleanup();
       break;
     }
 
@@ -2486,28 +2526,24 @@ void ChannelPass(FlatMatrix& VNtoChN,
       kernel_ms = static_cast<double>(kernel_ms_f);
     }
 
-    vector<float> outputFlat(inputFlat.size());
-    if (!timedMemcpy(outputFlat.data(),
-                     d_output,
-                     vectorBytes,
-                     cudaMemcpyDeviceToHost,
-                     "cudaMemcpy failed for ChannelPass output",
-                     transfer_to_host_ms)) {
+    CastFloatToDouble<<<cast_blocks, cast_threads>>>(
+        d_output, VNtoChN.cuda_device_storage(), elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass output cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      gpu_error = "ChannelPass output cast kernel execution failed";
+      cleanup();
       break;
     }
 
+    VNtoChN.markDeviceDataValid();
+
     cleanup();
-
-    for (int n = 0; n < N; ++n) {
-      for (int g = 0; g < GF; ++g) {
-        VNtoChN[n][g] = static_cast<double>(outputFlat[static_cast<size_t>(n) * GF + g]);
-      }
-      normalize(VNtoChN[n], GF);
-    }
-
-    // Keep the host copy authoritative; if a later GPU stage needs it, it must
-    // re-upload rather than relying on a potentially stale device buffer.
-    VNtoChN.markDeviceDataInvalid();
 
     if (g_enable_timing_output) {
       std::streamsize previous_precision = std::cout.precision();
