@@ -28,6 +28,7 @@
 #include <chrono>
 #include <numeric>
 #include <thread>
+#include <future>
 #include <condition_variable>
 #include <mutex>
 
@@ -67,6 +68,8 @@ class SingleTaskThread {
     if (stop_) {
       return;
     }
+    active_promise_ = std::make_shared<std::promise<void>>();
+    active_future_ = active_promise_->get_future().share();
     current_task_id_ = next_task_id_++;
     task_ = std::move(task);
     task_done_ = false;
@@ -76,11 +79,22 @@ class SingleTaskThread {
   }
 
   void wait() {
+    std::shared_future<void> future;
+    uint64_t waiting_for = 0;
     std::unique_lock<std::mutex> lock(mutex_);
     if (!has_task_ && !task_started_) {
       return;
     }
-    const uint64_t waiting_for = current_task_id_;
+    waiting_for = current_task_id_;
+    if (task_done_ && completed_task_id_ >= waiting_for) {
+      return;
+    }
+    future = active_future_;
+    lock.unlock();
+    if (future.valid()) {
+      future.wait();
+    }
+    lock.lock();
     cv_done_.wait(lock, [this, waiting_for]() {
       return ((task_done_ && completed_task_id_ >= waiting_for) ||
               (stop_ && !has_task_));
@@ -112,15 +126,21 @@ class SingleTaskThread {
       }
 
       std::function<void()> task = std::move(task_);
+      std::shared_ptr<std::promise<void>> promise = active_promise_;
       const uint64_t executing_task_id = current_task_id_;
       lock.unlock();
       task();
+      if (promise) {
+        promise->set_value();
+      }
       lock.lock();
 
       task_done_ = true;
       completed_task_id_ = executing_task_id;
       has_task_ = false;
       task_ = {};
+      active_promise_.reset();
+      active_future_ = std::shared_future<void>();
       cv_ready_.notify_all();
       cv_done_.notify_all();
     }
@@ -131,6 +151,8 @@ class SingleTaskThread {
   std::condition_variable cv_ready_;
   std::condition_variable cv_done_;
   std::function<void()> task_;
+  std::shared_ptr<std::promise<void>> active_promise_;
+  std::shared_future<void> active_future_;
   bool stop_ = false;
   bool has_task_ = false;
   bool task_done_ = false;
