@@ -3235,7 +3235,8 @@ int main(int argc, char * argv[]){
   size_t measurement_completed_runs = 0;
   P = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'P'));
   L = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'L'));
-  const double code_rate = 1.0 - static_cast<double>(M) / static_cast<double>(N);
+  const double code_rate =
+      (N > 0) ? (static_cast<double>(M) / static_cast<double>(N)) : 0.0;
   const double logical_qubits_per_decode =
       logGF * static_cast<double>(P) * static_cast<double>(L) * code_rate;
   printf("P=%d,L=%d\n",P,L);
