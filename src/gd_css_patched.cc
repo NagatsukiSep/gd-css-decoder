@@ -3233,10 +3233,11 @@ int main(int argc, char * argv[]){
     measurement_durations.reserve(measurement_runs);
   }
   size_t measurement_completed_runs = 0;
-  const double logical_qubits_per_decode = static_cast<double>(N) * logGF;
-
   P = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'P'));
   L = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'L'));
+  const double code_rate = 1.0 - static_cast<double>(M) / static_cast<double>(N);
+  const double logical_qubits_per_decode =
+      logGF * static_cast<double>(P) * static_cast<double>(L) * code_rate;
   printf("P=%d,L=%d\n",P,L);
   construct_inv_ZP(P);
   load_GF_tables(GF, logGF, BINGF, ADDGF, MULGF, DIVGF, FFTSQ);
