@@ -4,6 +4,7 @@
 #include <iostream>
 #include <regex>
 #include <cassert>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -18,14 +19,446 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <tuple>
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <exception>
+#include <chrono>
+#include <numeric>
+
+#if defined(__CUDACC__)
+#include <cuda_runtime.h>
+#define GD_CSS_COMPILED_WITH_NVCC 1
+#else
+#define GD_CSS_COMPILED_WITH_NVCC 0
+#endif
+
+#if defined(GD_CSS_CUDA_BUILD) && !GD_CSS_COMPILED_WITH_NVCC
+#error "GD_CSS_CUDA_BUILD requires compiling with nvcc"
+#endif
+
+#if defined(GD_CSS_ENABLE_CUDA)
+#undef GD_CSS_ENABLE_CUDA
+#endif
+
+#if defined(GD_CSS_CUDA_BUILD)
+#define GD_CSS_ENABLE_CUDA 1
+#elif GD_CSS_COMPILED_WITH_NVCC
+#define GD_CSS_ENABLE_CUDA 1
+#else
+#define GD_CSS_ENABLE_CUDA 0
+#endif
 using namespace std;
 
+class FlatMatrix
+{
+public:
+  class RowProxy
+  {
+  public:
+    RowProxy(double *ptr = nullptr, size_t cols = 0)
+        : ptr_(ptr), cols_(cols) {}
+
+    double &operator[](size_t idx) { return ptr_[idx]; }
+    const double &operator[](size_t idx) const { return ptr_[idx]; }
+    size_t size() const { return cols_; }
+    double *data() { return ptr_; }
+    const double *data() const { return ptr_; }
+
+  private:
+    double *ptr_;
+    size_t cols_;
+  };
+
+  class ConstRowProxy
+  {
+  public:
+    ConstRowProxy(const double *ptr = nullptr, size_t cols = 0)
+        : ptr_(ptr), cols_(cols) {}
+
+    const double &operator[](size_t idx) const { return ptr_[idx]; }
+    size_t size() const { return cols_; }
+    const double *data() const { return ptr_; }
+
+  private:
+    const double *ptr_;
+    size_t cols_;
+  };
+
+  FlatMatrix() : rows_(0), cols_(0) {}
+
+  ~FlatMatrix()
+  {
+#if GD_CSS_ENABLE_CUDA
+    releaseCudaMapping();
+    releaseCudaDeviceStorage();
+#endif
+  }
+
+  void resize(size_t rows, size_t cols)
+  {
+#if GD_CSS_ENABLE_CUDA
+    releaseCudaMapping();
+    releaseCudaDeviceStorage();
+#endif
+    rows_ = rows;
+    cols_ = cols;
+    data_.assign(rows_ * cols_, 0.0);
+  }
+
+  size_t size() const { return rows_; }
+  size_t rows() const { return rows_; }
+  size_t cols() const { return cols_; }
+  bool empty() const { return data_.empty(); }
+  size_t elements() const { return data_.size(); }
+
+  RowProxy operator[](size_t row)
+  {
+    return RowProxy(data_.data() + row * cols_, cols_);
+  }
+
+  ConstRowProxy operator[](size_t row) const
+  {
+    return ConstRowProxy(data_.data() + row * cols_, cols_);
+  }
+
+  double *data() { return data_.data(); }
+  const double *data() const { return data_.data(); }
+
+#if GD_CSS_ENABLE_CUDA
+  bool ensureCudaMapping(size_t bytes, std::string *error = nullptr)
+  {
+    if (bytes == 0)
+    {
+      releaseCudaMapping();
+      return true;
+    }
+    double *host_ptr = data();
+    if (!host_ptr)
+    {
+      if (error)
+      {
+        *error = "FlatMatrix has no backing storage";
+      }
+      return false;
+    }
+    if (cuda_registered_ && cuda_host_ptr_ == host_ptr &&
+        cuda_registered_bytes_ == bytes)
+    {
+      return true;
+    }
+    releaseCudaMapping();
+    cudaError_t status = cudaHostRegister(
+        host_ptr, bytes,
+        cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (status != cudaSuccess)
+    {
+      if (error)
+      {
+        *error = std::string("cudaHostRegister failed: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    status = cudaHostGetDevicePointer(&cuda_device_ptr_, host_ptr, 0);
+    if (status != cudaSuccess)
+    {
+      cudaHostUnregister(host_ptr);
+      if (error)
+      {
+        *error = std::string("cudaHostGetDevicePointer failed: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    cuda_registered_ = true;
+    cuda_host_ptr_ = host_ptr;
+    cuda_registered_bytes_ = bytes;
+    return true;
+  }
+
+  void releaseCudaMapping()
+  {
+    if (cuda_registered_ && cuda_host_ptr_)
+    {
+      cudaHostUnregister(cuda_host_ptr_);
+    }
+    cuda_registered_ = false;
+    cuda_host_ptr_ = nullptr;
+    cuda_device_ptr_ = nullptr;
+    cuda_registered_bytes_ = 0;
+  }
+
+  double *cuda_data() const { return cuda_device_ptr_; }
+  bool hasCudaMapping() const { return cuda_registered_; }
+
+  bool ensureCudaDeviceStorage(size_t bytes, std::string *error = nullptr)
+  {
+    if (bytes == 0)
+    {
+      releaseCudaDeviceStorage();
+      return true;
+    }
+    if (cuda_device_storage_ && cuda_device_capacity_ >= bytes)
+    {
+      return true;
+    }
+    releaseCudaDeviceStorage();
+    cudaError_t status = cudaMalloc(&cuda_device_storage_, bytes);
+    if (status != cudaSuccess)
+    {
+      if (error)
+      {
+        *error = std::string("cudaMalloc failed for FlatMatrix device storage: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    cuda_device_capacity_ = bytes;
+    cuda_device_data_valid_ = false;
+    return true;
+  }
+
+  bool copyHostToDevice(size_t bytes, std::string *error = nullptr)
+  {
+    if (bytes == 0)
+    {
+      return true;
+    }
+    if (!ensureCudaDeviceStorage(bytes, error))
+    {
+      return false;
+    }
+    cudaError_t status =
+        cudaMemcpy(cuda_device_storage_, data(), bytes, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess)
+    {
+      if (error)
+      {
+        *error = std::string("cudaMemcpy (host->device) failed for FlatMatrix: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    cuda_device_data_valid_ = true;
+    return true;
+  }
+
+  bool copyDeviceToHost(size_t bytes, std::string *error = nullptr)
+  {
+    if (bytes == 0)
+    {
+      return true;
+    }
+    if (!cuda_device_storage_)
+    {
+      if (error)
+      {
+        *error = "FlatMatrix device storage is not allocated";
+      }
+      return false;
+    }
+    cudaError_t status =
+        cudaMemcpy(data(), cuda_device_storage_, bytes, cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess)
+    {
+      if (error)
+      {
+        *error = std::string("cudaMemcpy (device->host) failed for FlatMatrix: ") +
+                 cudaGetErrorString(status);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  void releaseCudaDeviceStorage()
+  {
+    if (cuda_device_storage_)
+    {
+      cudaFree(cuda_device_storage_);
+    }
+    cuda_device_storage_ = nullptr;
+    cuda_device_capacity_ = 0;
+    cuda_device_data_valid_ = false;
+  }
+
+  double *cuda_device_storage() const { return cuda_device_storage_; }
+
+  bool hasValidDeviceData() const
+  {
+    return cuda_device_storage_ && cuda_device_data_valid_;
+  }
+
+  void markDeviceDataValid(bool valid = true)
+  {
+    cuda_device_data_valid_ = valid && cuda_device_storage_;
+  }
+
+  void markDeviceDataInvalid() { cuda_device_data_valid_ = false; }
+#else
+  bool hasValidDeviceData() const { return false; }
+  void markDeviceDataValid(bool = true) {}
+  void markDeviceDataInvalid() {}
+#endif
+
+private:
+  std::vector<double> data_;
+  size_t rows_;
+  size_t cols_;
+#if GD_CSS_ENABLE_CUDA
+  double *cuda_device_ptr_ = nullptr;
+  double *cuda_host_ptr_ = nullptr;
+  size_t cuda_registered_bytes_ = 0;
+  bool cuda_registered_ = false;
+  double *cuda_device_storage_ = nullptr;
+  size_t cuda_device_capacity_ = 0;
+  bool cuda_device_data_valid_ = false;
+#endif
+};
+
+namespace
+{
+
+  bool g_enable_timing_output = false;
+
+  class ScopedTimer
+  {
+  public:
+    explicit ScopedTimer(const char *label)
+        : label_(label),
+          enabled_(g_enable_timing_output)
+    {
+      if (enabled_)
+      {
+        start_ = std::chrono::steady_clock::now();
+      }
+    }
+
+    ~ScopedTimer()
+    {
+      if (!enabled_)
+      {
+        return;
+      }
+      auto end = std::chrono::steady_clock::now();
+      double elapsed_ms =
+          std::chrono::duration<double, std::milli>(end - start_).count();
+      std::cout << "[Timing] " << label_ << ": " << elapsed_ms << " ms"
+                << std::endl;
+    }
+
+  private:
+    const char *label_;
+    bool enabled_;
+    std::chrono::steady_clock::time_point start_{};
+  };
+
+  struct GFTablesCache
+  {
+    std::vector<int> divFlat;
+    std::vector<int> mulFlat;
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  struct CheckPassMetadataKey
+  {
+    const void *matValue = nullptr;
+    const void *rowDegree = nullptr;
+    const void *fftSq = nullptr;
+
+    bool operator==(const CheckPassMetadataKey &other) const noexcept
+    {
+      return matValue == other.matValue && rowDegree == other.rowDegree &&
+             fftSq == other.fftSq;
+    }
+  };
+
+  struct CheckPassMetadataKeyHash
+  {
+    size_t operator()(const CheckPassMetadataKey &key) const noexcept
+    {
+      size_t seed = 0;
+      auto mix = [&](const void *ptr)
+      {
+        size_t h = std::hash<const void *>()(ptr);
+        seed ^= h + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      };
+      mix(key.matValue);
+      mix(key.rowDegree);
+      mix(key.fftSq);
+      return seed;
+    }
+  };
+
+  struct DataPassMetadataKey
+  {
+    const void *interleaver = nullptr;
+    const void *columnDegree = nullptr;
+
+    bool operator==(const DataPassMetadataKey &other) const noexcept
+    {
+      return interleaver == other.interleaver &&
+             columnDegree == other.columnDegree;
+    }
+  };
+
+  struct DataPassMetadataKeyHash
+  {
+    size_t operator()(const DataPassMetadataKey &key) const noexcept
+    {
+      size_t seed = 0;
+      auto mix = [&](const void *ptr)
+      {
+        size_t h = std::hash<const void *>()(ptr);
+        seed ^= h + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+      };
+      mix(key.interleaver);
+      mix(key.columnDegree);
+      return seed;
+    }
+  };
+
+  template <typename T>
+  struct DeviceArray
+  {
+    T *ptr = nullptr;
+    size_t capacity = 0;
+    size_t size = 0;
+    bool dirty = true;
+  };
+
+  struct DeviceConstantSet
+  {
+    DeviceArray<int> matValue;
+    DeviceArray<int> rowBase;
+    DeviceArray<int> rowDegree;
+    DeviceArray<int> fft0;
+    DeviceArray<int> fft1;
+  };
+
+  struct DeviceGFTables
+  {
+    DeviceArray<int> div;
+    DeviceArray<int> mul;
+    int gf = 0;
+  };
+
+  struct DataPassConstantSet
+  {
+    DeviceArray<int> interleaver;
+    DeviceArray<int> columnDegree;
+    DeviceArray<int> nodeBase;
+  };
+#endif // GD_CSS_ENABLE_CUDA
+
+} // namespace
+
 // ======= Parameter Objects for TryDecodeSmallErrors (argument reduction) =======
-struct SM_StateRef {
+struct SM_StateRef
+{
   int &SyndromeIsSatisfied;
   std::vector<int> &SuspectJ;
   std::vector<int> &RUSS;
@@ -36,14 +469,16 @@ struct SM_StateRef {
   std::vector<int> &EstmNoise;
   std::vector<int> &Candidate_Covering_Normal_Rows;
 };
-struct SM_CodeRef {
+struct SM_CodeRef
+{
   std::vector<std::vector<int>> &JatI;
   std::vector<std::vector<int>> &IatJ;
   std::vector<std::vector<int>> &Mat;
   std::vector<std::vector<int>> &MatValue;
   std::vector<int> &RowDeg;
 };
-struct SM_UtcBcRef {
+struct SM_UtcBcRef
+{
   std::vector<std::vector<int>> &UTCBC_Rows_C_orthogonal_D;
   std::vector<std::vector<int>> &UTCBC_Cols_C_orthogonal_D;
   std::vector<std::vector<int>> &full_JatI_C;
@@ -51,7 +486,8 @@ struct SM_UtcBcRef {
   std::vector<std::vector<int>> &full_JatI_D;
   std::vector<std::vector<int>> &full_IatJ_D;
 };
-struct SM_GFTablesRef {
+struct SM_GFTablesRef
+{
   std::vector<std::vector<int>> &MULGF;
   std::vector<std::vector<int>> &ADDGF;
   std::vector<std::vector<int>> &DIVGF;
@@ -60,19 +496,19 @@ struct SM_GFTablesRef {
 // ==============================================================================
 string EF_LOG;
 vector<int> inv_ZP;
-int L,P;
+int L, P;
 int DEBUG_transmission;
-int M,N;
+int M, N;
 int itr;
 int eS;
 int eS_C;
 int eS_D;
 int transmission;
-int GF,logGF;
+int GF, logGF;
 FILE *f;
 
-char *MatrixFilePrefix_C=(char *)malloc(500);
-char *MatrixFilePrefix_D=(char *)malloc(500);
+char *MatrixFilePrefix_C = (char *)malloc(500);
+char *MatrixFilePrefix_D = (char *)malloc(500);
 
 vector<int> TrueNoise_C;
 vector<int> TrueNoise_D;
@@ -93,9 +529,9 @@ vector<vector<int>> NtoB_C;
 vector<int> Interleaver_C;
 vector<int> Puncture_C;
 vector<int> EstmNoise_C;
-vector<vector<double>> CNtoVNxxx_C;
-vector<vector<double>> VNtoCNxxx_C;
-vector<vector<double>> APP_C;
+FlatMatrix CNtoVNxxx_C;
+FlatMatrix VNtoCNxxx_C;
+FlatMatrix APP_C;
 vector<int> TrueNoiseSynd_D;
 vector<int> EstmNoiseSynd_D;
 vector<int> ColDeg_D;
@@ -106,15 +542,15 @@ vector<vector<int>> NtoB_D;
 vector<int> Interleaver_D;
 vector<int> Puncture_D;
 vector<int> EstmNoise_D;
-vector<vector<double>> VNtoChN_CD;
-vector<vector<double>> VNtoChN_DC;
-vector<vector<double>> CNtoVNxxx_D;
-vector<vector<double>> VNtoCNxxx_D;
-vector<vector<double>> APP_D;
-vector<vector<double>> ChNtoVN_CD;
-vector<vector<double>> ChNtoVN_DC;
-int NumUSS_C,NumUSS_D;
-const int HistoryLength=8;
+FlatMatrix VNtoChN_CD;
+FlatMatrix VNtoChN_DC;
+FlatMatrix CNtoVNxxx_D;
+FlatMatrix VNtoCNxxx_D;
+FlatMatrix APP_D;
+FlatMatrix ChNtoVN_CD;
+FlatMatrix ChNtoVN_DC;
+int NumUSS_C, NumUSS_D;
+const int HistoryLength = 8;
 vector<vector<int>> Updated_EstmNoise_History_C(HistoryLength);
 vector<vector<int>> Updated_EstmNoise_History_D(HistoryLength);
 vector<vector<int>> USSHistory_C(HistoryLength);
@@ -137,15 +573,15 @@ vector<vector<int>> full_IatJ_C;
 vector<vector<int>> full_IatJ_D;
 
 int SyndromeIsSatisfied_C;
-int NumEdge_C,P_C=0;
+int NumEdge_C, P_C = 0;
 double Rate_C;
 
 int SyndromeIsSatisfied_D;
-int NumEdge_D,P_D=0;
+int NumEdge_D, P_D = 0;
 double Rate_D;
 
-int TeB=0,TeS=0,eB,TeF=0,TdS=0;
-double f_m,pD;
+int TeB = 0, TeS = 0, eB, TeF = 0, TdS = 0;
+double f_m, pD;
 int NbUndetectedErrors;
 vector<int> IncorrectJ_C;
 vector<int> IncorrectJ_D;
@@ -161,66 +597,1127 @@ using LoopSet = vector<Loop>;
 using IndexList = vector<vector<int>>;
 using BitSet = unordered_set<int>;
 using NodeList = vector<int>;
+#if GD_CSS_COMPILED_WITH_NVCC
+namespace cuda_kernels
+{
+
+  template <typename T>
+  __device__ T BlockReduceSum(T *scratch, T value)
+  {
+    const int tid = threadIdx.x;
+    scratch[tid] = value;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
+    {
+      if (tid < offset)
+      {
+        scratch[tid] += scratch[tid + offset];
+      }
+      __syncthreads();
+    }
+    return scratch[0];
+  }
+
+  __global__ void ChannelPassKernel(float *VNtoChN,
+                                    const float *ChNtoVN,
+                                    const float *matrixT,
+                                    int N,
+                                    int GF)
+  {
+    const long long blockIndex = blockIdx.x +
+                                 static_cast<long long>(gridDim.x) * blockIdx.y +
+                                 static_cast<long long>(gridDim.x) * gridDim.y *
+                                     blockIdx.z;
+    const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                  gridDim.z;
+
+    extern __shared__ float shared[];
+    float *input = shared;
+    float *output = input + GF;
+    float *scratch = output + GF;
+
+    const int tid = threadIdx.x;
+
+    for (long long rowIndex = blockIndex; rowIndex < N; rowIndex += totalBlocks)
+    {
+      const int row = static_cast<int>(rowIndex);
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        input[g] = ChNtoVN[row * GF + g];
+      }
+      __syncthreads();
+
+      float partial = 0.0f;
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        partial += input[g];
+      }
+      const float sum = BlockReduceSum(scratch, partial);
+
+      if (sum == 0.0f)
+      {
+        const float uniform = 1.0f / static_cast<float>(GF);
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          input[g] = uniform;
+        }
+      }
+      else
+      {
+        const float inv = 1.0f / sum;
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          input[g] *= inv;
+        }
+      }
+      __syncthreads();
+
+      for (int d = tid; d < GF; d += blockDim.x)
+      {
+        float accum = 0.0f;
+        for (int e = 0; e < GF; ++e)
+        {
+          accum += matrixT[e * GF + d] * input[e];
+        }
+        output[d] = accum;
+      }
+      __syncthreads();
+
+      partial = 0.0f;
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        partial += output[g];
+      }
+      const float out_sum = BlockReduceSum(scratch, partial);
+
+      if (out_sum == 0.0f)
+      {
+        const float uniform = 1.0f / static_cast<float>(GF);
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          output[g] = uniform;
+        }
+      }
+      else
+      {
+        const float inv = 1.0f / out_sum;
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          output[g] *= inv;
+        }
+      }
+      __syncthreads();
+
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        VNtoChN[row * GF + g] = output[g];
+      }
+      __syncthreads();
+    }
+  }
+
+  __global__ void CastDoubleToFloat(const double *src,
+                                    float *dst,
+                                    size_t count)
+  {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+      dst[idx] = static_cast<float>(src[idx]);
+    }
+  }
+
+  __global__ void CastFloatToDouble(const float *src,
+                                    double *dst,
+                                    size_t count)
+  {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+      dst[idx] = static_cast<double>(src[idx]);
+    }
+  }
+
+  __global__ void VNtoChNKernel(double *out,
+                                const int *B0,
+                                const int *B1,
+                                int GF,
+                                int logGF,
+                                double pD)
+  {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int e = blockIdx.y * blockDim.y + threadIdx.y;
+    if (d >= GF || e >= GF)
+    {
+      return;
+    }
+
+    double value = 1.0;
+    for (int l = 0; l < logGF; ++l)
+    {
+      const int idx_d = d * logGF + l;
+      const int idx_e = e * logGF + l;
+      if (B0[idx_d] == 0 && B1[idx_e] == 0)
+      {
+        value *= (1.0 - pD);
+      }
+      else
+      {
+        value *= (pD / 3.0);
+      }
+    }
+
+    out[d * GF + e] = value;
+  }
+
+  __global__ void CheckPassKernel(double *CNtoVNxxx,
+                                  double *VNtoCNxxx,
+                                  const int *MatValue,
+                                  const int *rowBase,
+                                  const int *RowDegree,
+                                  const int *DIVGF,
+                                  const int *MULGF,
+                                  const int *FFT0,
+                                  const int *FFT1,
+                                  const int *TrueNoiseSynd,
+                                  int M,
+                                  int GF,
+                                  int logGF,
+                                  int pairCount)
+  {
+    const int row = blockIdx.x;
+    if (row >= M)
+    {
+      return;
+    }
+
+    extern __shared__ unsigned char sharedRaw[];
+    double *FTrue = reinterpret_cast<double *>(sharedRaw);
+    double *TMP = FTrue + GF;
+    __shared__ double warpSums[32];
+    __shared__ double sumShared;
+
+    const int tid = threadIdx.x;
+    const int degree = RowDegree[row];
+    const int base = rowBase[row];
+    const int warpCount = (blockDim.x + warpSize - 1) / warpSize;
+
+    for (int g = tid; g < GF; g += blockDim.x)
+    {
+      FTrue[g] = (g == TrueNoiseSynd[row]) ? 1.0 : 0.0;
+    }
+    __syncthreads();
+
+    const int butterfliesPerStage = (logGF > 0) ? (pairCount / logGF) : 0;
+    const bool hasFFT = butterfliesPerStage > 0 && logGF > 0;
+
+    if (hasFFT)
+    {
+      for (int stage = 0; stage < logGF; ++stage)
+      {
+        const int stageOffset = stage * butterfliesPerStage;
+        for (int k = tid; k < butterfliesPerStage; k += blockDim.x)
+        {
+          const int idx = stageOffset + k;
+          const int i = FFT0[idx];
+          const int j = FFT1[idx];
+          const double A = FTrue[i];
+          const double B = FTrue[j];
+          FTrue[i] = A + B;
+          FTrue[j] = A - B;
+        }
+        __syncthreads();
+      }
+    }
+    else
+    {
+      __syncthreads();
+    }
+
+    for (int t = 0; t < degree; ++t)
+    {
+      double *edgeVec = VNtoCNxxx + (base + t) * GF;
+      const int matVal = MatValue[base + t];
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        TMP[g] = edgeVec[DIVGF[g * GF + matVal]];
+      }
+      __syncthreads();
+      if (hasFFT)
+      {
+        for (int stage = 0; stage < logGF; ++stage)
+        {
+          const int stageOffset = stage * butterfliesPerStage;
+          for (int k = tid; k < butterfliesPerStage; k += blockDim.x)
+          {
+            const int idx = stageOffset + k;
+            const int i = FFT0[idx];
+            const int j = FFT1[idx];
+            const double A = TMP[i];
+            const double B = TMP[j];
+            TMP[i] = A + B;
+            TMP[j] = A - B;
+          }
+          __syncthreads();
+        }
+      }
+      else
+      {
+        __syncthreads();
+      }
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        edgeVec[g] = TMP[g];
+      }
+      __syncthreads();
+    }
+
+    for (int g = tid; g < GF; g += blockDim.x)
+    {
+      double prefix = FTrue[g];
+      for (int t = 0; t < degree; ++t)
+      {
+        CNtoVNxxx[(base + t) * GF + g] = prefix;
+        prefix *= VNtoCNxxx[(base + t) * GF + g];
+      }
+    }
+    __syncthreads();
+
+    for (int g = tid; g < GF; g += blockDim.x)
+    {
+      double suffix = 1.0;
+      for (int t = degree - 1; t >= 0; --t)
+      {
+        const int edgeIndex = (base + t) * GF + g;
+        const double prefix = CNtoVNxxx[edgeIndex];
+        const double value = prefix * suffix;
+        CNtoVNxxx[edgeIndex] = value;
+        suffix *= VNtoCNxxx[edgeIndex];
+      }
+    }
+    __syncthreads();
+
+    for (int t = 0; t < degree; ++t)
+    {
+      double *outVec = CNtoVNxxx + (base + t) * GF;
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        TMP[g] = outVec[g];
+      }
+      __syncthreads();
+
+      if (hasFFT)
+      {
+        for (int stage = 0; stage < logGF; ++stage)
+        {
+          const int stageOffset = stage * butterfliesPerStage;
+          for (int k = tid; k < butterfliesPerStage; k += blockDim.x)
+          {
+            const int idx = stageOffset + k;
+            const int i = FFT0[idx];
+            const int j = FFT1[idx];
+            const double A = TMP[i];
+            const double B = TMP[j];
+            TMP[i] = 0.5 * (A + B);
+            TMP[j] = 0.5 * (A - B);
+          }
+          __syncthreads();
+        }
+      }
+      else
+      {
+        __syncthreads();
+      }
+
+      const int matVal = MatValue[base + t];
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        outVec[g] = TMP[MULGF[matVal * GF + g]];
+      }
+      __syncthreads();
+
+      double partial = 0.0;
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        double v = outVec[g];
+        if (v < 0.0)
+        {
+          v = 0.0;
+        }
+        outVec[g] = v;
+        partial += v;
+      }
+
+      double sum = partial;
+      for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+      {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+      }
+      if ((threadIdx.x & (warpSize - 1)) == 0)
+      {
+        warpSums[threadIdx.x / warpSize] = sum;
+      }
+      __syncthreads();
+
+      double blockSum = 0.0;
+      if (threadIdx.x < warpSize)
+      {
+        blockSum = (threadIdx.x < warpCount) ? warpSums[threadIdx.x] : 0.0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+          blockSum += __shfl_down_sync(0xffffffff, blockSum, offset);
+        }
+        if (threadIdx.x == 0)
+        {
+          sumShared = blockSum;
+        }
+      }
+      __syncthreads();
+
+      const double total = sumShared;
+      double inv;
+      if (total == 0.0)
+      {
+        inv = 1.0 / static_cast<double>(GF);
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          outVec[g] = inv;
+        }
+      }
+      else
+      {
+        inv = 1.0 / total;
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          outVec[g] *= inv;
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  __global__ void DataPassKernel(double *VNtoCNxxx,
+                                 const double *CNtoVNxxx,
+                                 const double *VNtoChN,
+                                 const int *interleaver,
+                                 const int *columnDegree,
+                                 const int *nodeBase,
+                                 int N,
+                                 int GF)
+  {
+    const long long blockIndex = blockIdx.x +
+                                 static_cast<long long>(gridDim.x) * blockIdx.y +
+                                 static_cast<long long>(gridDim.x) * gridDim.y *
+                                     blockIdx.z;
+    const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                  gridDim.z;
+
+    extern __shared__ double dataShared[];
+    double *channel = dataShared;
+    double *scratch = channel + GF;
+
+    const int tid = threadIdx.x;
+
+    for (long long nodeIndex = blockIndex; nodeIndex < N;
+         nodeIndex += totalBlocks)
+    {
+      const int node = static_cast<int>(nodeIndex);
+      const int degree = columnDegree[node];
+      const int base = nodeBase[node];
+
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        channel[g] = VNtoChN[node * GF + g];
+      }
+      __syncthreads();
+
+      for (int t = 0; t < degree; ++t)
+      {
+        const int edgeIndex = interleaver[base + t];
+        double *outVec = VNtoCNxxx + static_cast<long long>(edgeIndex) * GF;
+
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          double value = channel[g];
+          for (int tz = 0; tz < degree; ++tz)
+          {
+            if (tz == t)
+            {
+              continue;
+            }
+            const int otherEdge = interleaver[base + tz];
+            value *= CNtoVNxxx[static_cast<long long>(otherEdge) * GF + g];
+          }
+          outVec[g] = value;
+        }
+        __syncthreads();
+
+        double partial = 0.0;
+        for (int g = tid; g < GF; g += blockDim.x)
+        {
+          partial += outVec[g];
+        }
+        const double sum = BlockReduceSum(scratch, partial);
+
+        if (sum == 0.0)
+        {
+          const double uniform = 1.0 / static_cast<double>(GF);
+          for (int g = tid; g < GF; g += blockDim.x)
+          {
+            outVec[g] = uniform;
+          }
+        }
+        else
+        {
+          const double inv = 1.0 / sum;
+          for (int g = tid; g < GF; g += blockDim.x)
+          {
+            outVec[g] *= inv;
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  __global__ void ComputeAPPKernel(double *APP,
+                                   double *ChNtoVN,
+                                   const double *CNtoVNxxx,
+                                   const double *VNtoChN,
+                                   const int *interleaver,
+                                   const int *columnDegree,
+                                   const int *nodeBase,
+                                   int N,
+                                   int GF)
+  {
+    const long long blockIndex = blockIdx.x +
+                                 static_cast<long long>(gridDim.x) * blockIdx.y +
+                                 static_cast<long long>(gridDim.x) * gridDim.y *
+                                     blockIdx.z;
+    const long long totalBlocks = static_cast<long long>(gridDim.x) * gridDim.y *
+                                  gridDim.z;
+
+    const int tid = threadIdx.x;
+
+    for (long long nodeIndex = blockIndex; nodeIndex < N;
+         nodeIndex += totalBlocks)
+    {
+      const int node = static_cast<int>(nodeIndex);
+      const int degree = columnDegree[node];
+      const int base = nodeBase[node];
+
+      for (int g = tid; g < GF; g += blockDim.x)
+      {
+        double value = 1.0;
+        for (int t = 0; t < degree; ++t)
+        {
+          const int edgeIndex = interleaver[base + t];
+          value *= CNtoVNxxx[static_cast<long long>(edgeIndex) * GF + g];
+        }
+        const double appValue = value * VNtoChN[node * GF + g];
+        ChNtoVN[node * GF + g] = value;
+        APP[node * GF + g] = appValue;
+      }
+    }
+  }
+
+  __global__ void DecisionKernel(const double *APP,
+                                 int *decision,
+                                 int N,
+                                 int GF)
+  {
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= N)
+    {
+      return;
+    }
+
+    const int base = node * GF;
+    double max_val = APP[base];
+    int max_idx = 0;
+    for (int g = 1; g < GF; ++g)
+    {
+      const double value = APP[base + g];
+      if (value >= max_val)
+      {
+        max_val = value;
+        max_idx = g;
+      }
+    }
+
+    decision[node] = max_idx;
+  }
+
+  __global__ void SyndromeKernel(const int *mat,
+                                 const int *matValue,
+                                 const int *rowBase,
+                                 const int *rowDegree,
+                                 const int *addGF,
+                                 const int *mulGF,
+                                 const int *estNoise,
+                                 int M,
+                                 int GF,
+                                 int *outSyndrome)
+  {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M)
+    {
+      return;
+    }
+
+    const int base = rowBase[row];
+    const int degree = rowDegree[row];
+
+    int syndrome = 0;
+    for (int t = 0; t < degree; ++t)
+    {
+      const int col = mat[base + t];
+      const int h = matValue[base + t];
+      const int product = mulGF[h * GF + estNoise[col]];
+      syndrome = addGF[syndrome * GF + product];
+    }
+
+    outSyndrome[row] = syndrome;
+  }
+
+} // namespace cuda_kernels
+#endif
+
+#if GD_CSS_ENABLE_CUDA
+static std::unordered_map<CheckPassMetadataKey,
+                          DeviceConstantSet,
+                          CheckPassMetadataKeyHash>
+    g_checkpass_constant_cache;
+static DeviceGFTables g_checkpass_gf_tables;
+static std::unordered_map<DataPassMetadataKey,
+                          DataPassConstantSet,
+                          DataPassMetadataKeyHash>
+    g_datapass_constant_cache;
+static DeviceArray<int> g_decision_buffer;
+
+template <typename T>
+bool EnsureDeviceArray(DeviceArray<T> &buffer,
+                       size_t elements,
+                       cudaError_t &status,
+                       const char *label,
+                       string &error)
+{
+  if (elements == 0)
+  {
+    if (buffer.ptr)
+    {
+      cudaFree(buffer.ptr);
+      buffer.ptr = nullptr;
+    }
+    buffer.capacity = 0;
+    buffer.size = 0;
+    buffer.dirty = false;
+    return true;
+  }
+  if (buffer.capacity >= elements)
+  {
+    buffer.size = elements;
+    return true;
+  }
+  if (buffer.ptr)
+  {
+    cudaFree(buffer.ptr);
+    buffer.ptr = nullptr;
+    buffer.capacity = 0;
+    buffer.size = 0;
+  }
+  buffer.dirty = true;
+  status = cudaMalloc(&buffer.ptr, elements * sizeof(T));
+  if (status != cudaSuccess)
+  {
+    error = string("cudaMalloc failed for ") + label;
+    return false;
+  }
+  buffer.capacity = elements;
+  buffer.size = elements;
+  return true;
+}
+
+static bool RunCheckPassCUDA(const vector<int> &rowBase,
+                             const vector<int> &RowDegree,
+                             const vector<int> &MatValueFlat,
+                             FlatMatrix &CNtoVNxxx,
+                             FlatMatrix &VNtoCNxxx,
+                             const vector<int> &DIVGFFlat,
+                             const vector<int> &MULGFFlat,
+                             const vector<int> &FFT0,
+                             const vector<int> &FFT1,
+                             const vector<int> &TrueNoiseSynd,
+                             int M,
+                             int GF,
+                             int logGF,
+                             const CheckPassMetadataKey &metadata_key,
+                             string &error)
+{
+  const size_t totalEdges = MatValueFlat.size();
+  if (totalEdges == 0 || M == 0)
+  {
+    return true;
+  }
+
+  double *d_CNtoVN = nullptr;
+  double *d_VNtoCN = nullptr;
+  int *d_TrueNoiseSynd = nullptr;
+  DeviceConstantSet &constant_set = g_checkpass_constant_cache[metadata_key];
+  DeviceGFTables &gf_tables = g_checkpass_gf_tables;
+  double transfer_to_device_ms = 0.0;
+  double transfer_to_host_ms = 0.0;
+  double kernel_ms = 0.0;
+  cudaEvent_t kernelStart = nullptr;
+  cudaEvent_t kernelEnd = nullptr;
+
+  const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+  const size_t pairCount = FFT0.size();
+  const size_t syndromeBytes = TrueNoiseSynd.size() * sizeof(int);
+  cudaError_t status = cudaSuccess;
+
+  auto cleanup = [&]()
+  {
+    if (d_TrueNoiseSynd)
+      cudaFree(d_TrueNoiseSynd);
+    if (kernelStart)
+      cudaEventDestroy(kernelStart);
+    if (kernelEnd)
+      cudaEventDestroy(kernelEnd);
+  };
+
+  auto timedMemcpy = [&](void *dst,
+                         const void *src,
+                         size_t bytes,
+                         cudaMemcpyKind kind,
+                         const char *failure,
+                         double &accumulator) -> bool
+  {
+    auto start = std::chrono::steady_clock::now();
+    status = cudaMemcpy(dst, src, bytes, kind);
+    auto end = std::chrono::steady_clock::now();
+    accumulator +=
+        std::chrono::duration<double, std::milli>(end - start).count();
+    if (status != cudaSuccess)
+    {
+      error = failure;
+      cleanup();
+      return false;
+    }
+    return true;
+  };
+
+  auto copyConstant = [&](DeviceArray<int> &buffer,
+                          const vector<int> &host,
+                          const char *failure) -> bool
+  {
+    if (buffer.size == 0 || !buffer.dirty)
+    {
+      return true;
+    }
+    if (!timedMemcpy(buffer.ptr,
+                     host.data(),
+                     buffer.size * sizeof(int),
+                     cudaMemcpyHostToDevice,
+                     failure,
+                     transfer_to_device_ms))
+    {
+      return false;
+    }
+    buffer.dirty = false;
+    return true;
+  };
+
+  auto ensureMatrixInput = [&](FlatMatrix &matrix,
+                               size_t bytes,
+                               const char *failure,
+                               double *&device_ptr) -> bool
+  {
+    if (!matrix.ensureCudaDeviceStorage(bytes, &error))
+    {
+      cleanup();
+      return false;
+    }
+    device_ptr = matrix.cuda_device_storage();
+    if (!matrix.hasValidDeviceData())
+    {
+      if (!timedMemcpy(device_ptr,
+                       matrix.data(),
+                       bytes,
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms))
+      {
+        return false;
+      }
+      matrix.markDeviceDataValid();
+    }
+    return true;
+  };
+
+  int device = 0;
+  status = cudaGetDevice(&device);
+  if (status != cudaSuccess)
+  {
+    error = "cudaGetDevice failed";
+    cleanup();
+    return false;
+  }
+
+  int maxSharedBytes = 0;
+  status = cudaDeviceGetAttribute(&maxSharedBytes, cudaDevAttrMaxSharedMemoryPerBlock, device);
+  if (status != cudaSuccess)
+  {
+    error = "cudaDeviceGetAttribute failed";
+    cleanup();
+    return false;
+  }
+
+  if (!CNtoVNxxx.ensureCudaDeviceStorage(matrixBytes, &error) ||
+      !VNtoCNxxx.ensureCudaDeviceStorage(matrixBytes, &error))
+  {
+    cleanup();
+    return false;
+  }
+  d_CNtoVN = CNtoVNxxx.cuda_device_storage();
+  d_VNtoCN = VNtoCNxxx.cuda_device_storage();
+
+  auto tryPinHostMatrix = [&](FlatMatrix &matrix, const char *label)
+  {
+    std::string pin_error;
+    if (!matrix.ensureCudaMapping(matrixBytes, &pin_error) &&
+        g_enable_timing_output)
+    {
+      std::cerr << "Warning: failed to pin host buffer for " << label
+                << ": " << pin_error << std::endl;
+    }
+  };
+
+  tryPinHostMatrix(CNtoVNxxx, "CNtoVN");
+  tryPinHostMatrix(VNtoCNxxx, "VNtoCN");
+  status = cudaMalloc(&d_TrueNoiseSynd, syndromeBytes);
+  if (status != cudaSuccess)
+  {
+    error = "cudaMalloc failed for TrueNoiseSynd";
+    cleanup();
+    return false;
+  }
+
+  const size_t sharedBytes =
+      (sizeof(double) * 2ULL) * static_cast<size_t>(GF);
+  if (sharedBytes > static_cast<size_t>(maxSharedBytes))
+  {
+    error = "CheckPass CUDA kernel requires more shared memory than available";
+    cleanup();
+    return false;
+  }
+
+  if (!EnsureDeviceArray(constant_set.matValue,
+                         MatValueFlat.size(),
+                         status,
+                         "MatValue",
+                         error) ||
+      !EnsureDeviceArray(constant_set.rowBase,
+                         rowBase.size(),
+                         status,
+                         "rowBase",
+                         error) ||
+      !EnsureDeviceArray(constant_set.rowDegree,
+                         RowDegree.size(),
+                         status,
+                         "RowDegree",
+                         error) ||
+      !EnsureDeviceArray(constant_set.fft0,
+                         FFT0.size(),
+                         status,
+                         "FFT0",
+                         error) ||
+      !EnsureDeviceArray(constant_set.fft1,
+                         FFT1.size(),
+                         status,
+                         "FFT1",
+                         error))
+  {
+    cleanup();
+    return false;
+  }
+
+  const size_t expectedGFTableSize =
+      static_cast<size_t>(GF) * static_cast<size_t>(GF);
+  if (DIVGFFlat.size() != expectedGFTableSize ||
+      MULGFFlat.size() != expectedGFTableSize)
+  {
+    error = "GF lookup tables are incomplete";
+    cleanup();
+    return false;
+  }
+  if (!EnsureDeviceArray(gf_tables.div,
+                         expectedGFTableSize,
+                         status,
+                         "DIVGF",
+                         error) ||
+      !EnsureDeviceArray(gf_tables.mul,
+                         expectedGFTableSize,
+                         status,
+                         "MULGF",
+                         error))
+  {
+    cleanup();
+    return false;
+  }
+  if (gf_tables.gf != GF)
+  {
+    gf_tables.div.dirty = true;
+    gf_tables.mul.dirty = true;
+    gf_tables.gf = GF;
+  }
+
+  if (!ensureMatrixInput(CNtoVNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for CNtoVN host->device",
+                         d_CNtoVN))
+  {
+    return false;
+  }
+  if (!ensureMatrixInput(VNtoCNxxx,
+                         matrixBytes,
+                         "cudaMemcpy failed for VNtoCN host->device",
+                         d_VNtoCN))
+  {
+    return false;
+  }
+  if (!copyConstant(constant_set.matValue,
+                    MatValueFlat,
+                    "cudaMemcpy failed for MatValue"))
+  {
+    return false;
+  }
+  if (!copyConstant(constant_set.rowBase,
+                    rowBase,
+                    "cudaMemcpy failed for rowBase"))
+  {
+    return false;
+  }
+  if (!copyConstant(constant_set.rowDegree,
+                    RowDegree,
+                    "cudaMemcpy failed for RowDegree"))
+  {
+    return false;
+  }
+  if (!copyConstant(gf_tables.div,
+                    DIVGFFlat,
+                    "cudaMemcpy failed for DIVGF"))
+  {
+    return false;
+  }
+  if (!copyConstant(gf_tables.mul,
+                    MULGFFlat,
+                    "cudaMemcpy failed for MULGF"))
+  {
+    return false;
+  }
+  if (!copyConstant(constant_set.fft0,
+                    FFT0,
+                    "cudaMemcpy failed for FFT0"))
+  {
+    return false;
+  }
+  if (!copyConstant(constant_set.fft1,
+                    FFT1,
+                    "cudaMemcpy failed for FFT1"))
+  {
+    return false;
+  }
+  if (!timedMemcpy(d_TrueNoiseSynd,
+                   TrueNoiseSynd.data(),
+                   syndromeBytes,
+                   cudaMemcpyHostToDevice,
+                   "cudaMemcpy failed for TrueNoiseSynd",
+                   transfer_to_device_ms))
+  {
+    return false;
+  }
+
+  int *d_MatValue = constant_set.matValue.ptr;
+  int *d_rowBase = constant_set.rowBase.ptr;
+  int *d_RowDegree = constant_set.rowDegree.ptr;
+  int *d_FFT0 = constant_set.fft0.ptr;
+  int *d_FFT1 = constant_set.fft1.ptr;
+  int *d_DIVGF = gf_tables.div.ptr;
+  int *d_MULGF = gf_tables.mul.ptr;
+
+  const int threads = std::min(256, std::max(1, GF));
+  dim3 grid(M);
+
+  status = cudaEventCreate(&kernelStart);
+  if (status != cudaSuccess)
+  {
+    error = "cudaEventCreate failed for kernelStart";
+    cleanup();
+    return false;
+  }
+  status = cudaEventCreate(&kernelEnd);
+  if (status != cudaSuccess)
+  {
+    error = "cudaEventCreate failed for kernelEnd";
+    cleanup();
+    return false;
+  }
+  status = cudaEventRecord(kernelStart);
+  if (status != cudaSuccess)
+  {
+    error = "cudaEventRecord failed for kernelStart";
+    cleanup();
+    return false;
+  }
+
+  cuda_kernels::CheckPassKernel<<<grid, threads, sharedBytes>>>(
+      d_CNtoVN,
+      d_VNtoCN,
+      d_MatValue,
+      d_rowBase,
+      d_RowDegree,
+      d_DIVGF,
+      d_MULGF,
+      d_FFT0,
+      d_FFT1,
+      d_TrueNoiseSynd,
+      M,
+      GF,
+      logGF,
+      static_cast<int>(pairCount));
+
+  status = cudaEventRecord(kernelEnd);
+  if (status != cudaSuccess)
+  {
+    error = "cudaEventRecord failed for kernelEnd";
+    cleanup();
+    return false;
+  }
+
+  status = cudaGetLastError();
+  if (status != cudaSuccess)
+  {
+    error = "CheckPass CUDA kernel launch failed";
+    cleanup();
+    return false;
+  }
+
+  status = cudaEventSynchronize(kernelEnd);
+  if (status != cudaSuccess)
+  {
+    error = "CheckPass CUDA kernel execution failed";
+    cleanup();
+    return false;
+  }
+
+  float kernel_ms_f = 0.0f;
+  status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+  if (status == cudaSuccess)
+  {
+    kernel_ms = static_cast<double>(kernel_ms_f);
+  }
+
+  CNtoVNxxx.markDeviceDataValid();
+  VNtoCNxxx.markDeviceDataValid();
+
+  if (g_enable_timing_output)
+  {
+    std::streamsize previous_precision = std::cout.precision();
+    std::ios::fmtflags previous_flags = std::cout.flags();
+    std::cout << std::fixed << std::setprecision(3)
+              << "CheckPass CUDA timing (H2D: " << transfer_to_device_ms
+              << " ms, kernel: " << kernel_ms
+              << " ms, D2H: " << transfer_to_host_ms
+              << " ms, total transfer: "
+              << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+              << std::endl;
+    std::cout.precision(previous_precision);
+    std::cout.flags(previous_flags);
+  }
+
+  cleanup();
+  return true;
+}
+#endif
 template <typename T>
 // Function: contains
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool contains(const vector<T>& S, const T& x) {
+bool contains(const vector<T> &S, const T &x)
+{
   // Loop: iterate over a range/collection.
-  for (const T& elem : S) {
+  for (const T &elem : S)
+  {
     // Conditional branch.
-    if (elem == x) return true;
+    if (elem == x)
+      return true;
   }
   return false;
 }
 // Function: difference
 // Purpose: TODO - describe the function's responsibility succinctly.
 template <typename T>
-vector<T> difference(const vector<T>& A, const vector<T>& B) {
+vector<T> difference(const vector<T> &A, const vector<T> &B)
+{
   unordered_set<T> setB(B.begin(), B.end());
   vector<T> diff;
-  for (const auto& x : A) {
-    if (setB.find(x) == setB.end()) diff.push_back(x);
+  for (const auto &x : A)
+  {
+    if (setB.find(x) == setB.end())
+      diff.push_back(x);
   }
   return diff;
 }
 // Function: find_missing_elements
 // Purpose: TODO - describe the function's responsibility succinctly.
-std::vector<int> find_missing_elements(const std::vector<int>& subset, const std::vector<int>& superset) {
+std::vector<int> find_missing_elements(const std::vector<int> &subset, const std::vector<int> &superset)
+{
   std::unordered_set<int> set_superset(superset.begin(), superset.end());
   std::vector<int> missing;
   // Loop: iterate over a range/collection.
-  for (int j : subset) {
+  for (int j : subset)
+  {
     // Conditional branch.
-    if (!set_superset.count(j)) {
+    if (!set_superset.count(j))
+    {
       missing.push_back(j);
     }
   }
   // Conditional branch.
-  if (!missing.empty()) {
+  if (!missing.empty())
+  {
     printf("Missing elements:");
     // Loop: iterate over a range/collection.
-    for (int j : missing) {
+    for (int j : missing)
+    {
       printf(" %d", j);
     }
     printf("\n");
-  }else{
-  printf("All included!\n");
-}
-return missing;
+  }
+  else
+  {
+    printf("All included!\n");
+  }
+  return missing;
 }
 
-vector<int> find_dangerous_checks(const NodeList& C0, const IndexList& JatI, const BitSet& S) {
+vector<int> find_dangerous_checks(const NodeList &C0, const IndexList &JatI, const BitSet &S)
+{
   vector<int> danger;
   // Loop: iterate over a range/collection.
-  for (int c : C0) {
+  for (int c : C0)
+  {
     int count = 0;
     // Loop: iterate over a range/collection.
-    for (int v : JatI[c]) {
+    for (int v : JatI[c])
+    {
       // Conditional branch.
-      if (S.find(v) != S.end()) count++;
+      if (S.find(v) != S.end())
+        count++;
     }
     // Conditional branch.
-    if (count == 1) {
+    if (count == 1)
+    {
       danger.push_back(c);
     }
   }
@@ -228,21 +1725,27 @@ vector<int> find_dangerous_checks(const NodeList& C0, const IndexList& JatI, con
 }
 // Function: print_progress_bar
 // Purpose: TODO - describe the function's responsibility succinctly.
-void print_progress_bar(int current, int total, const string& label = "", int bar_width = 50) {
+void print_progress_bar(int current, int total, const string &label = "", int bar_width = 50)
+{
   float progress = float(current) / total;
   int pos = int(bar_width * progress);
   cout << "\r\033[32m[";
   // Loop: iterate over a range/collection.
-  for (int j = 0; j < bar_width; ++j) {
+  for (int j = 0; j < bar_width; ++j)
+  {
     // Conditional branch.
-    if (j < pos) cout << "=";
-    else if (j == pos) cout << ">";
-    else cout << " ";
+    if (j < pos)
+      cout << "=";
+    else if (j == pos)
+      cout << ">";
+    else
+      cout << " ";
   }
   cout << "]\033[0m ";
   cout << int(progress * 100) << "% ";
   // Conditional branch.
-  if (!label.empty()) {
+  if (!label.empty())
+  {
     cout << "(" << label << ")";
   }
   cout << flush;
@@ -250,110 +1753,680 @@ void print_progress_bar(int current, int total, const string& label = "", int ba
 // Function: VNtoChN_init
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void VNtoChN_init(Eigen::MatrixXd& f_VNtoChN_eigen,
-double pD,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BINGF1){
+void VNtoChN_init(Eigen::MatrixXd &f_VNtoChN_eigen,
+                  double pD, int GF, int logGF, vector<vector<int>> &BINGF0, vector<vector<int>> &BINGF1)
+{
   cout << "@@@ VNtoChN_init" << endl;
-  f_VNtoChN_eigen=Eigen::MatrixXd(GF,GF);
+  f_VNtoChN_eigen = Eigen::MatrixXd(GF, GF);
   cout << "eigen done" << endl;
-  // Loop: iterate over a range/collection.
-  for(size_t d=0;d<GF;d++){
 
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){
-      f_VNtoChN_eigen(d,e)=1.0f;
-      // Loop: iterate over a range/collection.
-      for(size_t l=0;l<logGF;l++){
-        // Conditional branch.
-        if(BINGF0[d][l]==0 && BINGF1[e][l]==0){
-          f_VNtoChN_eigen(d,e)*=1-pD;
-        }else{
-        f_VNtoChN_eigen(d,e)*=pD/3;
+#if !GD_CSS_ENABLE_CUDA
+  static bool compile_time_reported = false;
+  if (!compile_time_reported)
+  {
+    cout << "VNtoChN_init compiled without CUDA support; using CPU implementation." << endl;
+    compile_time_reported = true;
+  }
+#endif
+
+  auto cpu_compute = [&]()
+  {
+    for (int d = 0; d < GF; ++d)
+    {
+      for (int e = 0; e < GF; ++e)
+      {
+        f_VNtoChN_eigen(d, e) = 1.0;
+        for (int l = 0; l < logGF; ++l)
+        {
+          if (BINGF0[d][l] == 0 && BINGF1[e][l] == 0)
+          {
+            f_VNtoChN_eigen(d, e) *= 1 - pD;
+          }
+          else
+          {
+            f_VNtoChN_eigen(d, e) *= pD / 3;
+          }
+        }
       }
     }
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  bool gpu_success = false;
+  std::string gpu_error;
+  do
+  {
+    try
+    {
+      std::vector<int> B0_flat(GF * logGF);
+      std::vector<int> B1_flat(GF * logGF);
+      for (int d = 0; d < GF; ++d)
+      {
+        for (int l = 0; l < logGF; ++l)
+        {
+          B0_flat[d * logGF + l] = BINGF0[d][l];
+          B1_flat[d * logGF + l] = BINGF1[d][l];
+        }
+      }
+
+      std::vector<double> host_result(GF * GF, 1.0);
+
+      double *d_out = nullptr;
+      int *d_B0 = nullptr;
+      int *d_B1 = nullptr;
+      auto cleanup = [&]()
+      {
+        if (d_out)
+          cudaFree(d_out);
+        if (d_B0)
+          cudaFree(d_B0);
+        if (d_B1)
+          cudaFree(d_B1);
+        d_out = nullptr;
+        d_B0 = nullptr;
+        d_B1 = nullptr;
+      };
+
+      const size_t matrix_bytes = sizeof(double) * host_result.size();
+      const size_t gf_bytes = sizeof(int) * B0_flat.size();
+
+      if (cudaMalloc(&d_out, matrix_bytes) != cudaSuccess)
+      {
+        gpu_error = "cudaMalloc failed for output matrix";
+        cleanup();
+        break;
+      }
+      if (cudaMalloc(&d_B0, gf_bytes) != cudaSuccess)
+      {
+        gpu_error = "cudaMalloc failed for B0";
+        cleanup();
+        break;
+      }
+      if (cudaMalloc(&d_B1, gf_bytes) != cudaSuccess)
+      {
+        gpu_error = "cudaMalloc failed for B1";
+        cleanup();
+        break;
+      }
+
+      if (cudaMemcpy(d_B0, B0_flat.data(), gf_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+      {
+        gpu_error = "cudaMemcpy failed for B0";
+        cleanup();
+        break;
+      }
+      if (cudaMemcpy(d_B1, B1_flat.data(), gf_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+      {
+        gpu_error = "cudaMemcpy failed for B1";
+        cleanup();
+        break;
+      }
+
+      dim3 block(16, 16);
+      dim3 grid((GF + block.x - 1) / block.x, (GF + block.y - 1) / block.y);
+      cuda_kernels::VNtoChNKernel<<<grid, block>>>(d_out, d_B0, d_B1, GF, logGF, pD);
+      if (cudaGetLastError() != cudaSuccess)
+      {
+        gpu_error = "Kernel launch failed";
+        cleanup();
+        break;
+      }
+      if (cudaDeviceSynchronize() != cudaSuccess)
+      {
+        gpu_error = "Kernel execution failed";
+        cleanup();
+        break;
+      }
+
+      if (cudaMemcpy(host_result.data(), d_out, matrix_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+      {
+        gpu_error = "cudaMemcpy failed for output";
+        cleanup();
+        break;
+      }
+
+      cleanup();
+
+      for (int d = 0; d < GF; ++d)
+      {
+        for (int e = 0; e < GF; ++e)
+        {
+          f_VNtoChN_eigen(d, e) = host_result[d * GF + e];
+        }
+      }
+
+      gpu_success = true;
+      if (!reported_cuda_success)
+      {
+        std::cout << "VNtoChN_init executed CUDA kernel path." << std::endl;
+        reported_cuda_success = true;
+      }
+    }
+    catch (const std::exception &ex)
+    {
+      gpu_error = ex.what();
+    }
+  } while (false);
+
+  if (!gpu_success)
+  {
+    if (!gpu_error.empty())
+    {
+      std::cerr << "VNtoChN_init GPU path failed: " << gpu_error
+                << ". Falling back to CPU implementation." << std::endl;
+    }
+    cpu_compute();
   }
-}
-cout << "*** VNtoChN_init" << endl;
+#else
+  cpu_compute();
+#endif
+
+  cout << "*** VNtoChN_init" << endl;
 }
 // Function: normalize
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void normalize(vector<double>& input, int n){
-  double sum=0;for(size_t i=0;i<n;i++){sum+=input[i];}
-  // Conditional branch.
-  if(sum==0){
-    cout << "divided by zero" << endl;
-    // Loop: iterate over a range/collection.
-    for(size_t i=0;i<n;i++){input[i]=1.0f/n;}
-    return;
-  }else
-  // Loop: iterate over a range/collection.
-  for(size_t i=0;i<n;i++){input[i]/=sum;}
+namespace
+{
+  template <typename T>
+  void normalize_buffer(T *input, int n)
+  {
+    T sum = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+      sum += input[i];
+    }
+    if (sum == 0.0)
+    {
+      cout << "divided by zero" << endl;
+      const T uniform = static_cast<T>(1.0) / static_cast<T>(n);
+      for (int i = 0; i < n; ++i)
+      {
+        input[i] = uniform;
+      }
+      return;
+    }
+    const T inv = static_cast<T>(1.0) / sum;
+    for (int i = 0; i < n; ++i)
+    {
+      input[i] *= inv;
+    }
+  }
+} // namespace
+
+void normalize(vector<double> &input, int n)
+{
+  normalize_buffer(input.data(), n);
+}
+
+void normalize(vector<float> &input, int n)
+{
+  normalize_buffer(input.data(), n);
+}
+
+void normalize(FlatMatrix::RowProxy row, int n)
+{
+  normalize_buffer(row.data(), n);
 }
 // Function: log2
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int log2(int x){
-  return log((double)x)/log(2.0);
+int log2(int x)
+{
+  return log((double)x) / log(2.0);
 }
 // Function: h2
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-double h2(double x){ return -x*std::log2(x) - (1.0 - x)*std::log2(1.0 - x); }
+double h2(double x) { return -x * std::log2(x) - (1.0 - x) * std::log2(1.0 - x); }
 // Function: Bin2GF
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int Bin2GF(vector<int>& U,int GF,int logGF,vector<vector<int>>& BINGF){
+int Bin2GF(vector<int> &U, int GF, int logGF, vector<vector<int>> &BINGF)
+{
   // Loop: iterate over a range/collection.
-  for(size_t k=0;k<GF;k++){
-    bool mtc=true;
+  for (size_t k = 0; k < GF; k++)
+  {
+    bool mtc = true;
     // Loop: iterate over a range/collection.
-    for(size_t j=0;j<logGF;j++){if(U[j]!=BINGF[k][j]){mtc=false;break;}}
+    for (size_t j = 0; j < logGF; j++)
+    {
+      if (U[j] != BINGF[k][j])
+      {
+        mtc = false;
+        break;
+      }
+    }
     // Conditional branch.
-    if(mtc)return(k);
+    if (mtc)
+      return (k);
   }
   return -1;
 }
 // Function: GF2GF
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int GF2GF(int g,int GF,int logGF,vector<vector<int>>& BINGF0,vector<vector<int>>& BINGF1){
+int GF2GF(int g, int GF, int logGF, vector<vector<int>> &BINGF0, vector<vector<int>> &BINGF1)
+{
 
-  return Bin2GF(BINGF0[g],GF,logGF,BINGF1);
+  return Bin2GF(BINGF0[g], GF, logGF, BINGF1);
 }
-
 // Function: ComputeAPP
 // Purpose: TODO - describe the function's responsibility succinctly.
-void ComputeAPP(std::vector<std::vector<double>> &APP,
-std::vector<std::vector<double>> &ChNtoVN,
-const std::vector<std::vector<double>> &CNtoVNxxx,
-const std::vector<std::vector<double>> &VNtoChN,
-const std::vector<int> &Interleaver,
-const std::vector<int> &ColDeg,
-int N, int GF) {
-  int numB = 0;
-  // Loop: iterate over a range/collection.
-  for (int n = 0; n < N; ++n) {
-    // Loop: iterate over a range/collection.
-    for (int g = 0; g < GF; ++g) {
-      ChNtoVN[n][g] = 1.0;
-      // Loop: iterate over a range/collection.
-      for (int t = numB; t < numB + ColDeg[n]; ++t) {
-        ChNtoVN[n][g] *= CNtoVNxxx[Interleaver[t]][g];
-      }
-      APP[n][g] = ChNtoVN[n][g] * VNtoChN[n][g];
-    }
-    numB += ColDeg[n];
-  }
-}
 
+void ComputeAPP(FlatMatrix &APP,
+                FlatMatrix &ChNtoVN,
+                FlatMatrix &CNtoVNxxx,
+                FlatMatrix &VNtoChN,
+                const std::vector<int> &Interleaver,
+                const std::vector<int> &ColDeg,
+                int N,
+                int GF)
+{
+  ScopedTimer timer("ComputeAPP");
+  auto cpu_impl = [&]()
+  {
+    int numB = 0;
+    for (int n = 0; n < N; ++n)
+    {
+      for (int g = 0; g < GF; ++g)
+      {
+        ChNtoVN[n][g] = 1.0;
+        for (int t = numB; t < numB + ColDeg[n]; ++t)
+        {
+          ChNtoVN[n][g] *= CNtoVNxxx[Interleaver[t]][g];
+        }
+        APP[n][g] = ChNtoVN[n][g] * VNtoChN[n][g];
+      }
+      numB += ColDeg[n];
+    }
+#if GD_CSS_ENABLE_CUDA
+    ChNtoVN.markDeviceDataInvalid();
+    APP.markDeviceDataInvalid();
+#endif
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do
+  {
+    if (N <= 0 || GF <= 0)
+    {
+      break;
+    }
+    if (ColDeg.size() < static_cast<size_t>(N))
+    {
+      gpu_error = "ComputeAPP GPU path received insufficient column degrees";
+      break;
+    }
+
+    vector<int> nodeBase(std::max(N, 0));
+    int prefix = 0;
+    for (int n = 0; n < N; ++n)
+    {
+      nodeBase[n] = prefix;
+      prefix += ColDeg[n];
+    }
+    const size_t totalEdges = static_cast<size_t>(prefix);
+    if (Interleaver.size() < totalEdges)
+    {
+      gpu_error = "ComputeAPP GPU path received insufficient interleaver entries";
+      break;
+    }
+    if (CNtoVNxxx.rows() < totalEdges ||
+        CNtoVNxxx.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "ComputeAPP GPU path received undersized CNtoVN buffer";
+      break;
+    }
+    if (ChNtoVN.rows() < static_cast<size_t>(N) ||
+        ChNtoVN.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "ComputeAPP GPU path received undersized ChNtoVN buffer";
+      break;
+    }
+    if (APP.rows() < static_cast<size_t>(N) ||
+        APP.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "ComputeAPP GPU path received undersized APP buffer";
+      break;
+    }
+    if (VNtoChN.rows() < static_cast<size_t>(N) ||
+        VNtoChN.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "ComputeAPP GPU path received undersized VNtoChN buffer";
+      break;
+    }
+
+    DataPassMetadataKey metadata_key{static_cast<const void *>(&Interleaver),
+                                     static_cast<const void *>(&ColDeg)};
+    DataPassConstantSet &constant_set = g_datapass_constant_cache[metadata_key];
+
+    const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+    const size_t nodeBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) * sizeof(double);
+
+    double *d_CNtoVN = nullptr;
+    double *d_VNtoCh = nullptr;
+    double *d_ChNtoVN = nullptr;
+    double *d_APP = nullptr;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
+    cudaError_t status = cudaSuccess;
+
+    auto cleanup = [&]()
+    {
+      if (kernelStart)
+        cudaEventDestroy(kernelStart);
+      if (kernelEnd)
+        cudaEventDestroy(kernelEnd);
+      kernelStart = nullptr;
+      kernelEnd = nullptr;
+    };
+
+    auto timedMemcpy = [&](void *dst,
+                           const void *src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char *failure,
+                           double &accumulator) -> bool
+    {
+      if (bytes == 0)
+      {
+        return true;
+      }
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess)
+      {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
+
+    auto ensureMatrixInput = [&](FlatMatrix &matrix,
+                                 size_t bytes,
+                                 const char *failure) -> double *
+    {
+      if (bytes == 0)
+      {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error))
+      {
+        cleanup();
+        return nullptr;
+      }
+      double *ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData())
+      {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms))
+        {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
+    };
+
+    auto prepareMatrixOutput = [&](FlatMatrix &matrix,
+                                   size_t bytes,
+                                   const char *label) -> double *
+    {
+      if (bytes == 0)
+      {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error))
+      {
+        cleanup();
+        return nullptr;
+      }
+      matrix.markDeviceDataInvalid();
+      double *ptr = matrix.cuda_device_storage();
+      if (!ptr)
+      {
+        gpu_error = label;
+        cleanup();
+      }
+      return ptr;
+    };
+
+    if (!EnsureDeviceArray(constant_set.interleaver,
+                           totalEdges,
+                           status,
+                           "ComputeAPP interleaver",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.columnDegree,
+                           N,
+                           status,
+                           "ComputeAPP columnDegree",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.nodeBase,
+                           N,
+                           status,
+                           "ComputeAPP nodeBase",
+                           gpu_error))
+    {
+      cleanup();
+      break;
+    }
+
+    auto copyVector = [&](DeviceArray<int> &buffer,
+                          const vector<int> &host,
+                          const char *failure) -> bool
+    {
+      if (buffer.size == 0 || !buffer.dirty)
+      {
+        return true;
+      }
+      if (host.size() < buffer.size)
+      {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      if (!timedMemcpy(buffer.ptr,
+                       host.data(),
+                       buffer.size * sizeof(int),
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms))
+      {
+        return false;
+      }
+      buffer.dirty = false;
+      return true;
+    };
+
+    if (!copyVector(constant_set.interleaver,
+                    Interleaver,
+                    "cudaMemcpy failed for ComputeAPP interleaver") ||
+        !copyVector(constant_set.columnDegree,
+                    ColDeg,
+                    "cudaMemcpy failed for ComputeAPP column degrees") ||
+        !copyVector(constant_set.nodeBase,
+                    nodeBase,
+                    "cudaMemcpy failed for ComputeAPP node base"))
+    {
+      break;
+    }
+
+    if (matrixBytes > 0)
+    {
+      d_CNtoVN = ensureMatrixInput(CNtoVNxxx,
+                                   matrixBytes,
+                                   "cudaMemcpy failed for ComputeAPP CNtoVN");
+      if (!d_CNtoVN)
+      {
+        break;
+      }
+    }
+    d_VNtoCh = ensureMatrixInput(VNtoChN,
+                                 nodeBytes,
+                                 "cudaMemcpy failed for ComputeAPP VNtoChN");
+    if (!d_VNtoCh && nodeBytes > 0)
+    {
+      break;
+    }
+    d_ChNtoVN = prepareMatrixOutput(ChNtoVN,
+                                    nodeBytes,
+                                    "ComputeAPP ChNtoVN device storage unavailable");
+    if (!d_ChNtoVN && nodeBytes > 0)
+    {
+      break;
+    }
+    d_APP = prepareMatrixOutput(APP,
+                                nodeBytes,
+                                "ComputeAPP APP device storage unavailable");
+    if (!d_APP && nodeBytes > 0)
+    {
+      break;
+    }
+
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for ComputeAPP kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for ComputeAPP kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for ComputeAPP kernelStart";
+      cleanup();
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    int grid_x = std::min(N, 65535);
+    if (grid_x == 0)
+    {
+      grid_x = 1;
+    }
+    int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+    grid_y = std::min(grid_y, 65535);
+    dim3 grid(grid_x, grid_y);
+    dim3 block(threads);
+
+    cuda_kernels::ComputeAPPKernel<<<grid, block>>>(
+        d_APP,
+        d_ChNtoVN,
+        d_CNtoVN,
+        d_VNtoCh,
+        constant_set.interleaver.ptr,
+        constant_set.columnDegree.ptr,
+        constant_set.nodeBase.ptr,
+        N,
+        GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for ComputeAPP kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ComputeAPP CUDA kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaEventSynchronize(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ComputeAPP CUDA kernel execution failed";
+      cleanup();
+      break;
+    }
+
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess)
+    {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    ChNtoVN.markDeviceDataValid();
+    APP.markDeviceDataValid();
+
+    cleanup();
+
+    if (g_enable_timing_output)
+    {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "ComputeAPP CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success)
+    {
+      std::cout << "ComputeAPP executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success)
+  {
+    return;
+  }
+  if (!gpu_error.empty() && !reported_cuda_failure)
+  {
+    std::cerr << "ComputeAPP GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  cpu_impl();
+}
 // Function: computeUnion
 // Purpose: TODO - describe the function's responsibility succinctly.
-std::vector<int> computeUnion(const std::vector<std::vector<int>>& Updated_EstmNoise_History) {
+
+std::vector<int> computeUnion(const std::vector<std::vector<int>> &Updated_EstmNoise_History)
+{
 
   std::set<int> unionSet;
 
   // Loop: iterate over a range/collection.
-  for (const auto& vec : Updated_EstmNoise_History) {
+  for (const auto &vec : Updated_EstmNoise_History)
+  {
 
     unionSet.insert(vec.begin(), vec.end());
   }
@@ -367,24 +2440,142 @@ std::vector<int> computeUnion(const std::vector<std::vector<int>>& Updated_EstmN
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void Decision(std::vector<int> &Decision,
-std::vector<int> &Updated_EstmNoise_History,
-const std::vector<std::vector<double>> &APP,
-int N, int GF) {
+              std::vector<int> &Updated_EstmNoise_History,
+              const FlatMatrix &APP,
+              int N,
+              int GF)
+{
+  ScopedTimer timer("Decision");
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do
+  {
+    if (N <= 0 || GF <= 0)
+    {
+      break;
+    }
+    if (APP.rows() < static_cast<size_t>(N) ||
+        APP.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "Decision GPU path received undersized APP buffer";
+      break;
+    }
+
+    cudaError_t status = cudaSuccess;
+    const size_t appBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) *
+                            sizeof(double);
+
+    if (!const_cast<FlatMatrix &>(APP)
+             .ensureCudaDeviceStorage(appBytes, &gpu_error))
+    {
+      break;
+    }
+    if (!APP.hasValidDeviceData())
+    {
+      if (!const_cast<FlatMatrix &>(APP).copyHostToDevice(appBytes, &gpu_error))
+      {
+        break;
+      }
+    }
+
+    if (!EnsureDeviceArray(g_decision_buffer,
+                           static_cast<size_t>(N),
+                           status,
+                           "Decision output",
+                           gpu_error))
+    {
+      break;
+    }
+
+    const double *d_APP = APP.cuda_device_storage();
+    if (!d_APP)
+    {
+      gpu_error = "Decision APP device pointer unavailable";
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    const int blocks = (N + threads - 1) / threads;
+
+    cuda_kernels::DecisionKernel<<<blocks, threads>>>(
+        d_APP, g_decision_buffer.ptr, N, GF);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "Decision CUDA kernel launch failed";
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "Decision CUDA kernel execution failed";
+      break;
+    }
+
+    std::vector<int> newDecision(static_cast<size_t>(N));
+    status = cudaMemcpy(newDecision.data(),
+                        g_decision_buffer.ptr,
+                        static_cast<size_t>(N) * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaMemcpy failed for Decision output";
+      break;
+    }
+
+    Updated_EstmNoise_History.clear();
+    for (int n = 0; n < N; ++n)
+    {
+      if (Decision[n] != newDecision[n])
+      {
+        Updated_EstmNoise_History.push_back(n);
+      }
+      Decision[n] = newDecision[n];
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success)
+    {
+      std::cout << "Decision executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success)
+  {
+    return;
+  }
+  if (!gpu_error.empty() && !reported_cuda_failure)
+  {
+    std::cerr << "Decision GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
   Updated_EstmNoise_History.clear();
   // Loop: iterate over a range/collection.
-  for (int n = 0; n < N; ++n) {
+  for (int n = 0; n < N; ++n)
+  {
     int ind = 0;
     double max = APP[n][0];
     // Loop: iterate over a range/collection.
-    for (int g = 1; g < GF; ++g) {
+    for (int g = 1; g < GF; ++g)
+    {
       // Conditional branch.
-      if (APP[n][g] >= max) {
+      if (APP[n][g] >= max)
+      {
         max = APP[n][g];
         ind = g;
       }
     }
     // Conditional branch.
-    if (Decision[n] != ind) {
+    if (Decision[n] != ind)
+    {
       Updated_EstmNoise_History.push_back(n);
     }
     Decision[n] = ind;
@@ -393,351 +2584,1567 @@ int N, int GF) {
 // Function: ChannelPass_zero
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void ChannelPass_zero(vector<vector<double>>& VNtoChN, int N,int GF,int logGF,double f_m,vector<vector<int>>& BINGF){
-  vector<double> VNtoChN0(GF,1);
+void ChannelPass_zero(FlatMatrix &VNtoChN,
+                      int N,
+                      int GF,
+                      int logGF,
+                      double f_m,
+                      vector<vector<int>> &BINGF)
+{
+  if (VNtoChN.rows() != static_cast<size_t>(N) ||
+      VNtoChN.cols() != static_cast<size_t>(GF))
+  {
+    VNtoChN.resize(N, GF);
+  }
+  vector<double> VNtoChN0(GF, 1);
   // Loop: iterate over a range/collection.
-  for(size_t d=0;d<GF;d++){
+  for (size_t d = 0; d < GF; d++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t l=0;l<logGF;l++){
+    for (size_t l = 0; l < logGF; l++)
+    {
       // Conditional branch.
-      if(BINGF[d][l]==0)
-      VNtoChN0[d]*=1-f_m;
+      if (BINGF[d][l] == 0)
+        VNtoChN0[d] *= 1 - f_m;
       else
-      VNtoChN0[d]*=f_m;
+        VNtoChN0[d] *= f_m;
     }
   }
   // Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++){
+  for (size_t n = 0; n < N; n++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t g=0;g<GF;g++){
-      VNtoChN[n][g]=VNtoChN0[g];
+    for (size_t g = 0; g < GF; g++)
+    {
+      VNtoChN[n][g] = VNtoChN0[g];
     }
   }
+#if GD_CSS_ENABLE_CUDA
+  VNtoChN.markDeviceDataInvalid();
+#endif
 }
 // Function: ChannelPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void ChannelPass(vector<vector<double>>& VNtoChN, Eigen::MatrixXd& f_VNtoChN_eigen, vector<vector<double>>& ChNtoVN, int N, int GF){// Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++){
-    vector<double> input(GF);
-// Loop: iterate over a range/collection.
-    for(size_t g=0;g<GF;g++){input[g]=ChNtoVN[n][g];}
-    normalize(input,GF);
-    Eigen::VectorXd vec(GF),res(GF);
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){vec(e)=input[e];}
-    res=f_VNtoChN_eigen.transpose()*vec;
+void ChannelPass(FlatMatrix &VNtoChN,
+                 Eigen::MatrixXd &f_VNtoChN_eigen,
+                 FlatMatrix &ChNtoVN,
+                 int N,
+                 int GF)
+{
+  ScopedTimer timer("ChannelPass");
 
-    // Loop: iterate over a range/collection.
-    for(size_t e=0;e<GF;e++){VNtoChN[n][e]=res(e);}
-    normalize(VNtoChN[n],GF);
+  auto cpu_impl = [&]()
+  {
+    Eigen::MatrixXf f_VNtoChN_eigen_f = f_VNtoChN_eigen.cast<float>();
+    for (int n = 0; n < N; ++n)
+    {
+      vector<float> input(GF);
+      for (int g = 0; g < GF; ++g)
+      {
+        input[g] = static_cast<float>(ChNtoVN[n][g]);
+      }
+      normalize(input, GF);
+      Eigen::VectorXf vec(GF), res(GF);
+      for (int e = 0; e < GF; ++e)
+      {
+        vec(e) = input[e];
+      }
+      res = f_VNtoChN_eigen_f.transpose() * vec;
+      for (int e = 0; e < GF; ++e)
+      {
+        VNtoChN[n][e] = static_cast<double>(res(e));
+      }
+      normalize(VNtoChN[n], GF);
+    }
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN.markDeviceDataInvalid();
+#endif
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do
+  {
+    if (N <= 0 || GF <= 0)
+    {
+      break;
+    }
+    if (VNtoChN.rows() < static_cast<size_t>(N) ||
+        ChNtoVN.rows() < static_cast<size_t>(N))
+    {
+      gpu_error = "ChannelPass GPU path received inconsistent row counts";
+      break;
+    }
+    bool dimension_error = false;
+    for (int n = 0; n < N; ++n)
+    {
+      if (VNtoChN[n].size() < static_cast<size_t>(GF) ||
+          ChNtoVN[n].size() < static_cast<size_t>(GF))
+      {
+        dimension_error = true;
+        break;
+      }
+    }
+    if (dimension_error)
+    {
+      gpu_error = "ChannelPass GPU path received GF-dimension mismatch";
+      break;
+    }
+
+    vector<float> matrixFlat(static_cast<size_t>(GF) * GF);
+    for (int e = 0; e < GF; ++e)
+    {
+      for (int d = 0; d < GF; ++d)
+      {
+        matrixFlat[static_cast<size_t>(e) * GF + d] =
+            static_cast<float>(f_VNtoChN_eigen(e, d));
+      }
+    }
+
+    const size_t elementCount = static_cast<size_t>(N) * GF;
+    const size_t vectorBytesFloat = elementCount * sizeof(float);
+    const size_t vectorBytesDouble = elementCount * sizeof(double);
+
+    float *d_input = nullptr;
+    float *d_output = nullptr;
+    float *d_matrix = nullptr;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
+    auto cleanup = [&]()
+    {
+      if (d_input)
+        cudaFree(d_input);
+      d_input = nullptr;
+      if (d_output)
+        cudaFree(d_output);
+      d_output = nullptr;
+      if (d_matrix)
+        cudaFree(d_matrix);
+      d_matrix = nullptr;
+      if (kernelStart)
+      {
+        cudaEventDestroy(kernelStart);
+        kernelStart = nullptr;
+      }
+      if (kernelEnd)
+      {
+        cudaEventDestroy(kernelEnd);
+        kernelEnd = nullptr;
+      }
+    };
+
+    const size_t matrixBytes = matrixFlat.size() * sizeof(float);
+    cudaError_t status = cudaSuccess;
+
+    auto timedMemcpy = [&](void *dst,
+                           const void *src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char *failure,
+                           double &accumulator)
+    {
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess)
+      {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
+
+    if (!ChNtoVN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error) ||
+        !VNtoChN.ensureCudaDeviceStorage(vectorBytesDouble, &gpu_error))
+    {
+      cleanup();
+      break;
+    }
+
+    if (!ChNtoVN.hasValidDeviceData())
+    {
+      if (!timedMemcpy(ChNtoVN.cuda_device_storage(),
+                       ChNtoVN.data(),
+                       vectorBytesDouble,
+                       cudaMemcpyHostToDevice,
+                       "cudaMemcpy failed for ChannelPass input",
+                       transfer_to_device_ms))
+      {
+        break;
+      }
+      ChNtoVN.markDeviceDataValid();
+    }
+
+    status = cudaMalloc(&d_input, vectorBytesFloat);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaMalloc failed for ChannelPass input";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_output, vectorBytesFloat);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaMalloc failed for ChannelPass output";
+      cleanup();
+      break;
+    }
+    status = cudaMalloc(&d_matrix, matrixBytes);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaMalloc failed for ChannelPass matrix";
+      cleanup();
+      break;
+    }
+
+    const int cast_threads = 256;
+    const int cast_blocks =
+        static_cast<int>((elementCount + cast_threads - 1) / cast_threads);
+    cuda_kernels::CastDoubleToFloat<<<cast_blocks, cast_threads>>>(
+        ChNtoVN.cuda_device_storage(), d_input, elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass input cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass input cast kernel execution failed";
+      cleanup();
+      break;
+    }
+
+    if (!timedMemcpy(d_matrix,
+                     matrixFlat.data(),
+                     matrixBytes,
+                     cudaMemcpyHostToDevice,
+                     "cudaMemcpy failed for ChannelPass matrix",
+                     transfer_to_device_ms))
+    {
+      break;
+    }
+
+    int threads = 1;
+    while (threads < GF && threads < 1024)
+    {
+      threads <<= 1;
+    }
+    if (threads > 1024)
+    {
+      threads = 1024;
+    }
+    int grid_x = std::min(N, 65535);
+    if (grid_x == 0)
+    {
+      grid_x = 1;
+    }
+    int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+    grid_y = std::min(grid_y, 65535);
+    dim3 grid(grid_x, grid_y);
+    dim3 block(threads);
+    const size_t sharedBytes = sizeof(float) *
+                               (2 * static_cast<size_t>(GF) + block.x);
+
+    int device = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaGetDevice failed for ChannelPass";
+      cleanup();
+      break;
+    }
+    int maxSharedBytes = 0;
+    status = cudaDeviceGetAttribute(&maxSharedBytes,
+                                    cudaDevAttrMaxSharedMemoryPerBlock,
+                                    device);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaDeviceGetAttribute failed for ChannelPass";
+      cleanup();
+      break;
+    }
+    if (sharedBytes > static_cast<size_t>(maxSharedBytes))
+    {
+      gpu_error = "ChannelPass kernel requires more shared memory than available";
+      cleanup();
+      break;
+    }
+
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelStart";
+      cleanup();
+      break;
+    }
+
+    cuda_kernels::ChannelPassKernel<<<grid, block, sharedBytes>>>(
+        d_output, d_input, d_matrix, N, GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for ChannelPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaEventSynchronize(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass kernel execution failed";
+      cleanup();
+      break;
+    }
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess)
+    {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    cuda_kernels::CastFloatToDouble<<<cast_blocks, cast_threads>>>(
+        d_output, VNtoChN.cuda_device_storage(), elementCount);
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass output cast kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "ChannelPass output cast kernel execution failed";
+      cleanup();
+      break;
+    }
+
+    VNtoChN.markDeviceDataValid();
+
+    cleanup();
+
+    if (g_enable_timing_output)
+    {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "ChannelPass CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success)
+    {
+      std::cout << "ChannelPass executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (!gpu_success)
+  {
+    if (!gpu_error.empty() && !reported_cuda_failure)
+    {
+      std::cerr << "ChannelPass GPU path failed: " << gpu_error
+                << ". Falling back to CPU implementation." << std::endl;
+      reported_cuda_failure = true;
+    }
   }
+  else
+  {
+    return;
+  }
+#endif
+
+  cpu_impl();
 }
 // Function: DataPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void DataPass(vector<vector<double>>& VNtoCNxxx,vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoChN,vector<int>& Interleaver,vector<int>& ColumnDegree,int N,int GF){
+void DataPass(FlatMatrix &VNtoCNxxx,
+              FlatMatrix &CNtoVNxxx,
+              FlatMatrix &VNtoChN,
+              vector<int> &Interleaver,
+              vector<int> &ColumnDegree,
+              int N,
+              int GF)
+{
+  ScopedTimer timer("DataPass");
 
-  int numB=0;
-  // Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++){
-    // Loop: iterate over a range/collection.
-    for(size_t t=0;t<ColumnDegree[n];t++){
-      int numBint=Interleaver[numB+t];
-      // Loop: iterate over a range/collection.
-      for(size_t g=0;g<GF;g++) VNtoCNxxx[numBint][g]=VNtoChN[n][g];
-      // Loop: iterate over a range/collection.
-      for(size_t tz=0;tz<ColumnDegree[n];tz++){
-        // Conditional branch.
-        if (tz!=t)
-        // Loop: iterate over a range/collection.
-        for(size_t g=0;g<GF;g++)
-        VNtoCNxxx[numBint][g]*=CNtoVNxxx[Interleaver[numB+tz]][g];
+  auto cpu_impl = [&]()
+  {
+    int numB = 0;
+    for (int n = 0; n < N; ++n)
+    {
+      const int degree = ColumnDegree[n];
+      for (int t = 0; t < degree; ++t)
+      {
+        const int edgeIndex = Interleaver[numB + t];
+        auto outRow = VNtoCNxxx[edgeIndex];
+        const auto channelRow = VNtoChN[n];
+        for (int g = 0; g < GF; ++g)
+        {
+          outRow[g] = channelRow[g];
+        }
+        for (int tz = 0; tz < degree; ++tz)
+        {
+          if (tz == t)
+          {
+            continue;
+          }
+          const int otherEdge = Interleaver[numB + tz];
+          const auto otherRow = CNtoVNxxx[otherEdge];
+          for (int g = 0; g < GF; ++g)
+          {
+            outRow[g] *= otherRow[g];
+          }
+        }
+        normalize(outRow, GF);
       }
-      normalize(VNtoCNxxx[numBint],GF);
+      numB += degree;
     }
-    numB+=ColumnDegree[n];
+#if GD_CSS_ENABLE_CUDA
+    VNtoCNxxx.markDeviceDataInvalid();
+#endif
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+
+  do
+  {
+    if (N <= 0 || GF <= 0)
+    {
+      gpu_success = true;
+      break;
+    }
+    if (ColumnDegree.size() < static_cast<size_t>(N))
+    {
+      gpu_error = "DataPass GPU path received insufficient ColumnDegree entries";
+      break;
+    }
+
+    vector<int> nodeBase(max(N, 0));
+    int prefix = 0;
+    for (int n = 0; n < N; ++n)
+    {
+      nodeBase[n] = prefix;
+      prefix += ColumnDegree[n];
+    }
+    const size_t totalEdges = static_cast<size_t>(prefix);
+    if (totalEdges == 0)
+    {
+      gpu_success = true;
+      break;
+    }
+    if (Interleaver.size() < totalEdges)
+    {
+      gpu_error = "DataPass GPU path received insufficient interleaver entries";
+      break;
+    }
+    if (VNtoCNxxx.rows() < totalEdges || VNtoCNxxx.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "DataPass GPU path received undersized VNtoCN buffer";
+      break;
+    }
+    if (CNtoVNxxx.rows() < totalEdges || CNtoVNxxx.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "DataPass GPU path received undersized CNtoVN buffer";
+      break;
+    }
+    if (VNtoChN.rows() < static_cast<size_t>(N) ||
+        VNtoChN.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "DataPass GPU path received undersized VNtoChN buffer";
+      break;
+    }
+
+    DataPassMetadataKey metadata_key{static_cast<const void *>(&Interleaver),
+                                     static_cast<const void *>(&ColumnDegree)};
+    DataPassConstantSet &constant_set = g_datapass_constant_cache[metadata_key];
+
+    const size_t matrixBytes = totalEdges * static_cast<size_t>(GF) * sizeof(double);
+    const size_t channelBytes = static_cast<size_t>(N) * static_cast<size_t>(GF) *
+                                sizeof(double);
+
+    cudaError_t status = cudaSuccess;
+    double transfer_to_device_ms = 0.0;
+    double transfer_to_host_ms = 0.0;
+    double kernel_ms = 0.0;
+    cudaEvent_t kernelStart = nullptr;
+    cudaEvent_t kernelEnd = nullptr;
+
+    auto cleanup = [&]()
+    {
+      if (kernelStart)
+        cudaEventDestroy(kernelStart);
+      if (kernelEnd)
+        cudaEventDestroy(kernelEnd);
+    };
+
+    auto timedMemcpy = [&](void *dst,
+                           const void *src,
+                           size_t bytes,
+                           cudaMemcpyKind kind,
+                           const char *failure,
+                           double &accumulator) -> bool
+    {
+      if (bytes == 0)
+      {
+        return true;
+      }
+      auto start = std::chrono::steady_clock::now();
+      status = cudaMemcpy(dst, src, bytes, kind);
+      auto end = std::chrono::steady_clock::now();
+      accumulator +=
+          std::chrono::duration<double, std::milli>(end - start).count();
+      if (status != cudaSuccess)
+      {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      return true;
+    };
+
+    auto ensureMatrixInput = [&](FlatMatrix &matrix,
+                                 size_t bytes,
+                                 const char *failure) -> double *
+    {
+      if (bytes == 0)
+      {
+        return nullptr;
+      }
+      if (!matrix.ensureCudaDeviceStorage(bytes, &gpu_error))
+      {
+        cleanup();
+        return nullptr;
+      }
+      double *ptr = matrix.cuda_device_storage();
+      if (!matrix.hasValidDeviceData())
+      {
+        if (!timedMemcpy(ptr,
+                         matrix.data(),
+                         bytes,
+                         cudaMemcpyHostToDevice,
+                         failure,
+                         transfer_to_device_ms))
+        {
+          return nullptr;
+        }
+        matrix.markDeviceDataValid();
+      }
+      return ptr;
+    };
+
+    if (!VNtoCNxxx.ensureCudaDeviceStorage(matrixBytes, &gpu_error) ||
+        !CNtoVNxxx.ensureCudaDeviceStorage(matrixBytes, &gpu_error) ||
+        !VNtoChN.ensureCudaDeviceStorage(channelBytes, &gpu_error))
+    {
+      cleanup();
+      break;
+    }
+
+    if (!EnsureDeviceArray(constant_set.interleaver,
+                           totalEdges,
+                           status,
+                           "DataPass interleaver",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.columnDegree,
+                           N,
+                           status,
+                           "DataPass columnDegree",
+                           gpu_error) ||
+        !EnsureDeviceArray(constant_set.nodeBase,
+                           N,
+                           status,
+                           "DataPass nodeBase",
+                           gpu_error))
+    {
+      cleanup();
+      break;
+    }
+
+    auto copyVector = [&](DeviceArray<int> &buffer,
+                          const vector<int> &host,
+                          const char *failure) -> bool
+    {
+      if (buffer.size == 0 || !buffer.dirty)
+      {
+        return true;
+      }
+      if (host.size() < buffer.size)
+      {
+        gpu_error = failure;
+        cleanup();
+        return false;
+      }
+      if (!timedMemcpy(buffer.ptr,
+                       host.data(),
+                       buffer.size * sizeof(int),
+                       cudaMemcpyHostToDevice,
+                       failure,
+                       transfer_to_device_ms))
+      {
+        return false;
+      }
+      buffer.dirty = false;
+      return true;
+    };
+
+    if (!copyVector(constant_set.interleaver,
+                    Interleaver,
+                    "cudaMemcpy failed for DataPass interleaver") ||
+        !copyVector(constant_set.columnDegree,
+                    ColumnDegree,
+                    "cudaMemcpy failed for DataPass column degrees") ||
+        !copyVector(constant_set.nodeBase,
+                    nodeBase,
+                    "cudaMemcpy failed for DataPass node base"))
+    {
+      break;
+    }
+
+    double *d_VNtoCN = VNtoCNxxx.cuda_device_storage();
+    double *d_CNtoVN = ensureMatrixInput(CNtoVNxxx,
+                                         matrixBytes,
+                                         "cudaMemcpy failed for DataPass CNtoVN");
+    double *d_VNtoCh = ensureMatrixInput(VNtoChN,
+                                         channelBytes,
+                                         "cudaMemcpy failed for DataPass VNtoChN");
+    if ((!d_CNtoVN && matrixBytes > 0) || (!d_VNtoCh && channelBytes > 0))
+    {
+      break;
+    }
+
+    int device = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaGetDevice failed for DataPass";
+      cleanup();
+      break;
+    }
+
+    int maxSharedBytes = 0;
+    status = cudaDeviceGetAttribute(&maxSharedBytes,
+                                    cudaDevAttrMaxSharedMemoryPerBlock,
+                                    device);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaDeviceGetAttribute failed for DataPass";
+      cleanup();
+      break;
+    }
+
+    const int threads = std::min(256, std::max(1, GF));
+    int grid_x = std::min(N, 65535);
+    if (grid_x == 0)
+    {
+      grid_x = 1;
+    }
+    int grid_y = std::max(1, (N + grid_x - 1) / grid_x);
+    grid_y = std::min(grid_y, 65535);
+    dim3 grid(grid_x, grid_y);
+    dim3 block(threads);
+
+    const size_t sharedBytes = sizeof(double) *
+                               (static_cast<size_t>(GF) + block.x);
+    if (sharedBytes > static_cast<size_t>(maxSharedBytes))
+    {
+      gpu_error = "DataPass kernel requires more shared memory than available";
+      cleanup();
+      break;
+    }
+
+    status = cudaEventCreate(&kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for DataPass kernelStart";
+      cleanup();
+      break;
+    }
+    status = cudaEventCreate(&kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventCreate failed for DataPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaEventRecord(kernelStart);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for DataPass kernelStart";
+      cleanup();
+      break;
+    }
+
+    cuda_kernels::DataPassKernel<<<grid, block, sharedBytes>>>(
+        d_VNtoCN,
+        d_CNtoVN,
+        d_VNtoCh,
+        constant_set.interleaver.ptr,
+        constant_set.columnDegree.ptr,
+        constant_set.nodeBase.ptr,
+        N,
+        GF);
+
+    status = cudaEventRecord(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaEventRecord failed for DataPass kernelEnd";
+      cleanup();
+      break;
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "DataPass CUDA kernel launch failed";
+      cleanup();
+      break;
+    }
+    status = cudaEventSynchronize(kernelEnd);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "DataPass CUDA kernel execution failed";
+      cleanup();
+      break;
+    }
+
+    float kernel_ms_f = 0.0f;
+    status = cudaEventElapsedTime(&kernel_ms_f, kernelStart, kernelEnd);
+    if (status == cudaSuccess)
+    {
+      kernel_ms = static_cast<double>(kernel_ms_f);
+    }
+
+    VNtoCNxxx.markDeviceDataValid();
+
+    cleanup();
+
+    if (g_enable_timing_output)
+    {
+      std::streamsize previous_precision = std::cout.precision();
+      std::ios::fmtflags previous_flags = std::cout.flags();
+      std::cout << std::fixed << std::setprecision(3)
+                << "DataPass CUDA timing (H2D: " << transfer_to_device_ms
+                << " ms, kernel: " << kernel_ms
+                << " ms, D2H: " << transfer_to_host_ms
+                << " ms, total transfer: "
+                << (transfer_to_device_ms + transfer_to_host_ms) << " ms)"
+                << std::endl;
+      std::cout.precision(previous_precision);
+      std::cout.flags(previous_flags);
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success)
+    {
+      std::cout << "DataPass executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success)
+  {
+    return;
   }
+  if (!gpu_error.empty() && !reported_cuda_failure)
+  {
+    std::cerr << "DataPass GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  cpu_impl();
 }
 // Function: CheckPass
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void CheckPass(vector<vector<double>>& CNtoVNxxx,vector<vector<double>>& VNtoCNxxx,vector<vector<int>>& MatValue,int M,vector<int>& RowDegree,vector<vector<int>>& MULGF,vector<vector<int>>& DIVGF,vector<vector<int>>& FFTSQ,int GF,vector<int>& TrueNoiseSynd){
+void CheckPass(FlatMatrix &CNtoVNxxx,
+               FlatMatrix &VNtoCNxxx,
+               vector<vector<int>> &MatValue,
+               int M,
+               vector<int> &RowDegree,
+               vector<vector<int>> &MULGF,
+               vector<vector<int>> &DIVGF,
+               vector<vector<int>> &FFTSQ,
+               int GF,
+               vector<int> &TrueNoiseSynd)
+{
+  ScopedTimer timer("CheckPass");
+  int logGF = rint(log2(GF) / log2(2));
 
-  int           tz,t,k,m,g,numB;
-  int           logGF;
-  vector<double> TMP;
-  double  Afft,Bfft,buff;
-  TMP=vector<double>(GF,0);
-  vector<double> F_TrueNoiseSynd(GF,0);
-  numB=0;
-  logGF=rint(log2(GF)/log2(2));
-  // Loop: iterate over a range/collection.
-  for(size_t m=0;m<M;m++){
-
-    // Loop: iterate over a range/collection.
-    for(g=0;g<GF;g++){F_TrueNoiseSynd[g]=0;}F_TrueNoiseSynd[TrueNoiseSynd[m]]=1;
-    // Loop: iterate over a range/collection.
-    for(k=0;k<logGF*GF/2;k++){
-      Afft=F_TrueNoiseSynd[FFTSQ[k][0]];      Bfft=F_TrueNoiseSynd[FFTSQ[k][1]];
-      F_TrueNoiseSynd[FFTSQ[k][0]]=Afft+Bfft; F_TrueNoiseSynd[FFTSQ[k][1]]=Afft-Bfft;
-    }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++){
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) TMP[g]=VNtoCNxxx[numB+t][DIVGF[g][MatValue[m][t]]];
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) VNtoCNxxx[numB+t][g]=TMP[g];
-      // Loop: iterate over a range/collection.
-      for(k=0;k<logGF*GF/2;k++){
-        Afft=VNtoCNxxx[numB+t][FFTSQ[k][0]];
-        Bfft=VNtoCNxxx[numB+t][FFTSQ[k][1]];
-        VNtoCNxxx[numB+t][FFTSQ[k][0]]=Afft+Bfft;
-        VNtoCNxxx[numB+t][FFTSQ[k][1]]=Afft-Bfft;
-      }
-    }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++)	{
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++){CNtoVNxxx[numB+t][g]=F_TrueNoiseSynd[g];}
-      // Loop: iterate over a range/collection.
-      for(tz=0;tz<RowDegree[m];tz++){if(tz!=t){for(g=0;g<GF;g++){CNtoVNxxx[numB+t][g]*=VNtoCNxxx[numB+tz][g];}}}
-    }
-
-    // Loop: iterate over a range/collection.
-    for(t=0;t<RowDegree[m];t++){
-      // Loop: iterate over a range/collection.
-      for(k=0;k<(logGF*GF/2);k++){
-        Afft=CNtoVNxxx[numB+t][FFTSQ[k][0]];
-        Bfft=CNtoVNxxx[numB+t][FFTSQ[k][1]];
-        CNtoVNxxx[numB+t][FFTSQ[k][0]]=0.5f*(Afft+Bfft);
-        CNtoVNxxx[numB+t][FFTSQ[k][1]]=0.5f*(Afft-Bfft);
-      }
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) TMP[g]=CNtoVNxxx[numB+t][MULGF[MatValue[m][t]][g]];
-      // Loop: iterate over a range/collection.
-      for(g=0;g<GF;g++) CNtoVNxxx[numB+t][g]=std::max(TMP[g], 0.0);
-      normalize(CNtoVNxxx[numB+t],GF);
-    }
-    numB+=RowDegree[m];
+  vector<int> rowBase(M + 1, 0);
+  for (int m = 1; m <= M; m++)
+  {
+    rowBase[m] = rowBase[m - 1] + RowDegree[m - 1];
   }
+
+  auto cpu_impl = [&]()
+  {
+    for (int m = 0; m < M; m++)
+    {
+      int base = rowBase[m];
+      vector<double> TMP(GF, 0.0);
+      vector<double> F_TrueNoiseSynd(GF, 0.0);
+
+      F_TrueNoiseSynd[TrueNoiseSynd[m]] = 1.0;
+
+      for (int k = 0; k < logGF * GF / 2; k++)
+      {
+        double A = F_TrueNoiseSynd[FFTSQ[k][0]];
+        double B = F_TrueNoiseSynd[FFTSQ[k][1]];
+        F_TrueNoiseSynd[FFTSQ[k][0]] = A + B;
+        F_TrueNoiseSynd[FFTSQ[k][1]] = A - B;
+      }
+
+      for (int t = 0; t < RowDegree[m]; t++)
+      {
+        for (int g = 0; g < GF; g++)
+        {
+          TMP[g] = VNtoCNxxx[base + t][DIVGF[g][MatValue[m][t]]];
+        }
+        for (int g = 0; g < GF; g++)
+        {
+          VNtoCNxxx[base + t][g] = TMP[g];
+        }
+
+        for (int k = 0; k < logGF * GF / 2; k++)
+        {
+          double A = VNtoCNxxx[base + t][FFTSQ[k][0]];
+          double B = VNtoCNxxx[base + t][FFTSQ[k][1]];
+          VNtoCNxxx[base + t][FFTSQ[k][0]] = A + B;
+          VNtoCNxxx[base + t][FFTSQ[k][1]] = A - B;
+        }
+      }
+
+      for (int t = 0; t < RowDegree[m]; t++)
+      {
+        for (int g = 0; g < GF; g++)
+        {
+          CNtoVNxxx[base + t][g] = F_TrueNoiseSynd[g];
+        }
+
+        for (int tz = 0; tz < RowDegree[m]; tz++)
+        {
+          if (tz == t)
+            continue;
+          for (int g = 0; g < GF; g++)
+          {
+            CNtoVNxxx[base + t][g] *= VNtoCNxxx[base + tz][g];
+          }
+        }
+      }
+
+      for (int t = 0; t < RowDegree[m]; t++)
+      {
+        for (int k = 0; k < logGF * GF / 2; k++)
+        {
+          double A = CNtoVNxxx[base + t][FFTSQ[k][0]];
+          double B = CNtoVNxxx[base + t][FFTSQ[k][1]];
+          CNtoVNxxx[base + t][FFTSQ[k][0]] = 0.5 * (A + B);
+          CNtoVNxxx[base + t][FFTSQ[k][1]] = 0.5 * (A - B);
+        }
+
+        for (int g = 0; g < GF; g++)
+        {
+          TMP[g] = CNtoVNxxx[base + t][MULGF[MatValue[m][t]][g]];
+        }
+        for (int g = 0; g < GF; g++)
+        {
+          CNtoVNxxx[base + t][g] = std::max(TMP[g], 0.0);
+        }
+
+        normalize(CNtoVNxxx[base + t], GF);
+      }
+    }
+#if GD_CSS_ENABLE_CUDA
+    CNtoVNxxx.markDeviceDataInvalid();
+    VNtoCNxxx.markDeviceDataInvalid();
+#endif
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  static vector<int> matValueFlatBuffer;
+  static vector<int> fft0Buffer;
+  static vector<int> fft1Buffer;
+  static GFTablesCache gfCache;
+
+  bool gpu_success = false;
+  string gpu_error;
+
+  do
+  {
+    const size_t totalEdges = static_cast<size_t>(rowBase.back());
+    if (CNtoVNxxx.size() < totalEdges || VNtoCNxxx.size() < totalEdges)
+    {
+      gpu_error = "CheckPass GPU path received inconsistent edge buffers";
+      break;
+    }
+    if (CNtoVNxxx.cols() < static_cast<size_t>(GF) ||
+        VNtoCNxxx.cols() < static_cast<size_t>(GF))
+    {
+      gpu_error = "CheckPass GPU path received insufficient GF columns";
+      break;
+    }
+    if (MatValue.size() < static_cast<size_t>(M) || FFTSQ.size() != static_cast<size_t>(logGF) * GF / 2)
+    {
+      gpu_error = "CheckPass GPU path received incompatible table dimensions";
+      break;
+    }
+
+    matValueFlatBuffer.resize(totalEdges);
+    for (int mIdx = 0; mIdx < M; ++mIdx)
+    {
+      if (MatValue[mIdx].size() < static_cast<size_t>(RowDegree[mIdx]))
+      {
+        gpu_error = "MatValue row shorter than RowDegree";
+        break;
+      }
+      for (int t = 0; t < RowDegree[mIdx]; ++t)
+      {
+        matValueFlatBuffer[rowBase[mIdx] + t] = MatValue[mIdx][t];
+      }
+    }
+    if (!gpu_error.empty())
+    {
+      break;
+    }
+
+    auto ensureGFTablesPacked = [&]() -> bool
+    {
+      if (DIVGF.size() != static_cast<size_t>(GF) || MULGF.size() != static_cast<size_t>(GF))
+      {
+        gpu_error = "CheckPass GPU path requires full GF tables";
+        return false;
+      }
+
+      const size_t expectedSize = static_cast<size_t>(GF) * GF;
+      gfCache.divFlat.resize(expectedSize);
+      gfCache.mulFlat.resize(expectedSize);
+
+      for (int i = 0; i < GF; ++i)
+      {
+        if (DIVGF[i].size() < static_cast<size_t>(GF) || MULGF[i].size() < static_cast<size_t>(GF))
+        {
+          gpu_error = "GF lookup tables are incomplete";
+          return false;
+        }
+        for (int j = 0; j < GF; ++j)
+        {
+          const size_t idx = static_cast<size_t>(i) * GF + j;
+          gfCache.divFlat[idx] = DIVGF[i][j];
+          gfCache.mulFlat[idx] = MULGF[i][j];
+        }
+      }
+
+      return true;
+    };
+
+    if (!ensureGFTablesPacked())
+    {
+      break;
+    }
+
+    const size_t pairCount = FFTSQ.size();
+    if (logGF > 0 && (pairCount % static_cast<size_t>(logGF)) != 0)
+    {
+      gpu_error = "FFTSQ size must be divisible by logGF";
+      break;
+    }
+    fft0Buffer.resize(pairCount);
+    fft1Buffer.resize(pairCount);
+    for (size_t k = 0; k < pairCount; ++k)
+    {
+      if (FFTSQ[k].size() < 2)
+      {
+        gpu_error = "FFTSQ entries must contain two indices";
+        break;
+      }
+      fft0Buffer[k] = FFTSQ[k][0];
+      fft1Buffer[k] = FFTSQ[k][1];
+    }
+    if (!gpu_error.empty())
+    {
+      break;
+    }
+
+    CheckPassMetadataKey metadata_key{static_cast<const void *>(&MatValue),
+                                      static_cast<const void *>(&RowDegree),
+                                      static_cast<const void *>(&FFTSQ)};
+    gpu_success = RunCheckPassCUDA(rowBase,
+                                   RowDegree,
+                                   matValueFlatBuffer,
+                                   CNtoVNxxx,
+                                   VNtoCNxxx,
+                                   gfCache.divFlat,
+                                   gfCache.mulFlat,
+                                   fft0Buffer,
+                                   fft1Buffer,
+                                   TrueNoiseSynd,
+                                   M,
+                                   GF,
+                                   logGF,
+                                   metadata_key,
+                                   gpu_error);
+    if (!gpu_success)
+    {
+      break;
+    }
+
+    if (!reported_cuda_success)
+    {
+      std::cout << "CheckPass executed with CUDA acceleration." << std::endl;
+      reported_cuda_success = true;
+    }
+    return;
+  } while (false);
+
+  if (!gpu_error.empty() && !reported_cuda_failure)
+  {
+    std::cerr << "CheckPass GPU path failed: " << gpu_error << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  cpu_impl();
 }
 // Function: calcSyndrome
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void calcSyndrome(vector<int>& Synd, int M,vector<int>& EstmNoise,vector<vector<int>>& MatValue,vector<int>& RowDegree,vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& Mat){
+void calcSyndrome(vector<int> &Synd, int M, vector<int> &EstmNoise, vector<vector<int>> &MatValue, vector<int> &RowDegree, vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF, vector<vector<int>> &Mat)
+{
   // Loop: iterate over a range/collection.
-  for(int k=0;k<M;k++){
-    Synd[k]=0;
+  for (int k = 0; k < M; k++)
+  {
+    Synd[k] = 0;
     // Loop: iterate over a range/collection.
-    for(int l=0;l<RowDegree[k];l++){
-      int n=Mat[k][l];
-      int H=MatValue[k][l];
-      int x=MULGF[H][EstmNoise[n]];
-      int s=Synd[k];
-      Synd[k]=ADDGF[s][x];
+    for (int l = 0; l < RowDegree[k]; l++)
+    {
+      int n = Mat[k][l];
+      int H = MatValue[k][l];
+      int x = MULGF[H][EstmNoise[n]];
+      int s = Synd[k];
+      Synd[k] = ADDGF[s][x];
     }
   }
 }
 // Function: IsSyndromeSatisfied
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int IsSyndromeSatisfied(vector<int>& TrueNoiseSynd,vector<int>& EstmNoiseSynd,vector<int>& USS, int M,vector<int>& EstmNoise,vector<vector<int>>& MatValue,vector<int>& RowDegree,vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& Mat){
+int IsSyndromeSatisfied(vector<int> &TrueNoiseSynd, vector<int> &EstmNoiseSynd, vector<int> &USS, int M, vector<int> &EstmNoise, vector<vector<int>> &MatValue, vector<int> &RowDegree, vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF, vector<vector<int>> &Mat)
+{
 
-  USS.clear();
-  calcSyndrome(EstmNoiseSynd, M,EstmNoise,MatValue,RowDegree,ADDGF, MULGF,Mat);
-  // Loop: iterate over a range/collection.
-  for(size_t k=0;k<M;k++){
-    // Conditional branch.
-    if(EstmNoiseSynd[k]!=TrueNoiseSynd[k]){
-      USS.push_back(k);
+  auto finalize_results = [&]() -> int
+  {
+    USS.clear();
+    for (size_t k = 0; k < static_cast<size_t>(M); k++)
+    {
+      if (EstmNoiseSynd[k] != TrueNoiseSynd[k])
+      {
+        USS.push_back(static_cast<int>(k));
+      }
     }
-  }
-  // Loop: iterate over a range/collection.
-  for(size_t k=0;k<M;k++){
-    // Conditional branch.
-    if(EstmNoiseSynd[k]!=TrueNoiseSynd[k]){
-      return 0;
+    for (size_t k = 0; k < static_cast<size_t>(M); k++)
+    {
+      if (EstmNoiseSynd[k] != TrueNoiseSynd[k])
+      {
+        return 0;
+      }
     }
+    return 1;
+  };
+
+  auto cpu_impl = [&]() -> int
+  {
+    calcSyndrome(EstmNoiseSynd, M, EstmNoise, MatValue, RowDegree, ADDGF, MULGF, Mat);
+    return finalize_results();
+  };
+
+#if GD_CSS_ENABLE_CUDA
+  static DeviceArray<int> d_mat;
+  static DeviceArray<int> d_matValue;
+  static DeviceArray<int> d_rowBase;
+  static DeviceArray<int> d_rowDegree;
+  static DeviceArray<int> d_addGF;
+  static DeviceArray<int> d_mulGF;
+  static DeviceArray<int> d_estNoise;
+  static DeviceArray<int> d_estSynd;
+
+  static bool reported_cuda_success = false;
+  static bool reported_cuda_failure = false;
+  bool gpu_success = false;
+  string gpu_error;
+  cudaError_t status = cudaSuccess;
+
+  do
+  {
+    const int N = static_cast<int>(EstmNoise.size());
+    if (M <= 0 || N <= 0)
+    {
+      break;
+    }
+    if (Mat.size() < static_cast<size_t>(M) ||
+        MatValue.size() < static_cast<size_t>(M) ||
+        RowDegree.size() < static_cast<size_t>(M) ||
+        ADDGF.empty() || MULGF.empty() ||
+        ADDGF.size() != MULGF.size())
+    {
+      gpu_error = "IsSyndromeSatisfied GPU path received inconsistent dimensions";
+      break;
+    }
+
+    vector<int> rowBase(M + 1, 0);
+    for (int m = 1; m <= M; ++m)
+    {
+      rowBase[m] = rowBase[m - 1] + RowDegree[m - 1];
+    }
+    const size_t totalEdges = static_cast<size_t>(rowBase.back());
+
+    if (totalEdges == 0)
+    {
+      EstmNoiseSynd.assign(M, 0);
+      gpu_success = true;
+      break;
+    }
+
+    vector<int> matFlat(totalEdges);
+    vector<int> matValueFlat(totalEdges);
+    for (int m = 0; m < M; ++m)
+    {
+      const int degree = RowDegree[m];
+      if (Mat[m].size() < static_cast<size_t>(degree) ||
+          MatValue[m].size() < static_cast<size_t>(degree))
+      {
+        gpu_error = "IsSyndromeSatisfied GPU path received short Mat/MatValue rows";
+        break;
+      }
+      for (int t = 0; t < degree; ++t)
+      {
+        const size_t idx = static_cast<size_t>(rowBase[m]) + t;
+        matFlat[idx] = Mat[m][t];
+        matValueFlat[idx] = MatValue[m][t];
+      }
+    }
+    if (!gpu_error.empty())
+    {
+      break;
+    }
+
+    const int gf = static_cast<int>(ADDGF.size());
+    const size_t gf_table_elems = static_cast<size_t>(gf) * gf;
+    vector<int> addFlat(gf_table_elems);
+    vector<int> mulFlat(gf_table_elems);
+    for (int i = 0; i < gf; ++i)
+    {
+      if (ADDGF[i].size() < static_cast<size_t>(gf) ||
+          MULGF[i].size() < static_cast<size_t>(gf))
+      {
+        gpu_error = "IsSyndromeSatisfied GPU path requires full GF tables";
+        break;
+      }
+      for (int j = 0; j < gf; ++j)
+      {
+        const size_t idx = static_cast<size_t>(i) * gf + j;
+        addFlat[idx] = ADDGF[i][j];
+        mulFlat[idx] = MULGF[i][j];
+      }
+    }
+    if (!gpu_error.empty())
+    {
+      break;
+    }
+
+    auto ensureBuffer = [&](DeviceArray<int> &buffer,
+                            size_t elements,
+                            const char *label) -> bool
+    {
+      if (!EnsureDeviceArray(buffer, elements, status, label, gpu_error))
+      {
+        return false;
+      }
+      return true;
+    };
+
+    if (!ensureBuffer(d_mat, totalEdges, "IsSyndromeSatisfied mat") ||
+        !ensureBuffer(d_matValue, totalEdges, "IsSyndromeSatisfied MatValue") ||
+        !ensureBuffer(d_rowBase, rowBase.size(), "IsSyndromeSatisfied rowBase") ||
+        !ensureBuffer(d_rowDegree, RowDegree.size(), "IsSyndromeSatisfied RowDegree") ||
+        !ensureBuffer(d_addGF, addFlat.size(), "IsSyndromeSatisfied ADDGF") ||
+        !ensureBuffer(d_mulGF, mulFlat.size(), "IsSyndromeSatisfied MULGF") ||
+        !ensureBuffer(d_estNoise, EstmNoise.size(), "IsSyndromeSatisfied EstmNoise") ||
+        !ensureBuffer(d_estSynd, M, "IsSyndromeSatisfied EstmNoiseSynd"))
+    {
+      break;
+    }
+
+    auto copyBuffer = [&](DeviceArray<int> &buffer,
+                          const void *src,
+                          size_t count,
+                          const char *label) -> bool
+    {
+      status = cudaMemcpy(buffer.ptr, src, count * sizeof(int),
+                          cudaMemcpyHostToDevice);
+      if (status != cudaSuccess)
+      {
+        gpu_error = string("cudaMemcpy failed for ") + label;
+        return false;
+      }
+      return true;
+    };
+
+    if (!copyBuffer(d_mat, matFlat.data(), totalEdges, "Mat") ||
+        !copyBuffer(d_matValue, matValueFlat.data(), totalEdges, "MatValue") ||
+        !copyBuffer(d_rowBase, rowBase.data(), rowBase.size(), "rowBase") ||
+        !copyBuffer(d_rowDegree, RowDegree.data(), RowDegree.size(), "RowDegree") ||
+        !copyBuffer(d_addGF, addFlat.data(), addFlat.size(), "ADDGF") ||
+        !copyBuffer(d_mulGF, mulFlat.data(), mulFlat.size(), "MULGF") ||
+        !copyBuffer(d_estNoise, EstmNoise.data(), EstmNoise.size(), "EstmNoise"))
+    {
+      break;
+    }
+
+    const int threads = 256;
+    const int grid = (M + threads - 1) / threads;
+    cuda_kernels::SyndromeKernel<<<grid, threads>>>(d_mat.ptr,
+                                                    d_matValue.ptr,
+                                                    d_rowBase.ptr,
+                                                    d_rowDegree.ptr,
+                                                    d_addGF.ptr,
+                                                    d_mulGF.ptr,
+                                                    d_estNoise.ptr,
+                                                    M,
+                                                    gf,
+                                                    d_estSynd.ptr);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "IsSyndromeSatisfied CUDA kernel launch failed";
+      break;
+    }
+    status = cudaDeviceSynchronize();
+    if (status != cudaSuccess)
+    {
+      gpu_error = "IsSyndromeSatisfied CUDA kernel execution failed";
+      break;
+    }
+
+    EstmNoiseSynd.resize(static_cast<size_t>(M));
+    status = cudaMemcpy(EstmNoiseSynd.data(),
+                        d_estSynd.ptr,
+                        static_cast<size_t>(M) * sizeof(int),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess)
+    {
+      gpu_error = "cudaMemcpy failed for EstmNoiseSynd";
+      break;
+    }
+
+    gpu_success = true;
+    if (!reported_cuda_success)
+    {
+      std::cout << "IsSyndromeSatisfied executed with CUDA acceleration."
+                << std::endl;
+      reported_cuda_success = true;
+    }
+  } while (false);
+
+  if (gpu_success)
+  {
+    return finalize_results();
   }
-  return 1;
+  if (!gpu_error.empty() && !reported_cuda_failure)
+  {
+    std::cerr << "IsSyndromeSatisfied GPU path failed: " << gpu_error
+              << ". Falling back to CPU implementation." << std::endl;
+    reported_cuda_failure = true;
+  }
+#endif
+
+  return cpu_impl();
 }
 // Function: count_errors
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void count_errors(
-int N, int M,
-vector<int>& EstmNoise_C, vector<int>& EstmNoise_D,
-vector<int>& TrueNoise_C, vector<int>& TrueNoise_D,
-vector<int>& EstmNoiseSynd_C, vector<int>& TrueNoiseSynd_C,
-vector<int>& EstmNoiseSynd_D, vector<int>& TrueNoiseSynd_D,
-vector<int>& IncorrectJ_C,
-vector<int>& IncorrectJ_D,
-int& eS, int& eS_C, int& eS_D,
-int& NumUSS_C, int& NumUSS_D
-) {
+    int N, int M,
+    vector<int> &EstmNoise_C, vector<int> &EstmNoise_D,
+    vector<int> &TrueNoise_C, vector<int> &TrueNoise_D,
+    vector<int> &EstmNoiseSynd_C, vector<int> &TrueNoiseSynd_C,
+    vector<int> &EstmNoiseSynd_D, vector<int> &TrueNoiseSynd_D,
+    vector<int> &IncorrectJ_C,
+    vector<int> &IncorrectJ_D,
+    int &eS, int &eS_C, int &eS_D,
+    int &NumUSS_C, int &NumUSS_D)
+{
 
   IncorrectJ_C.clear();
   IncorrectJ_D.clear();
-  eS=0;
-  eS_C=0;
-  eS_D=0;
+  eS = 0;
+  eS_C = 0;
+  eS_D = 0;
   // Loop: iterate over a range/collection.
-  for(size_t k=0;k<N;k++){
+  for (size_t k = 0; k < N; k++)
+  {
     // Conditional branch.
-    if ( EstmNoise_C[k]!=TrueNoise_C[k]){ eS_C++;  eS++;IncorrectJ_C.push_back(k);}
+    if (EstmNoise_C[k] != TrueNoise_C[k])
+    {
+      eS_C++;
+      eS++;
+      IncorrectJ_C.push_back(k);
+    }
   }
   // Loop: iterate over a range/collection.
-  for(size_t k=0;k<N;k++){
+  for (size_t k = 0; k < N; k++)
+  {
     // Conditional branch.
-    if ( EstmNoise_D[k]!=TrueNoise_D[k]){ eS_D++;  eS++;IncorrectJ_D.push_back(k);}
+    if (EstmNoise_D[k] != TrueNoise_D[k])
+    {
+      eS_D++;
+      eS++;
+      IncorrectJ_D.push_back(k);
+    }
   }
-  NumUSS_C=0;for(int i=0;i<M;i++){if(EstmNoiseSynd_C[i]!=TrueNoiseSynd_C[i]){NumUSS_C++;}}
-  NumUSS_D=0;for(int i=0;i<M;i++){if(EstmNoiseSynd_D[i]!=TrueNoiseSynd_D[i]){NumUSS_D++;}}
+  NumUSS_C = 0;
+  for (int i = 0; i < M; i++)
+  {
+    if (EstmNoiseSynd_C[i] != TrueNoiseSynd_C[i])
+    {
+      NumUSS_C++;
+    }
+  }
+  NumUSS_D = 0;
+  for (int i = 0; i < M; i++)
+  {
+    if (EstmNoiseSynd_D[i] != TrueNoiseSynd_D[i])
+    {
+      NumUSS_D++;
+    }
+  }
 }
 // Function: gaussianElimination
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void gaussianElimination(Matrix& H, vector<int>& Perm) {
+void gaussianElimination(Matrix &H, vector<int> &Perm)
+{
   int m = H.rows, n = H.cols;
-  Perm=vector<int>(n);
+  Perm = vector<int>(n);
   // Loop: iterate over a range/collection.
-  for(int j=0;j<n;j++){Perm[j]=j;}
-  int lead = 0;
-  int N=n;
-  int M=m;
+  for (int j = 0; j < n; j++)
+  {
+    Perm[j] = j;
+  }
+  int N = n;
+  int M = m;
 
   // Loop: iterate over a range/collection.
-  for(int n=0;n<N;n++){Perm[n]=n;}
-  int i,j,k,l,pivot;
-  int p,q;
+  for (int n = 0; n < N; n++)
+  {
+    Perm[n] = n;
+  }
+  int i, j, k;
+  int p;
   // Loop: iterate over a range/collection.
-  for(k=0;k<M;k++){
-    p=H[k][k];
+  for (k = 0; k < M; k++)
+  {
+    p = H[k][k];
     // Conditional branch.
-    if(p==0){
+    if (p == 0)
+    {
 
-      int j1,j2;
+      int j1, j2;
       // Loop: iterate over a range/collection.
-      for(j=k;j<N;j++){
+      for (j = k; j < N; j++)
+      {
         // Conditional branch.
-        if(H[k][j]!=0){
-          j1=k;
-          j2=j;
+        if (H[k][j] != 0)
+        {
+          j1 = k;
+          j2 = j;
           break;
         }
       }
 
       // Conditional branch.
-      if(j==N){
+      if (j == N)
+      {
         H.removeRow(k);
-        M=H.rows;
+        M = H.rows;
         k--;
         continue;
       }
-      p=H[k][j];
+      p = H[k][j];
 
-      int t=Perm[j1];Perm[j1]=Perm[j2];Perm[j2]=t;
-      H.swapColumns(j1,j2);
-
+      int t = Perm[j1];
+      Perm[j1] = Perm[j2];
+      Perm[j2] = t;
+      H.swapColumns(j1, j2);
     }
 
     // Loop: iterate over a range/collection.
-    for(j=0;j<N;j++) {
-      H[k][j]=DIVGF[H[k][j]][p];
+    for (j = 0; j < N; j++)
+    {
+      H[k][j] = DIVGF[H[k][j]][p];
     }
 
     // Loop: iterate over a range/collection.
-    for(i=k+1;i<M;i++) {
-      int q=H[i][k];
+    for (i = k + 1; i < M; i++)
+    {
+      int q = H[i][k];
       // Conditional branch.
-      if(q){
+      if (q)
+      {
 
         // Loop: iterate over a range/collection.
-        for(j=0;j<N;j++) {
-          H[i][j]=ADDGF[H[i][j]][MULGF[q][H[k][j]]];
+        for (j = 0; j < N; j++)
+        {
+          H[i][j] = ADDGF[H[i][j]][MULGF[q][H[k][j]]];
         }
-
       }
     }
-
   }
 
   // Loop: iterate over a range/collection.
-  for(k=1;k<M;k++) {
+  for (k = 1; k < M; k++)
+  {
     // Loop: iterate over a range/collection.
-    for(i=0;i<=k-1;i++){
-      int q=H[i][k];
+    for (i = 0; i <= k - 1; i++)
+    {
+      int q = H[i][k];
       // Conditional branch.
-      if(q){
+      if (q)
+      {
 
         // Loop: iterate over a range/collection.
-        for(j=0;j<N;j++) {
-          H[i][j]=ADDGF[H[i][j]][MULGF[q][H[k][j]]];
+        for (j = 0; j < N; j++)
+        {
+          H[i][j] = ADDGF[H[i][j]][MULGF[q][H[k][j]]];
         }
       }
     }
   }
 }
 
-Matrix findGeneratorMatrix(Matrix H) {
+Matrix findGeneratorMatrix(Matrix H)
+{
   int m = H.rows;
   int n = H.cols;
 
   Matrix H0(m, n);
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < m; ++i) {
+  for (int i = 0; i < m; ++i)
+  {
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < n; ++j) {
+    for (int j = 0; j < n; ++j)
+    {
       H0[i][j] = H[i][j];
     }
   }
 
   vector<int> Perm(n);
   gaussianElimination(H, Perm);
-  int rankH=H.rows;
-  printf("rankH=%d, H.rows=%d\n",rankH,H.rows);
+  int rankH = H.rows;
+  printf("rankH=%d, H.rows=%d\n", rankH, H.rows);
 
-  int N=n;
-  int M=m;
-  int K=N-rankH;
-  Matrix G(K,N);
+  int N = n;
+  int K = N - rankH;
+  Matrix G(K, N);
   // Loop: iterate over a range/collection.
-  for (int m=0;m<K;m++){for (int n=0;n<N;n++){G[m][n]=0;}}
+  for (int m = 0; m < K; m++)
+  {
+    for (int n = 0; n < N; n++)
+    {
+      G[m][n] = 0;
+    }
+  }
   // Loop: iterate over a range/collection.
-  for(int k=0;k<K;k++){
-    G[k][k+rankH]=1;
+  for (int k = 0; k < K; k++)
+  {
+    G[k][k + rankH] = 1;
     // Loop: iterate over a range/collection.
-    for(int j=0;j<N-K;j++) {
-      G[k][j]=H[j][rankH+k];
+    for (int j = 0; j < N - K; j++)
+    {
+      G[k][j] = H[j][rankH + k];
     }
   }
 
-  Matrix TH=H;
+  Matrix TH = H;
   // Loop: iterate over a range/collection.
-  for(int j1=0;j1<N;j1++){
+  for (int j1 = 0; j1 < N; j1++)
+  {
     int j2 = Perm[j1];
     // Conditional branch.
-    if(j1!=j2){
+    if (j1 != j2)
+    {
 
       // Loop: iterate over a range/collection.
-      for(int i=0;i<rankH;i++) {
-        H[i][j2]=TH[i][j1];
+      for (int i = 0; i < rankH; i++)
+      {
+        H[i][j2] = TH[i][j1];
       }
     }
   }
-  Matrix TG=G;
+  Matrix TG = G;
   // Loop: iterate over a range/collection.
-  for(int j1=0;j1<N;j1++){
+  for (int j1 = 0; j1 < N; j1++)
+  {
     int j2 = Perm[j1];
     // Conditional branch.
-    if(j1!=j2){
+    if (j1 != j2)
+    {
 
       // Loop: iterate over a range/collection.
-      for(int i=0;i<K;i++) {
-        G[i][j2]=TG[i][j1];
+      for (int i = 0; i < K; i++)
+      {
+        G[i][j2] = TG[i][j1];
       }
     }
   }
@@ -746,10 +4153,10 @@ Matrix findGeneratorMatrix(Matrix H) {
 }
 
 tuple<vector<vector<int>>, unordered_map<int, int>, unordered_map<int, int>>
-generateDenseMatrixA(const vector<int>& rows,
-const vector<int>& cols,
-const vector<vector<int>>& JatI,
-vector<vector<int>>& MatValue)
+generateDenseMatrixA(const vector<int> &rows,
+                     const vector<int> &cols,
+                     const vector<vector<int>> &JatI,
+                     vector<vector<int>> &MatValue)
 {
   printf("@@@generateDenseMatrixA\n");
 
@@ -757,25 +4164,30 @@ vector<vector<int>>& MatValue)
 
   unordered_map<int, int> colMapping;
   // Loop: iterate over a range/collection.
-  for (size_t j = 0; j < cols.size(); j++) {
+  for (size_t j = 0; j < cols.size(); j++)
+  {
     colMapping[cols[j]] = j;
   }
 
   unordered_map<int, int> rowMapping;
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < rows.size(); i++) {
+  for (size_t i = 0; i < rows.size(); i++)
+  {
     rowMapping[rows[i]] = i;
   }
 
   // Loop: iterate over a range/collection.
-  for (size_t r = 0; r < rows.size(); r++) {
+  for (size_t r = 0; r < rows.size(); r++)
+  {
     int sparseRow = rows[r];
     // Loop: iterate over a range/collection.
-    for (int k = 0; k < JatI[sparseRow].size(); k++) {
+    for (int k = 0; k < JatI[sparseRow].size(); k++)
+    {
       int col = JatI[sparseRow][k];
 
       // Conditional branch.
-      if (colMapping.find(col) != colMapping.end()) {
+      if (colMapping.find(col) != colMapping.end())
+      {
         int c = colMapping[col];
         A[r][c] = MatValue[sparseRow][k];
       }
@@ -787,43 +4199,54 @@ vector<vector<int>>& MatValue)
 // Function: computeRankGF
 // Purpose: TODO - describe the function's responsibility succinctly.
 int computeRankGF(
-vector<vector<int>> A) {
+    vector<vector<int>> A)
+{
   int n = A.size();
   // Conditional branch.
-  if (n == 0) return 0;
+  if (n == 0)
+    return 0;
   int m = A[0].size();
   int rank = 0;
   // Loop: iterate over a range/collection.
-  for (int col = 0, row = 0; col < m && row < n; ++col) {
+  for (int col = 0, row = 0; col < m && row < n; ++col)
+  {
 
     int pivot = -1;
     // Loop: iterate over a range/collection.
-    for (int i = row; i < n; ++i) {
+    for (int i = row; i < n; ++i)
+    {
       // Conditional branch.
-      if (A[i][col] != 0) {
+      if (A[i][col] != 0)
+      {
         pivot = i;
         break;
       }
     }
     // Conditional branch.
-    if (pivot == -1) continue;
+    if (pivot == -1)
+      continue;
 
     // Conditional branch.
-    if (pivot != row) std::swap(A[pivot], A[row]);
+    if (pivot != row)
+      std::swap(A[pivot], A[row]);
 
     int inv = DIVGF[1][A[row][col]];
     // Loop: iterate over a range/collection.
-    for (int j = col; j < m; ++j) {
+    for (int j = col; j < m; ++j)
+    {
       A[row][j] = MULGF[inv][A[row][j]];
     }
 
     // Loop: iterate over a range/collection.
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n; ++i)
+    {
       // Conditional branch.
-      if (i != row && A[i][col] != 0) {
+      if (i != row && A[i][col] != 0)
+      {
         int factor = A[i][col];
         // Loop: iterate over a range/collection.
-        for (int j = col; j < m; ++j) {
+        for (int j = col; j < m; ++j)
+        {
           A[i][j] = ADDGF[A[i][j]][MULGF[factor][A[row][j]]];
         }
       }
@@ -836,24 +4259,37 @@ vector<vector<int>> A) {
 // Function: computeRankGF
 // Purpose: TODO - describe the function's responsibility succinctly.
 int computeRankGF(
-vector<int>& rows,
-vector<int>& cols,
-vector<vector<int>>& JatI_C,
-vector<vector<int>>& MatValue_C){
+    vector<int> &rows,
+    vector<int> &cols,
+    vector<vector<int>> &JatI_C,
+    vector<vector<int>> &MatValue_C)
+{
   printf("@@@computeRankGF\n");
-  printf("rows<%d>:",rows.size());for(int i:rows){printf("%7d(%d)",i,i/P);}printf("\n");
-  printf("cols<%d>:",cols.size());for(int i:cols){printf("%7d(%d)",i,i/P);}printf("\n");
+  printf("rows<%zu>:", rows.size());
+  for (int i : rows)
+  {
+    printf("%7d(%d)", i, i / P);
+  }
+  printf("\n");
+  printf("cols<%zu>:", cols.size());
+  for (int i : cols)
+  {
+    printf("%7d(%d)", i, i / P);
+  }
+  printf("\n");
 
   auto result = generateDenseMatrixA(rows, cols, JatI_C, MatValue_C);
   vector<vector<int>> A = std::get<0>(result);
   unordered_map<int, int> colMapping = std::get<1>(result);
   unordered_map<int, int> rowMapping = std::get<2>(result);
 
-  printf("Matrix A(%dx%d)=\n", A.size(), A[0].size());
+  printf("Matrix A(%zux%zu)=\n", A.size(), A[0].size());
   // Loop: iterate over a range/collection.
-  for (const auto& row : A) {
+  for (const auto &row : A)
+  {
     // Loop: iterate over a range/collection.
-    for (int val : row) {
+    for (int val : row)
+    {
       printf("%3x", val);
     }
     std::cout << std::endl;
@@ -861,51 +4297,61 @@ vector<vector<int>>& MatValue_C){
   return computeRankGF(A);
 }
 vector<vector<int>> enumerateAllSolutions(
-vector<vector<int>> A, vector<int> b,
-const vector<vector<int>>& ADDGF,
-const vector<vector<int>>& MULGF,
-const vector<vector<int>>& DIVGF,
-int GFq
-) {
+    vector<vector<int>> A, vector<int> b,
+    const vector<vector<int>> &ADDGF,
+    const vector<vector<int>> &MULGF,
+    const vector<vector<int>> &DIVGF,
+    int GFq)
+{
   int n = A.size();
   // Conditional branch.
-  if (n == 0) return {};
+  if (n == 0)
+    return {};
   int m = A[0].size();
 
   vector<vector<int>> aug(n, vector<int>(m + 1));
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     copy(A[i].begin(), A[i].end(), aug[i].begin());
     aug[i][m] = b[i];
   }
   vector<int> pivot_col(m, -1);
   int pivot_row = 0;
   // Loop: iterate over a range/collection.
-  for (int col = 0; col < m && pivot_row < n; col++) {
+  for (int col = 0; col < m && pivot_row < n; col++)
+  {
     int pivot = -1;
     // Loop: iterate over a range/collection.
-    for (int row = pivot_row; row < n; row++) {
+    for (int row = pivot_row; row < n; row++)
+    {
       // Conditional branch.
-      if (aug[row][col] != 0) {
+      if (aug[row][col] != 0)
+      {
         pivot = row;
         break;
       }
     }
     // Conditional branch.
-    if (pivot == -1) continue;
+    if (pivot == -1)
+      continue;
     swap(aug[pivot_row], aug[pivot]);
     int invPivot = DIVGF[1][aug[pivot_row][col]];
     // Loop: iterate over a range/collection.
-    for (int j = 0; j <= m; j++) {
+    for (int j = 0; j <= m; j++)
+    {
       aug[pivot_row][j] = MULGF[aug[pivot_row][j]][invPivot];
     }
     // Loop: iterate over a range/collection.
-    for (int row = 0; row < n; row++) {
+    for (int row = 0; row < n; row++)
+    {
       // Conditional branch.
-      if (row == pivot_row) continue;
+      if (row == pivot_row)
+        continue;
       int factor = aug[row][col];
       // Loop: iterate over a range/collection.
-      for (int j = 0; j <= m; j++) {
+      for (int j = 0; j <= m; j++)
+      {
         aug[row][j] = ADDGF[aug[row][j]][MULGF[factor][aug[pivot_row][j]]];
       }
     }
@@ -914,18 +4360,22 @@ int GFq
   }
 
   // Loop: iterate over a range/collection.
-  for (int i = pivot_row; i < n; i++) {
+  for (int i = pivot_row; i < n; i++)
+  {
     bool allZero = true;
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < m; j++) {
+    for (int j = 0; j < m; j++)
+    {
       // Conditional branch.
-      if (aug[i][j] != 0) {
+      if (aug[i][j] != 0)
+      {
         allZero = false;
         break;
       }
     }
     // Conditional branch.
-    if (allZero && aug[i][m] != 0) {
+    if (allZero && aug[i][m] != 0)
+    {
       cout << "No solution." << endl;
       return {};
     }
@@ -934,43 +4384,54 @@ int GFq
   vector<int> free_vars;
   vector<int> pivot_vars;
   // Loop: iterate over a range/collection.
-  for (int j = 0; j < m; j++) {
+  for (int j = 0; j < m; j++)
+  {
     // Conditional branch.
-    if (pivot_col[j] == -1) free_vars.push_back(j);
-    else pivot_vars.push_back(j);
+    if (pivot_col[j] == -1)
+      free_vars.push_back(j);
+    else
+      pivot_vars.push_back(j);
   }
   int num_free = free_vars.size();
   vector<vector<int>> solutions;
 
   int total = 1;
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < num_free; i++) total *= GFq;
+  for (int i = 0; i < num_free; i++)
+    total *= GFq;
   // Loop: iterate over a range/collection.
-  for (int idx = 0; idx < total; idx++) {
+  for (int idx = 0; idx < total; idx++)
+  {
     vector<int> x(m, 0);
     int tmp = idx;
     // Loop: iterate over a range/collection.
-    for (int k = 0; k < num_free; k++) {
+    for (int k = 0; k < num_free; k++)
+    {
       x[free_vars[k]] = tmp % GFq;
       tmp /= GFq;
     }
 
     // Loop: iterate over a range/collection.
-    for (int i = pivot_row - 1; i >= 0; i--) {
+    for (int i = pivot_row - 1; i >= 0; i--)
+    {
       int pivot_j = -1;
       // Loop: iterate over a range/collection.
-      for (int j = 0; j < m; j++) {
+      for (int j = 0; j < m; j++)
+      {
         // Conditional branch.
-        if (aug[i][j] != 0) {
+        if (aug[i][j] != 0)
+        {
           pivot_j = j;
           break;
         }
       }
       // Conditional branch.
-      if (pivot_j == -1) continue;
+      if (pivot_j == -1)
+        continue;
       int sum = 0;
       // Loop: iterate over a range/collection.
-      for (int j = pivot_j + 1; j < m; j++) {
+      for (int j = pivot_j + 1; j < m; j++)
+      {
         sum = ADDGF[sum][MULGF[aug[i][j]][x[j]]];
       }
       x[pivot_j] = ADDGF[aug[i][m]][sum];
@@ -981,19 +4442,23 @@ int GFq
   return solutions;
 }
 
-pair<bool, vector<int>> solveLinearEquations(vector<vector<int>>& A, vector<int>& b,
-vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIVGF) {
+pair<bool, vector<int>> solveLinearEquations(vector<vector<int>> &A, vector<int> &b,
+                                             vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF, vector<vector<int>> &DIVGF)
+{
   int n = A.size();
   // Conditional branch.
-  if (n == 0) return {false, {}};
+  if (n == 0)
+    return {false, {}};
   int m = A[0].size();
   vector<int> x(m, 0);
 
   vector<vector<int>> aug(n, vector<int>(m + 1, 0));
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < m; j++) {
+    for (int j = 0; j < m; j++)
+    {
       aug[i][j] = A[i][j];
     }
     aug[i][m] = b[i];
@@ -1001,35 +4466,43 @@ vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIV
 
   int pivot_row = 0;
   // Loop: iterate over a range/collection.
-  for (int col = 0; col < m && pivot_row < n; col++) {
+  for (int col = 0; col < m && pivot_row < n; col++)
+  {
 
     int pivot = -1;
     // Loop: iterate over a range/collection.
-    for (int row = pivot_row; row < n; row++) {
+    for (int row = pivot_row; row < n; row++)
+    {
       // Conditional branch.
-      if (aug[row][col] != 0) {
+      if (aug[row][col] != 0)
+      {
         pivot = row;
         break;
       }
     }
     // Conditional branch.
-    if (pivot == -1) continue;
+    if (pivot == -1)
+      continue;
 
     swap(aug[pivot_row], aug[pivot]);
 
     int invPivot = DIVGF[1][aug[pivot_row][col]];
     // Loop: iterate over a range/collection.
-    for (int j = 0; j <= m; j++) {
+    for (int j = 0; j <= m; j++)
+    {
       aug[pivot_row][j] = MULGF[aug[pivot_row][j]][invPivot];
     }
 
     // Loop: iterate over a range/collection.
-    for (int row = 0; row < n; row++) {
+    for (int row = 0; row < n; row++)
+    {
       // Conditional branch.
-      if (row == pivot_row) continue;
+      if (row == pivot_row)
+        continue;
       int factor = aug[row][col];
       // Loop: iterate over a range/collection.
-      for (int j = 0; j <= m; j++) {
+      for (int j = 0; j <= m; j++)
+      {
         aug[row][j] = ADDGF[aug[row][j]][MULGF[factor][aug[pivot_row][j]]];
       }
     }
@@ -1038,67 +4511,92 @@ vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIV
   }
 
   // Loop: iterate over a range/collection.
-  for (int i = pivot_row - 1; i >= 0; i--) {
+  for (int i = pivot_row - 1; i >= 0; i--)
+  {
 
     int pivot_col = -1;
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < m; j++) {
+    for (int j = 0; j < m; j++)
+    {
       // Conditional branch.
-      if (aug[i][j] != 0) {
+      if (aug[i][j] != 0)
+      {
         pivot_col = j;
         break;
       }
     }
     // Conditional branch.
-    if (pivot_col == -1) continue;
+    if (pivot_col == -1)
+      continue;
     int sum = 0;
     // Loop: iterate over a range/collection.
-    for (int j = pivot_col + 1; j < m; j++) {
+    for (int j = pivot_col + 1; j < m; j++)
+    {
       sum = ADDGF[sum][MULGF[aug[i][j]][x[j]]];
     }
     x[pivot_col] = ADDGF[aug[i][m]][sum];
   }
 
-  printf("x=\n");for (int i = 0; i < x.size(); i++) {printf("%3x",x[i]);}printf("\n");
+  printf("x=\n");
+  for (int i = 0; i < x.size(); i++)
+  {
+    printf("%3x", x[i]);
+  }
+  printf("\n");
 
   printf("A=\n");
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < A.size(); i++) {
+  for (int i = 0; i < A.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < A[0].size(); j++) {
-      printf("%3x",A[i][j]);
+    for (int j = 0; j < A[0].size(); j++)
+    {
+      printf("%3x", A[i][j]);
     }
     printf("\n");
   }
 
   vector<int> computed_b(n, 0);
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < m; j++) {
+    for (int j = 0; j < m; j++)
+    {
       computed_b[i] = ADDGF[computed_b[i]][MULGF[A[i][j]][x[j]]];
     }
   }
 
   printf("computed_b=\n");
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < computed_b.size(); i++) {printf("%3x",computed_b[i]);}printf("\n");
+  for (int i = 0; i < computed_b.size(); i++)
+  {
+    printf("%3x", computed_b[i]);
+  }
+  printf("\n");
 
   printf("b=\n");
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < b.size(); i++) {printf("%3x",b[i]);}printf("\n");
+  for (int i = 0; i < b.size(); i++)
+  {
+    printf("%3x", b[i]);
+  }
+  printf("\n");
 
   bool correct = true;
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     // Conditional branch.
-    if (computed_b[i] != b[i]) {
+    if (computed_b[i] != b[i])
+    {
       correct = false;
       break;
     }
   }
   // Conditional branch.
-  if (!correct) {
+  if (!correct)
+  {
     cout << "Error: Computed solution does not satisfy Ax = b!" << endl;
     return {false, {}};
   }
@@ -1108,16 +4606,19 @@ vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIV
 // Function: check_degenerate_decoding_success
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& Noise_C, vector<vector<int>>& JatI_C, vector<vector<int>>& JatI_D, vector<vector<int>>& MatValue_D, int N, int M){
+bool check_degenerate_decoding_success(vector<int> &EstmNoise_C, vector<int> &Noise_C, vector<vector<int>> &JatI_C, vector<vector<int>> &JatI_D, vector<vector<int>> &MatValue_D, int N, int M)
+{
   printf("@check_degenerate_decoding_success\n");
 
   unordered_set<int> J_set;
   vector<int> J;
 
   // Loop: iterate over a range/collection.
-  for (int j = 0; j < N; ++j) {
+  for (int j = 0; j < N; ++j)
+  {
     // Conditional branch.
-    if (EstmNoise_C[j] != Noise_C[j]) {
+    if (EstmNoise_C[j] != Noise_C[j])
+    {
       J_set.insert(j);
       J.push_back(j);
     }
@@ -1125,27 +4626,35 @@ bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& No
 
   cout << "J=";
   // Loop: iterate over a range/collection.
-  for (int j : J) { cout << j << " "; }
+  for (int j : J)
+  {
+    cout << j << " ";
+  }
   cout << endl;
 
   // Conditional branch.
-  if (J.empty()) return true;
+  if (J.empty())
+    return true;
   unordered_set<int> I_set;
   vector<int> I;
 
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < M; ++i) {
+  for (int i = 0; i < M; ++i)
+  {
     bool allInJ = true;
     // Loop: iterate over a range/collection.
-    for (int j : JatI_D[i]) {
+    for (int j : JatI_D[i])
+    {
       // Conditional branch.
-      if (!J_set.count(j)) {
+      if (!J_set.count(j))
+      {
         allInJ = false;
         break;
       }
     }
     // Conditional branch.
-    if (allInJ) {
+    if (allInJ)
+    {
       I_set.insert(i);
       I.push_back(i);
     }
@@ -1153,13 +4662,22 @@ bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& No
 
   cout << "I=";
   // Loop: iterate over a range/collection.
-  for (int i : I) { cout << i << " "; }
+  for (int i : I)
+  {
+    cout << i << " ";
+  }
   cout << endl;
 
   // Conditional branch.
-  if (I.empty()) return false;
+  if (I.empty())
+    return false;
 
-  cout << "I=";for(int i:I){cout << i << " ";}cout << endl;
+  cout << "I=";
+  for (int i : I)
+  {
+    cout << i << " ";
+  }
+  cout << endl;
 
   auto result = generateDenseMatrixA(I, J, JatI_D, MatValue_D);
   vector<vector<int>> A = std::get<0>(result);
@@ -1168,38 +4686,50 @@ bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& No
 
   vector<vector<int>> At(A[0].size(), vector<int>(A.size()));
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < A.size(); ++i) {
+  for (size_t i = 0; i < A.size(); ++i)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t j = 0; j < A[0].size(); ++j) {
+    for (size_t j = 0; j < A[0].size(); ++j)
+    {
       At[j][i] = A[i][j];
     }
   }
 
   std::cout << "Matrix At:" << std::endl;
   // Loop: iterate over a range/collection.
-  for (const auto& row : At) {
+  for (const auto &row : At)
+  {
     // Loop: iterate over a range/collection.
-    for (int val : row) {
+    for (int val : row)
+    {
       std::cout << std::setw(5) << val << " ";
     }
     std::cout << std::endl;
   }
   vector<int> b(J.size(), 0);
   // Loop: iterate over a range/collection.
-  for (size_t k = 0; k < J.size(); k++) {
+  for (size_t k = 0; k < J.size(); k++)
+  {
     b[k] = ADDGF[Noise_C[J[k]]][EstmNoise_C[J[k]]];
   }
 
-  cout << "b=";for(int val:b){cout << val << " ";}cout << endl;
+  cout << "b=";
+  for (int val : b)
+  {
+    cout << val << " ";
+  }
+  cout << endl;
   auto res = solveLinearEquations(At, b, ADDGF, MULGF, DIVGF);
   // Conditional branch.
-  if(res.first){
+  if (res.first)
+  {
 
     vector<int> x = res.second;
 
     std::cout << "Solution x:" << std::endl;
     // Loop: iterate over a range/collection.
-    for (int val : x) {
+    for (int val : x)
+    {
       printf("%3x", val);
     }
     std::cout << std::endl;
@@ -1208,22 +4738,26 @@ bool check_degenerate_decoding_success(vector<int>& EstmNoise_C, vector<int>& No
 }
 // Function: addIfNotIncluded
 // Purpose: TODO - describe the function's responsibility succinctly.
-void addIfNotIncluded(std::vector<int>& v, int x) {
+void addIfNotIncluded(std::vector<int> &v, int x)
+{
 
   // Conditional branch.
-  if (std::find(v.begin(), v.end(), x) == v.end()) {
+  if (std::find(v.begin(), v.end(), x) == v.end())
+  {
     v.push_back(x);
   }
 }
 vector<int> makeUnion(
-const vector<int>& Candidate_Covering_Normal_Rows_D,
-const vector<vector<int>>& UTCBC_Indices
-) {
+    const vector<int> &Candidate_Covering_Normal_Rows_D,
+    const vector<vector<int>> &UTCBC_Indices)
+{
   set<int> union_set;
   // Loop: iterate over a range/collection.
-  for (int i : Candidate_Covering_Normal_Rows_D) {
+  for (int i : Candidate_Covering_Normal_Rows_D)
+  {
     // Loop: iterate over a range/collection.
-    for (int v : UTCBC_Indices[i]) {
+    for (int v : UTCBC_Indices[i])
+    {
       union_set.insert(v);
     }
   }
@@ -1234,30 +4768,34 @@ const vector<vector<int>>& UTCBC_Indices
 }
 // Function: Find_Nonsingular_Cycle_of_Length_Larger_thatn_L
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@Find_Nonsingular_Cycle_of_Length_Larger_thatn_L" << endl;
   cols.clear();
   rows.clear();
-  set<int> rows_set,cols_set;
+  set<int> rows_set, cols_set;
 
   sort(SuspectJ.begin(), SuspectJ.end());
 
   // Loop: iterate over a range/collection.
-  for (int j : SuspectJ) {
+  for (int j : SuspectJ)
+  {
 
     // Loop: iterate over a range/collection.
-    for (int i : IatJ_C[j]) {
-      int count_J = 0;
+    for (int i : IatJ_C[j])
+    {
 
       vector<int> intersection;
       set_intersection(JatI_C[i].begin(), JatI_C[i].end(),
-      SuspectJ.begin(), SuspectJ.end(),
-      back_inserter(intersection));
+                       SuspectJ.begin(), SuspectJ.end(),
+                       back_inserter(intersection));
       // Conditional branch.
-      if(intersection.size() == 2) {
+      if (intersection.size() == 2)
+      {
         rows_set.insert(i);
         // Loop: iterate over a range/collection.
-        for(int j: intersection) {
+        for (int j : intersection)
+        {
           cols_set.insert(j);
         }
       }
@@ -1265,44 +4803,52 @@ bool Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(vector<int>& cols, vector<i
   }
   rows.assign(rows_set.begin(), rows_set.end());
   cols.assign(cols_set.begin(), cols_set.end());
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("rank=%d\n",rank);
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("rank=%d\n", rank);
   // Conditional branch.
-  if(cols_set.size()>L && cols_set.size()==rows_set.size() && (cols_set.size()==rank)){
+  if (cols_set.size() > L && cols_set.size() == rows_set.size() && (cols_set.size() == rank))
+  {
     printf("cols_set.size()=0\n");
     printf("***Find_Nonsingular_Cycle_of_Length_Larger_thatn_L end true\n");
     rows.assign(rows_set.begin(), rows_set.end());
     cols.assign(cols_set.begin(), cols_set.end());
     return true;
-  }else{
-  printf("***Find_Nonsingular_Cycle_of_Length_Larger_thatn_L end false\n");
-  return false;
-}
+  }
+  else
+  {
+    printf("***Find_Nonsingular_Cycle_of_Length_Larger_thatn_L end false\n");
+    return false;
+  }
 }
 // Function: Find_Cycle_of_Length_L
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Find_Cycle_of_Length_L(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Find_Cycle_of_Length_L(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@Find_Cycle_of_Length_L" << endl;
   cols.clear();
   rows.clear();
-  set<int> rows_set,cols_set;
+  set<int> rows_set, cols_set;
 
   sort(SuspectJ.begin(), SuspectJ.end());
 
   // Loop: iterate over a range/collection.
-  for (int j : SuspectJ) {
+  for (int j : SuspectJ)
+  {
 
     // Loop: iterate over a range/collection.
-    for (int i : IatJ_C[j]) {
+    for (int i : IatJ_C[j])
+    {
       vector<int> intersection;
       set_intersection(JatI_C[i].begin(), JatI_C[i].end(),
-      SuspectJ.begin(), SuspectJ.end(),
-      back_inserter(intersection));
+                       SuspectJ.begin(), SuspectJ.end(),
+                       back_inserter(intersection));
       // Conditional branch.
-      if(intersection.size() == 2) {
+      if (intersection.size() == 2)
+      {
         rows_set.insert(i);
         // Loop: iterate over a range/collection.
-        for(int j: intersection) {
+        for (int j : intersection)
+        {
           cols_set.insert(j);
         }
       }
@@ -1310,47 +4856,58 @@ bool Find_Cycle_of_Length_L(vector<int>& cols, vector<int>& rows, vector<int>& S
   }
   rows.assign(rows_set.begin(), rows_set.end());
   cols.assign(cols_set.begin(), cols_set.end());
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("rank=%d\n",rank);
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("rank=%d\n", rank);
   // Conditional branch.
-  if(cols_set.size()==L && rows_set.size()==L && (rank==L || rank==L-1)){
+  if (cols_set.size() == L && rows_set.size() == L && (rank == L || rank == L - 1))
+  {
     printf("cols_set.size()=0\n");
     printf("***Find_Cycle_of_Length_L end true\n");
     rows.assign(rows_set.begin(), rows_set.end());
     cols.assign(cols_set.begin(), cols_set.end());
     return true;
-  }else{
-  printf("***Find_Cycle_of_Length_L end false\n");
-  return false;
-}
+  }
+  else
+  {
+    printf("***Find_Cycle_of_Length_L end false\n");
+    return false;
+  }
 }
 // Function: Find_Covering_Cycles_By_RUSS
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool Find_Covering_Cycles_By_RUSS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C){
+bool Find_Covering_Cycles_By_RUSS(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<int> &RUSS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C)
+{
   cout << "@@@Find_Covering_Cycles_By_RUSS" << endl;
   cols.clear();
   rows.clear();
-  rows=RUSS;
-  set<int> rows_set,cols_set;
+  rows = RUSS;
+  set<int> rows_set, cols_set;
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int ii=0;ii<rows.size();ii++){
+    for (int ii = 0; ii < rows.size(); ii++)
+    {
       // Conditional branch.
-      if(i==ii){continue;}
+      if (i == ii)
+      {
+        continue;
+      }
 
       vector<int> intersection;
       set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-      JatI_C[rows[ii]].begin(), JatI_C[rows[ii]].end(),
-      back_inserter(intersection));
+                       JatI_C[rows[ii]].begin(), JatI_C[rows[ii]].end(),
+                       back_inserter(intersection));
 
       // Conditional branch.
-      if(intersection.size()==1){
+      if (intersection.size() == 1)
+      {
 
         // Loop: iterate over a range/collection.
-        for(int j:intersection){
+        for (int j : intersection)
+        {
           cols_set.insert(j);
         }
       }
@@ -1358,229 +4915,294 @@ bool Find_Covering_Cycles_By_RUSS(vector<int>& cols, vector<int>& rows, vector<i
   }
   cols.assign(cols_set.begin(), cols_set.end());
 
-  vector<int> missingJ=difference(SuspectJ,cols);
+  vector<int> missingJ = difference(SuspectJ, cols);
   // Conditional branch.
-  if (missingJ.empty()) {
+  if (missingJ.empty())
+  {
     printf("YES. SuspectJ is covered by cols\n");
     printf("***Find_Covering_Cycles_By_RUSS end true \n");
     return true;
-  }else{
-  printf("NO. SuspectJ is NOT covered by cols\n");
-  printf("***Find_Covering_Cycles_By_RUSS end false\n");
-  cols.clear();
-  rows.clear();
-  return false;
-}
+  }
+  else
+  {
+    printf("NO. SuspectJ is NOT covered by cols\n");
+    printf("***Find_Covering_Cycles_By_RUSS end false\n");
+    cols.clear();
+    rows.clear();
+    return false;
+  }
 }
 // Function: Find_Rows_Coverintg_SuspectJ_From_RUSS
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Find_Rows_Coverintg_SuspectJ_From_RUSS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Find_Rows_Coverintg_SuspectJ_From_RUSS(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<int> &RUSS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@@@Find_Rows_Coverintg_SuspectJ_From_RUSS" << endl;
   cols.clear();
   rows.clear();
-  rows=RUSS;
-  set<int> rows_set,cols_set;
+  rows = RUSS;
+  set<int> rows_set, cols_set;
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     vector<int> intersection;
     set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-    SuspectJ.begin(), SuspectJ.end(),
-    back_inserter(intersection));
+                     SuspectJ.begin(), SuspectJ.end(),
+                     back_inserter(intersection));
 
     // Loop: iterate over a range/collection.
-    for(int j:intersection){
+    for (int j : intersection)
+    {
       cols_set.insert(j);
     }
   }
   cols.assign(cols_set.begin(), cols_set.end());
 
-  vector<int> missingJ=difference(SuspectJ,cols);
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("cols.size()=%d rank(rows,cols)=%d\n",cols.size(),rank);
+  vector<int> missingJ = difference(SuspectJ, cols);
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("cols.size()=%zu rank(rows,cols)=%d\n", cols.size(), rank);
   // Conditional branch.
-  if (cols.size()<= rank){
+  if (cols.size() <= rank)
+  {
     printf("***Find_Rows_Coverintg_SuspectJ_From_RUSS end true\n");
     return true;
-  }else{
-  printf("***Find_Rows_Coverintg_SuspectJ_From_RUSS end false\n");
-  cols.clear();
-  rows.clear();
-  return false;
-}
+  }
+  else
+  {
+    printf("***Find_Rows_Coverintg_SuspectJ_From_RUSS end false\n");
+    cols.clear();
+    rows.clear();
+    return false;
+  }
 }
 // Function: Find_Unique_Solution_Noise_From_USS
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Find_Unique_Solution_Noise_From_USS(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& USS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Find_Unique_Solution_Noise_From_USS(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<int> &USS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@@@Find_Unique_Solution_Noise_From_RUSS" << endl;
   cols.clear();
   rows.clear();
-  rows=USS;
-  set<int> rows_set,cols_set;
+  rows = USS;
+  set<int> rows_set, cols_set;
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     vector<int> intersection;
     set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-    SuspectJ.begin(), SuspectJ.end(),
-    back_inserter(intersection));
+                     SuspectJ.begin(), SuspectJ.end(),
+                     back_inserter(intersection));
 
     // Loop: iterate over a range/collection.
-    for(int j:intersection){
+    for (int j : intersection)
+    {
       cols_set.insert(j);
     }
   }
   cols.assign(cols_set.begin(), cols_set.end());
 
-  vector<int> missingJ=difference(SuspectJ,cols);
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("cols.size()=%d rank(rows,cols)=%d\n",cols.size(),rank);
+  vector<int> missingJ = difference(SuspectJ, cols);
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("cols.size()=%zu rank(rows,cols)=%d\n", cols.size(), rank);
   // Conditional branch.
-  if (cols.size()<= rank){
+  if (cols.size() <= rank)
+  {
     printf("***Find_Unique_Solution_Noise_From_RUSS end true\n");
     return true;
-  }else{
-  printf("***Find_Unique_Solution_Noise_From_RUSS end false\n");
-  cols.clear();
-  rows.clear();
-  return false;
-}
+  }
+  else
+  {
+    printf("***Find_Unique_Solution_Noise_From_RUSS end false\n");
+    cols.clear();
+    rows.clear();
+    return false;
+  }
 }
 // Function: Rows_eq_USS_Cols_eq_Overlapping_USS
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Rows_eq_USS_Cols_eq_Overlapping_USS(vector<int>& cols, vector<int>& rows, vector<int>& USS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Rows_eq_USS_Cols_eq_Overlapping_USS(vector<int> &cols, vector<int> &rows, vector<int> &USS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@@@Rows_eq_USS_Cols_eq_Overlapping_USS" << endl;
   cols.clear();
   rows.clear();
-  rows=USS;
-  set<int> rows_set,cols_set;
+  rows = USS;
+  set<int> rows_set, cols_set;
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int ii=0;ii<rows.size();ii++){
+    for (int ii = 0; ii < rows.size(); ii++)
+    {
       // Conditional branch.
-      if(i==ii){continue;}
+      if (i == ii)
+      {
+        continue;
+      }
 
       vector<int> intersection;
       set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-      JatI_C[rows[ii]].begin(), JatI_C[rows[ii]].end(),
-      back_inserter(intersection));
+                       JatI_C[rows[ii]].begin(), JatI_C[rows[ii]].end(),
+                       back_inserter(intersection));
 
       // Conditional branch.
-      if(intersection.size()==1){
+      if (intersection.size() == 1)
+      {
 
         // Loop: iterate over a range/collection.
-        for(int j:intersection){
+        for (int j : intersection)
+        {
           cols_set.insert(j);
         }
       }
     }
   }
   // Conditional branch.
-  if (cols_set.size() == 0) {
+  if (cols_set.size() == 0)
+  {
     printf("cols_set.size()=0\n");
     printf("***Rows_eq_USS_Cols_eq_Overlapping_USS end false\n");
     return false;
   }
   cols.assign(cols_set.begin(), cols_set.end());
-  printf("cols=");for(int x: cols){printf("%7d(%d)",x,x/P);}printf("\n");
-  printf("rows=");for(int x: rows){printf("%7d(%d)",x,x/P);}printf("\n");
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("cols.size()=%d rank(rows,cols)=%d\n",cols.size(),rank);
+  printf("cols=");
+  for (int x : cols)
+  {
+    printf("%7d(%d)", x, x / P);
+  }
+  printf("\n");
+  printf("rows=");
+  for (int x : rows)
+  {
+    printf("%7d(%d)", x, x / P);
+  }
+  printf("\n");
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("cols.size()=%zu rank(rows,cols)=%d\n", cols.size(), rank);
   // Conditional branch.
-  if (cols.size()<= rank){
+  if (cols.size() <= rank)
+  {
     printf("***Rows_eq_USS_Cols_eq_Overlapping_USS end true\n");
     return true;
-  }else{
-  printf("***Rows_eq_USS_Cols_eq_Overlapping_USS end false\n");
-  return false;
-}
+  }
+  else
+  {
+    printf("***Rows_eq_USS_Cols_eq_Overlapping_USS end false\n");
+    return false;
+  }
 }
 // Function: Rows_eq_RUSS_Cols_eq_SuspectJ
 // Purpose: TODO - describe the function's responsibility succinctly.
-bool Rows_eq_RUSS_Cols_eq_SuspectJ(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Rows_eq_RUSS_Cols_eq_SuspectJ(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<int> &RUSS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@@@Rows_eq_RUSS_Cols_eq_SuspectJ" << endl;
   cols.clear();
   rows.clear();
-  rows=RUSS;
-  cols=SuspectJ;
-  printf("cols=");for(int x: cols){printf("%7d(%d)",x,x/P);}printf("\n");
-  printf("rows=");for(int x: rows){printf("%7d(%d)",x,x/P);}printf("\n");
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("cols.size()=%d rank(rows,cols)=%d\n",cols.size(),rank);
+  rows = RUSS;
+  cols = SuspectJ;
+  printf("cols=");
+  for (int x : cols)
+  {
+    printf("%7d(%d)", x, x / P);
+  }
+  printf("\n");
+  printf("rows=");
+  for (int x : rows)
+  {
+    printf("%7d(%d)", x, x / P);
+  }
+  printf("\n");
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("cols.size()=%zu rank(rows,cols)=%d\n", cols.size(), rank);
   // Conditional branch.
-  if (cols.size()<= rank){
+  if (cols.size() <= rank)
+  {
     printf("***Rows_eq_RUSS_Cols_eq_SuspectJ end true\n");
     return true;
-  }else{
-  printf("***Rows_eq_RUSS_Cols_eq_SuspectJ end false\n");
-  return false;
-}
+  }
+  else
+  {
+    printf("***Rows_eq_RUSS_Cols_eq_SuspectJ end false\n");
+    return false;
+  }
 }
 // Function: Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ, vector<int>& RUSS, vector<vector<int>>& JatI_C, vector<vector<int>>& IatJ_C, vector<vector<int>>& MatValue_C){
+bool Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ, vector<int> &RUSS, vector<vector<int>> &JatI_C, vector<vector<int>> &IatJ_C, vector<vector<int>> &MatValue_C)
+{
   cout << "@@@Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap" << endl;
   cols.clear();
   rows.clear();
-  rows=RUSS;
-  set<int> rows_set,cols_set;
+  rows = RUSS;
+  set<int> rows_set, cols_set;
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     vector<int> intersection;
     set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-    SuspectJ.begin(), SuspectJ.end(),
-    back_inserter(intersection));
+                     SuspectJ.begin(), SuspectJ.end(),
+                     back_inserter(intersection));
 
     // Loop: iterate over a range/collection.
-    for(int j:intersection){
+    for (int j : intersection)
+    {
       cols_set.insert(j);
     }
   }
 
   // Loop: iterate over a range/collection.
-  for(int i=0;i<rows.size();i++){
+  for (int i = 0; i < rows.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int j=0;j<rows.size();j++){
+    for (int j = 0; j < rows.size(); j++)
+    {
       // Conditional branch.
-      if(i==j){continue;}
+      if (i == j)
+      {
+        continue;
+      }
 
       vector<int> intersection;
       set_intersection(JatI_C[rows[i]].begin(), JatI_C[rows[i]].end(),
-      JatI_C[rows[j]].begin(), JatI_C[rows[j]].end(),
-      back_inserter(intersection));
+                       JatI_C[rows[j]].begin(), JatI_C[rows[j]].end(),
+                       back_inserter(intersection));
 
       // Conditional branch.
-      if(intersection.size()==1){
+      if (intersection.size() == 1)
+      {
 
         // Loop: iterate over a range/collection.
-        for(int j:intersection){
+        for (int j : intersection)
+        {
           cols_set.insert(j);
         }
       }
     }
   }
   cols.assign(cols_set.begin(), cols_set.end());
-  int rank=computeRankGF(rows,cols,JatI_C,MatValue_C);
-  printf("cols.size()=%d rank(rows,cols)=%d\n",cols.size(),rank);
+  int rank = computeRankGF(rows, cols, JatI_C, MatValue_C);
+  printf("cols.size()=%zu rank(rows,cols)=%d\n", cols.size(), rank);
   // Conditional branch.
-  if (cols.size()<= rank){
+  if (cols.size() <= rank)
+  {
     printf("***Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap end true\n");
     return true;
-  }else{
-  printf("***Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap end false\n");
-  cols.clear();
-  rows.clear();
-  return false;
-}
+  }
+  else
+  {
+    printf("***Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap end false\n");
+    cols.clear();
+    rows.clear();
+    return false;
+  }
 }
 // Function: Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(vector<int>& cols, vector<int>& rows, vector<int>& SuspectJ_C, vector<vector<int>>& UTCBC_Rows_C_orthogonal_D, vector<vector<int>>& UTCBC_Cols_C_orthogonal_D, vector<vector<int>>& full_IatJ_D){
+bool Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(vector<int> &cols, vector<int> &rows, vector<int> &SuspectJ_C, vector<vector<int>> &UTCBC_Rows_C_orthogonal_D, vector<vector<int>> &UTCBC_Cols_C_orthogonal_D, vector<vector<int>> &full_IatJ_D)
+{
   cout << "@findCoveringRowsByUTCBC_Cols" << endl;
   vector<int> Candidate_Covering_Normal_Rows_D;
 
@@ -1589,49 +5211,63 @@ bool Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(vector<int>& cols, vector<
   sort(SuspectJ_C.begin(), SuspectJ_C.end());
 
   // Loop: iterate over a range/collection.
-  for (int j : SuspectJ_C) {
+  for (int j : SuspectJ_C)
+  {
 
     // Loop: iterate over a range/collection.
-    for (int i : full_IatJ_D[j]) {
+    for (int i : full_IatJ_D[j])
+    {
 
       // Conditional branch.
-      if(find(Candidate_Covering_Normal_Rows_D.begin(), Candidate_Covering_Normal_Rows_D.end(), i) != Candidate_Covering_Normal_Rows_D.end()){
+      if (find(Candidate_Covering_Normal_Rows_D.begin(), Candidate_Covering_Normal_Rows_D.end(), i) != Candidate_Covering_Normal_Rows_D.end())
+      {
         continue;
       }
 
       vector<int> intersection;
       set_intersection(UTCBC_Cols_C_orthogonal_D[i].begin(), UTCBC_Cols_C_orthogonal_D[i].end(),
-      SuspectJ_C.begin(), SuspectJ_C.end(),
-      back_inserter(intersection));
-      printf("intersection=");for(int x: intersection){printf("%7d",x);}printf("\n");
+                       SuspectJ_C.begin(), SuspectJ_C.end(),
+                       back_inserter(intersection));
+      printf("intersection=");
+      for (int x : intersection)
+      {
+        printf("%7d", x);
+      }
+      printf("\n");
 
       // Conditional branch.
-      if (intersection.size() >= 2) {
-        printf("%d is added\n",i);
+      if (intersection.size() >= 2)
+      {
+        printf("%d is added\n", i);
         Candidate_Covering_Normal_Rows_D.push_back(i);
         // Conditional branch.
-        if (Candidate_Covering_Normal_Rows_D.size() > 2) {
+        if (Candidate_Covering_Normal_Rows_D.size() > 2)
+        {
           printf("Candidate_Covering_Normal_Rows_D.size()>2\n");
           printf("***findCoveringRowsByUTCBC_Cols end false\n");
           return false;
         }
-        set<int> rows_set,cols_set;
+        set<int> rows_set, cols_set;
         // Loop: iterate over a range/collection.
-        for (int i : Candidate_Covering_Normal_Rows_D) {
+        for (int i : Candidate_Covering_Normal_Rows_D)
+        {
           // Loop: iterate over a range/collection.
-          for (int j: UTCBC_Cols_C_orthogonal_D[i]) {
+          for (int j : UTCBC_Cols_C_orthogonal_D[i])
+          {
             cols_set.insert(j);
           }
           // Loop: iterate over a range/collection.
-          for (int ii: UTCBC_Rows_C_orthogonal_D[i]) {
+          for (int ii : UTCBC_Rows_C_orthogonal_D[i])
+          {
             rows_set.insert(ii);
           }
         }
 
-        vector<int> UnionJ=makeUnion(Candidate_Covering_Normal_Rows_D, UTCBC_Cols_C_orthogonal_D);
-        vector<int> missingJ=difference(SuspectJ_C,UnionJ);
+        vector<int> UnionJ = makeUnion(Candidate_Covering_Normal_Rows_D, UTCBC_Cols_C_orthogonal_D);
+        vector<int> missingJ = difference(SuspectJ_C, UnionJ);
         // Conditional branch.
-        if (missingJ.empty()) {
+        if (missingJ.empty())
+        {
           printf("YES. SuspectJ_C is covered by UnionJ\n");
 
           rows.assign(rows_set.begin(), rows_set.end());
@@ -1648,11 +5284,14 @@ bool Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(vector<int>& cols, vector<
 // Function: printMatrix
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void printMatrix(const vector<vector<int>>& mat) {
+void printMatrix(const vector<vector<int>> &mat)
+{
   // Loop: iterate over a range/collection.
-  for (const auto& row : mat) {
+  for (const auto &row : mat)
+  {
     // Loop: iterate over a range/collection.
-    for (int val : row) {
+    for (int val : row)
+    {
       cout << setw(5) << val << " ";
     }
     cout << endl;
@@ -1662,11 +5301,14 @@ void printMatrix(const vector<vector<int>>& mat) {
 // Function: isEqual
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool isEqual(vector<int>& a, vector<int>& b, int size) {
+bool isEqual(vector<int> &a, vector<int> &b, int size)
+{
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < size; i++) {
+  for (size_t i = 0; i < size; i++)
+  {
     // Conditional branch.
-    if (a[i] != b[i]) {
+    if (a[i] != b[i])
+    {
       return false;
     }
   }
@@ -1676,24 +5318,28 @@ bool isEqual(vector<int>& a, vector<int>& b, int size) {
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 int computeDeterminantGF(
-vector<vector<int>> A,
-const vector<vector<int>>& ADDGF,
-const vector<vector<int>>& MULGF,
-const vector<vector<int>>& DIVGF,
-int GF_minus_one
-) {
+    vector<vector<int>> A,
+    const vector<vector<int>> &ADDGF,
+    const vector<vector<int>> &MULGF,
+    const vector<vector<int>> &DIVGF,
+    int GF_minus_one)
+{
   int N = A.size();
   int det = 1;
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; ++i) {
+  for (int i = 0; i < N; ++i)
+  {
     // Conditional branch.
-    if (A[i][i] == 0) {
+    if (A[i][i] == 0)
+    {
 
       bool found = false;
       // Loop: iterate over a range/collection.
-      for (int j = i + 1; j < N; ++j) {
+      for (int j = i + 1; j < N; ++j)
+      {
         // Conditional branch.
-        if (A[j][i] != 0) {
+        if (A[j][i] != 0)
+        {
           std::swap(A[i], A[j]);
           det = MULGF[det][GF_minus_one];
           found = true;
@@ -1701,17 +5347,21 @@ int GF_minus_one
         }
       }
       // Conditional branch.
-      if (!found) return 0;
+      if (!found)
+        return 0;
     }
     det = MULGF[det][A[i][i]];
     int inv = DIVGF[1][A[i][i]];
     // Loop: iterate over a range/collection.
-    for (int j = i + 1; j < N; ++j) {
+    for (int j = i + 1; j < N; ++j)
+    {
       // Conditional branch.
-      if (A[j][i] != 0) {
+      if (A[j][i] != 0)
+      {
         int factor = MULGF[A[j][i]][inv];
         // Loop: iterate over a range/collection.
-        for (int k = i; k < N; ++k) {
+        for (int k = i; k < N; ++k)
+        {
           A[j][k] = ADDGF[A[j][k]][MULGF[factor][A[i][k]]];
         }
       }
@@ -1722,9 +5372,10 @@ int GF_minus_one
 // Function: decode_small_errors_from_rows_cols
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void decode_small_errors_from_rows_cols(vector<int>& TrueNoiseSynd, vector<int>& TrueNoise, int M, int N, vector<int>& EstmNoise, vector<int>& RowDeg, vector<int>& rows, vector<int>& cols, vector<vector<int>>& IatJ_C, vector<vector<int>>& JatI_C, vector<vector<int>>& Mat, vector<vector<int>>& MatValue, vector<vector<int>>& MULGF, vector<vector<int>>& ADDGF, vector<vector<int>>& DIVGF, vector<vector<int>>& BINGF){
+void decode_small_errors_from_rows_cols(vector<int> &TrueNoiseSynd, vector<int> &TrueNoise, int M, int N, vector<int> &EstmNoise, vector<int> &RowDeg, vector<int> &rows, vector<int> &cols, vector<vector<int>> &IatJ_C, vector<vector<int>> &JatI_C, vector<vector<int>> &Mat, vector<vector<int>> &MatValue, vector<vector<int>> &MULGF, vector<vector<int>> &ADDGF, vector<vector<int>> &DIVGF, vector<vector<int>> &BINGF)
+{
   printf("@decode_small_errors_from_rows_cols\n");
-  vector<int> Set_J=cols;
+  vector<int> Set_J = cols;
 
   auto result = generateDenseMatrixA(rows, cols, JatI_C, MatValue);
   vector<vector<int>> A = std::get<0>(result);
@@ -1733,9 +5384,11 @@ void decode_small_errors_from_rows_cols(vector<int>& TrueNoiseSynd, vector<int>&
 
   std::cout << "Matrix A:" << std::endl;
   // Loop: iterate over a range/collection.
-  for (const auto& row : A) {
+  for (const auto &row : A)
+  {
     // Loop: iterate over a range/collection.
-    for (int val : row) {
+    for (int val : row)
+    {
       printf("%3x", val);
     }
     std::cout << std::endl;
@@ -1743,15 +5396,18 @@ void decode_small_errors_from_rows_cols(vector<int>& TrueNoiseSynd, vector<int>&
 
   vector<int> Set_JO;
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {
+  for (int i = 0; i < N; i++)
+  {
     // Conditional branch.
-    if (find(Set_J.begin(), Set_J.end(), i) == Set_J.end()) {
+    if (find(Set_J.begin(), Set_J.end(), i) == Set_J.end())
+    {
       Set_JO.push_back(i);
     }
   }
 
   // Conditional branch.
-  if (A.size() == A[0].size()) {
+  if (A.size() == A[0].size())
+  {
     int det = computeDeterminantGF(A, ADDGF, MULGF, DIVGF, GF - 1);
     printf("det=%3x\n", det);
   }
@@ -1768,227 +5424,407 @@ void decode_small_errors_from_rows_cols(vector<int>& TrueNoiseSynd, vector<int>&
   vector<int> sigmaU_J_plus_sigmaU_JO(M, 0);
   vector<int> sigmaU_J_plus_sigmaUH_JO(M, 0);
   vector<int> xiUH_J(cols.size(), 0);
-  printf("cols=");for(int i=0;i<cols.size();i++){printf("%7d",cols[i]);}printf("\n");
-  printf("rows=");for(int i=0;i<rows.size();i++){printf("%7d",rows[i]);}printf("\n");
+  printf("cols=");
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%7d", cols[i]);
+  }
+  printf("\n");
+  printf("rows=");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%7d", rows[i]);
+  }
+  printf("\n");
 
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < Set_J.size(); i++) {xiU_J[i]        = TrueNoise[cols[i]];}
+  for (int i = 0; i < Set_J.size(); i++)
+  {
+    xiU_J[i] = TrueNoise[cols[i]];
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < Set_J.size(); i++) {xiUH_J[i]       = EstmNoise[cols[i]];}
+  for (int i = 0; i < Set_J.size(); i++)
+  {
+    xiUH_J[i] = EstmNoise[cols[i]];
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {xiU[i]        = TrueNoise[i];}
+  for (int i = 0; i < N; i++)
+  {
+    xiU[i] = TrueNoise[i];
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {xiU_J_ZP[i]  = TrueNoise[i];}
+  for (int i = 0; i < N; i++)
+  {
+    xiU_J_ZP[i] = TrueNoise[i];
+  }
   // Loop: iterate over a range/collection.
-  for (int n : Set_JO) {xiU_J_ZP[n]=0;}
+  for (int n : Set_JO)
+  {
+    xiU_J_ZP[n] = 0;
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {xiUH_J_ZP[i]  = EstmNoise[i];}
+  for (int i = 0; i < N; i++)
+  {
+    xiUH_J_ZP[i] = EstmNoise[i];
+  }
   // Loop: iterate over a range/collection.
-  for (int n : Set_JO) {xiUH_J_ZP[n]=0;}
+  for (int n : Set_JO)
+  {
+    xiUH_J_ZP[n] = 0;
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {xiU_JO_ZP[i]  = TrueNoise[i];}
+  for (int i = 0; i < N; i++)
+  {
+    xiU_JO_ZP[i] = TrueNoise[i];
+  }
   // Loop: iterate over a range/collection.
-  for (int n : Set_J){xiU_JO_ZP[n]=0;}
+  for (int n : Set_J)
+  {
+    xiU_JO_ZP[n] = 0;
+  }
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < N; i++) {xiUH_JO_ZP[i] = EstmNoise[i];}
+  for (int i = 0; i < N; i++)
+  {
+    xiUH_JO_ZP[i] = EstmNoise[i];
+  }
   // Loop: iterate over a range/collection.
-  for (int n : Set_J) {xiUH_JO_ZP[n]=0;}
+  for (int n : Set_J)
+  {
+    xiUH_JO_ZP[n] = 0;
+  }
   printf("-------------------------------------------------\n");
-  printf("xiU_J=\n");for(int i=0;i<cols.size();i++){printf("%3x",xiU_J[i]);}printf("\n");
-  printf("(xiU)_J=\n");for(int i=0;i<cols.size();i++){printf("%3x",xiU[cols[i]]);}printf("\n");
-  printf("xiUH_J=\n");for(int i=0;i<cols.size();i++){printf("%3x",xiUH_J[i]);}printf("\n");
+  printf("xiU_J=\n");
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiU_J[i]);
+  }
+  printf("\n");
+  printf("(xiU)_J=\n");
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiU[cols[i]]);
+  }
+  printf("\n");
+  printf("xiUH_J=\n");
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiUH_J[i]);
+  }
+  printf("\n");
   printf("-------------------------------------------------\n");
 
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < M; i++) {sigmaU_JO[i] = TrueNoiseSynd[i];}
+  for (int i = 0; i < M; i++)
+  {
+    sigmaU_JO[i] = TrueNoiseSynd[i];
+  }
 
-  calcSyndrome(sigmaU,    M,xiU,       MatValue,RowDeg,ADDGF, MULGF,Mat);
-  calcSyndrome(sigmaU_J,  M,xiU_J_ZP,  MatValue,RowDeg,ADDGF, MULGF,Mat);
-  calcSyndrome(sigmaU_JO, M,xiU_JO_ZP, MatValue,RowDeg,ADDGF, MULGF,Mat);
-  calcSyndrome(sigmaUH_JO,M,xiUH_JO_ZP,MatValue,RowDeg,ADDGF, MULGF,Mat);
+  calcSyndrome(sigmaU, M, xiU, MatValue, RowDeg, ADDGF, MULGF, Mat);
+  calcSyndrome(sigmaU_J, M, xiU_J_ZP, MatValue, RowDeg, ADDGF, MULGF, Mat);
+  calcSyndrome(sigmaU_JO, M, xiU_JO_ZP, MatValue, RowDeg, ADDGF, MULGF, Mat);
+  calcSyndrome(sigmaUH_JO, M, xiUH_JO_ZP, MatValue, RowDeg, ADDGF, MULGF, Mat);
 
-  printf("sigmaU_JO=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaU_JO[rows[i]]);}printf("\n");
+  printf("sigmaU_JO=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_JO[rows[i]]);
+  }
+  printf("\n");
 
-  printf("sigmaUH_JO=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaUH_JO[rows[i]]);}printf("\n");
+  printf("sigmaUH_JO=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaUH_JO[rows[i]]);
+  }
+  printf("\n");
   // Conditional branch.
-  if (isEqual(sigmaU_JO, sigmaUH_JO, M)) {
+  if (isEqual(sigmaU_JO, sigmaUH_JO, M))
+  {
     std::cout << "sigmaU_JO == sigmaUH_JO" << std::endl;
-  } else {
-  std::cout << "sigmaU_JO != sigmaUH_JO" << std::endl;
-}
-printf("-------------------------------------------------\n");
-// Loop: iterate over a range/collection.
-for (int i = 0; i < M; i++) {
-  sigmaU_J_plus_sigmaU_JO[i] = ADDGF[sigmaU_J[i]][sigmaU_JO[i]];
-}
-printf("sigmaU_J_plus_sigmaU_JO=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaU_J_plus_sigmaU_JO[rows[i]]);}printf("\n");
-printf("sigmaU=\n"); for(int i=0;i<rows.size();i++){printf("%3x",sigmaU[rows[i]]);}printf("\n");
-// Conditional branch.
-if(isEqual(sigmaU_J_plus_sigmaU_JO, sigmaU, M)){
-  std::cout << "sigmaU_J + sigmaU_JO == sigmaU" << std::endl;
-}else{
-std::cout << "sigmaU_J + sigmaU_JO != sigmaU" << std::endl;
-}
-printf("-------------------------------------------------\n");
-printf("sigmaU_J=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaU_J[rows[i]]);}printf("\n");
-printf("sigmaUH_JO=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaUH_JO[rows[i]]);}printf("\n");
-// Loop: iterate over a range/collection.
-for (int i = 0; i < M; i++) {
-  sigmaU_J_plus_sigmaUH_JO[i] = ADDGF[sigmaU_J[i]][sigmaUH_JO[i]];
-}
-
-printf("(sigmaU_J_plus_sigmaUH_JO)_I=\n");
-// Loop: iterate over a range/collection.
-for (int i = 0; i < rows.size(); i++) {
-  printf("%3x", sigmaU_J_plus_sigmaUH_JO[rows[i]]);
-}
-printf("\n");
-printf("-------------------------------------------------\n");
-printf("sigmaU=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaU[rows[i]]);}printf("\n");
-printf("sigmaUH_JO=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaUH_JO[rows[i]]);}printf("\n");
-vector<int> RHS_b(rows.size(), 0);
-
-// Loop: iterate over a range/collection.
-for (size_t i = 0; i < rows.size(); i++) {
-  RHS_b[i] = ADDGF[sigmaU[rows[i]]][sigmaUH_JO[rows[i]]];
-}
-printf("(sigmaU-sigmaUH_JO)_I=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<RHS_b.size();i++){printf("%3x",RHS_b[i]);}printf("\n");
-printf("-------------------------------------------------\n");
-printf("sigmaU_J=\n");for(int i=0;i<rows.size();i++){printf("%3x",sigmaU_J[rows[i]]);}printf("\n");
-printf("-------------------------------------------------\n");
-
-printf("(sigmaU_JO)_I=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<rows.size();i++){printf("%3x",sigmaU_JO[rows[i]]);}printf("\n");
-printf("xiU_J=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<cols.size();i++){printf("%3x",xiU_J[i]);}printf("\n");
-printf("xiUH_J=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<cols.size();i++){printf("%3x",xiUH_J[i]);}printf("\n");
-printf("-------------------------------------------------\n");
-
-vector<int> LHS_b(rows.size(), 0);
-// Loop: iterate over a range/collection.
-for (size_t i = 0; i < rows.size(); i++) {
-  // Loop: iterate over a range/collection.
-  for (size_t j = 0; j < cols.size(); j++) {
-    int t=MULGF[A[i][j]][xiU_J[j]];
-    LHS_b[i] = ADDGF[LHS_b[i]][t];
   }
-}
-
-printf("LHS_b=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<LHS_b.size();i++){printf("%3x",LHS_b[i]);}printf("\n");
-printf("-------------------------------------------------\n");
-
-printf("RHS_b=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<RHS_b.size();i++){printf("%3x",RHS_b[i]);}printf("\n");
-printf("xiU_J=\n");
-// Loop: iterate over a range/collection.
-for(int i=0;i<cols.size();i++){printf("%3x",xiU_J[i]);}printf("\n");
-
-printf("-------------------------------------------------\n");
-// Conditional branch.
-if(isEqual(LHS_b, RHS_b, rows.size())){
-  std::cout << "True noise gets verification successful: Ay = b holds." << std::endl;
-}else{
-std::cout << "Error: Ay != b. Verification failed!" << std::endl;
-}
-printf("-------------------------------------------------\n");
-
-int weight_xiU=0;
-// Loop: iterate over a range/collection.
-for (int i = 0; i < cols.size(); i++) {
+  else
+  {
+    std::cout << "sigmaU_JO != sigmaUH_JO" << std::endl;
+  }
+  printf("-------------------------------------------------\n");
   // Loop: iterate over a range/collection.
-  for(int l=0;l<logGF;l++){
-    // Conditional branch.
-    if((BINGF[xiU_J[i]][l])){
-      weight_xiU++;
+  for (int i = 0; i < M; i++)
+  {
+    sigmaU_J_plus_sigmaU_JO[i] = ADDGF[sigmaU_J[i]][sigmaU_JO[i]];
+  }
+  printf("sigmaU_J_plus_sigmaU_JO=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_J_plus_sigmaU_JO[rows[i]]);
+  }
+  printf("\n");
+  printf("sigmaU=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU[rows[i]]);
+  }
+  printf("\n");
+  // Conditional branch.
+  if (isEqual(sigmaU_J_plus_sigmaU_JO, sigmaU, M))
+  {
+    std::cout << "sigmaU_J + sigmaU_JO == sigmaU" << std::endl;
+  }
+  else
+  {
+    std::cout << "sigmaU_J + sigmaU_JO != sigmaU" << std::endl;
+  }
+  printf("-------------------------------------------------\n");
+  printf("sigmaU_J=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_J[rows[i]]);
+  }
+  printf("\n");
+  printf("sigmaUH_JO=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaUH_JO[rows[i]]);
+  }
+  printf("\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < M; i++)
+  {
+    sigmaU_J_plus_sigmaUH_JO[i] = ADDGF[sigmaU_J[i]][sigmaUH_JO[i]];
+  }
+
+  printf("(sigmaU_J_plus_sigmaUH_JO)_I=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_J_plus_sigmaUH_JO[rows[i]]);
+  }
+  printf("\n");
+  printf("-------------------------------------------------\n");
+  printf("sigmaU=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU[rows[i]]);
+  }
+  printf("\n");
+  printf("sigmaUH_JO=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaUH_JO[rows[i]]);
+  }
+  printf("\n");
+  vector<int> RHS_b(rows.size(), 0);
+
+  // Loop: iterate over a range/collection.
+  for (size_t i = 0; i < rows.size(); i++)
+  {
+    RHS_b[i] = ADDGF[sigmaU[rows[i]]][sigmaUH_JO[rows[i]]];
+  }
+  printf("(sigmaU-sigmaUH_JO)_I=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < RHS_b.size(); i++)
+  {
+    printf("%3x", RHS_b[i]);
+  }
+  printf("\n");
+  printf("-------------------------------------------------\n");
+  printf("sigmaU_J=\n");
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_J[rows[i]]);
+  }
+  printf("\n");
+  printf("-------------------------------------------------\n");
+
+  printf("(sigmaU_JO)_I=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < rows.size(); i++)
+  {
+    printf("%3x", sigmaU_JO[rows[i]]);
+  }
+  printf("\n");
+  printf("xiU_J=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiU_J[i]);
+  }
+  printf("\n");
+  printf("xiUH_J=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiUH_J[i]);
+  }
+  printf("\n");
+  printf("-------------------------------------------------\n");
+
+  vector<int> LHS_b(rows.size(), 0);
+  // Loop: iterate over a range/collection.
+  for (size_t i = 0; i < rows.size(); i++)
+  {
+    // Loop: iterate over a range/collection.
+    for (size_t j = 0; j < cols.size(); j++)
+    {
+      int t = MULGF[A[i][j]][xiU_J[j]];
+      LHS_b[i] = ADDGF[LHS_b[i]][t];
     }
   }
-}
-printf("weight_xiU=%d\n",weight_xiU);
 
-auto res = solveLinearEquations(A, RHS_b, ADDGF, MULGF, DIVGF);
-vector<int> solution = res.second;
-// Conditional branch.
-if(res.first){
-  printf("A solution exists\n");
-
-  printf("A=\n");
+  printf("LHS_b=\n");
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < A.size(); i++) {
-    // Loop: iterate over a range/collection.
-    for (int j = 0; j < A[0].size(); j++) {
-      printf("%3x",A[i][j]);
-    }
-    printf("\n");
+  for (int i = 0; i < LHS_b.size(); i++)
+  {
+    printf("%3x", LHS_b[i]);
   }
+  printf("\n");
+  printf("-------------------------------------------------\n");
 
-  printf("solution=\n");
+  printf("RHS_b=\n");
   // Loop: iterate over a range/collection.
-  for(int i=0;i<cols.size();i++){printf("%3x",res.second[i]);}printf("\n");
+  for (int i = 0; i < RHS_b.size(); i++)
+  {
+    printf("%3x", RHS_b[i]);
+  }
+  printf("\n");
+  printf("xiU_J=\n");
+  // Loop: iterate over a range/collection.
+  for (int i = 0; i < cols.size(); i++)
+  {
+    printf("%3x", xiU_J[i]);
+  }
+  printf("\n");
 
-  int weight_solution=0;
+  printf("-------------------------------------------------\n");
+  // Conditional branch.
+  if (isEqual(LHS_b, RHS_b, rows.size()))
+  {
+    std::cout << "True noise gets verification successful: Ay = b holds." << std::endl;
+  }
+  else
+  {
+    std::cout << "Error: Ay != b. Verification failed!" << std::endl;
+  }
+  printf("-------------------------------------------------\n");
+
+  int weight_xiU = 0;
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < solution.size(); i++) {
+  for (int i = 0; i < cols.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int l=0;l<logGF;l++){
+    for (int l = 0; l < logGF; l++)
+    {
       // Conditional branch.
-      if((BINGF[solution[i]][l])){
-        weight_solution++;
+      if ((BINGF[xiU_J[i]][l]))
+      {
+        weight_xiU++;
       }
     }
   }
-  printf("weight_solution=%d\n",weight_solution);
+  printf("weight_xiU=%d\n", weight_xiU);
 
-  vector<int> x = res.second;
-  // Loop: iterate over a range/collection.
-  for(int k=0;k<cols.size();k++){
-    int j=cols[k];
-    EstmNoise[j]=x[k];
-  }
+  auto res = solveLinearEquations(A, RHS_b, ADDGF, MULGF, DIVGF);
+  vector<int> solution = res.second;
+  // Conditional branch.
+  if (res.first)
+  {
+    printf("A solution exists\n");
 
-  vector<int> verify_b(rows.size(), 0);
-  // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < rows.size(); i++) {
+    printf("A=\n");
     // Loop: iterate over a range/collection.
-    for (size_t j = 0; j < cols.size(); j++) {
-      int t=MULGF[A[i][j]][xiU_J[j]];
-      verify_b[i] = ADDGF[verify_b[i]][t];
+    for (int i = 0; i < A.size(); i++)
+    {
+      // Loop: iterate over a range/collection.
+      for (int j = 0; j < A[0].size(); j++)
+      {
+        printf("%3x", A[i][j]);
+      }
+      printf("\n");
     }
-  }
 
-  printf("verify_b=\n");
-  // Loop: iterate over a range/collection.
-  for(int i=0;i<verify_b.size();i++){printf("%3x",verify_b[i]);}printf("\n");
-  printf("***decode_small_errors_from_rows_cols %d\n", res.first);
-}else{
-printf("No solution exists\n");
-printf("***decode_small_errors_from_rows_cols %d\n", res.first);
-}
+    printf("solution=\n");
+    // Loop: iterate over a range/collection.
+    for (int i = 0; i < cols.size(); i++)
+    {
+      printf("%3x", res.second[i]);
+    }
+    printf("\n");
+
+    int weight_solution = 0;
+    // Loop: iterate over a range/collection.
+    for (int i = 0; i < solution.size(); i++)
+    {
+      // Loop: iterate over a range/collection.
+      for (int l = 0; l < logGF; l++)
+      {
+        // Conditional branch.
+        if ((BINGF[solution[i]][l]))
+        {
+          weight_solution++;
+        }
+      }
+    }
+    printf("weight_solution=%d\n", weight_solution);
+
+    vector<int> x = res.second;
+    // Loop: iterate over a range/collection.
+    for (int k = 0; k < cols.size(); k++)
+    {
+      int j = cols[k];
+      EstmNoise[j] = x[k];
+    }
+
+    vector<int> verify_b(rows.size(), 0);
+    // Loop: iterate over a range/collection.
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+      // Loop: iterate over a range/collection.
+      for (size_t j = 0; j < cols.size(); j++)
+      {
+        int t = MULGF[A[i][j]][xiU_J[j]];
+        verify_b[i] = ADDGF[verify_b[i]][t];
+      }
+    }
+
+    printf("verify_b=\n");
+    // Loop: iterate over a range/collection.
+    for (int i = 0; i < verify_b.size(); i++)
+    {
+      printf("%3x", verify_b[i]);
+    }
+    printf("\n");
+    printf("***decode_small_errors_from_rows_cols %d\n", res.first);
+  }
+  else
+  {
+    printf("No solution exists\n");
+    printf("***decode_small_errors_from_rows_cols %d\n", res.first);
+  }
 }
 // Function: decode_small_errors
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void decode_small_errors(vector<int>& TrueNoiseSynd, vector<int>& TrueNoise_C, int M, int N, vector<int>& EstmNoise, vector<int>& RowDeg, vector<int>& Candidate_Covering_Normal_Rows_D, vector<vector<int>>& UTCBC_Rows_C_orthogonal_D, vector<vector<int>>& UTCBC_Cols_C_orthogonal_D, vector<vector<int>>& IatJ_C, vector<vector<int>>& JatI_C, vector<vector<int>>& Mat, vector<vector<int>>& MatValue, vector<vector<int>>& MULGF, vector<vector<int>>& ADDGF, vector<vector<int>>& DIVGF, vector<vector<int>>& BINGF){
+void decode_small_errors(vector<int> &TrueNoiseSynd, vector<int> &TrueNoise_C, int M, int N, vector<int> &EstmNoise, vector<int> &RowDeg, vector<int> &Candidate_Covering_Normal_Rows_D, vector<vector<int>> &UTCBC_Rows_C_orthogonal_D, vector<vector<int>> &UTCBC_Cols_C_orthogonal_D, vector<vector<int>> &IatJ_C, vector<vector<int>> &JatI_C, vector<vector<int>> &Mat, vector<vector<int>> &MatValue, vector<vector<int>> &MULGF, vector<vector<int>> &ADDGF, vector<vector<int>> &DIVGF, vector<vector<int>> &BINGF)
+{
   printf("@@@decode_small_errors\n");
 
-  set<int> rows_set,cols_set;
-  printf("Candidate_Covering_Normal_Rows_D(%d):",Candidate_Covering_Normal_Rows_D.size());for(int i:Candidate_Covering_Normal_Rows_D){printf("%5d ",i);}printf("\n");
+  set<int> rows_set, cols_set;
+  printf("Candidate_Covering_Normal_Rows_D(%zu):", Candidate_Covering_Normal_Rows_D.size());
+  for (int i : Candidate_Covering_Normal_Rows_D)
+  {
+    printf("%5d ", i);
+  }
+  printf("\n");
   // Loop: iterate over a range/collection.
-  for (int i : Candidate_Covering_Normal_Rows_D) {
+  for (int i : Candidate_Covering_Normal_Rows_D)
+  {
     // Loop: iterate over a range/collection.
-    for (int ii : UTCBC_Rows_C_orthogonal_D[i]) {
+    for (int ii : UTCBC_Rows_C_orthogonal_D[i])
+    {
       rows_set.insert(ii);
     }
     // Loop: iterate over a range/collection.
-    for (int jj : UTCBC_Cols_C_orthogonal_D[i]) {
+    for (int jj : UTCBC_Cols_C_orthogonal_D[i])
+    {
       cols_set.insert(jj);
     }
   }
@@ -2001,10 +5837,12 @@ void decode_small_errors(vector<int>& TrueNoiseSynd, vector<int>& TrueNoise_C, i
 // Function: gcd
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int gcd(int a, int b){
+int gcd(int a, int b)
+{
   int c;
   // Loop: repeat while condition holds.
-  while (b != 0)    {
+  while (b != 0)
+  {
     c = a % b;
     a = b;
     b = c;
@@ -2014,63 +5852,72 @@ int gcd(int a, int b){
 // Function: inv
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int inv(int x, int P){
-  int a=x/P;
-  int b=x%P;
-  int aa=inv_ZP[a];
-  int bb=((P-b)*inv_ZP[a])%P;
-  return aa*P+bb;
+int inv(int x, int P)
+{
+  int a = x / P;
+  int b = x % P;
+  int aa = inv_ZP[a];
+  int bb = ((P - b) * inv_ZP[a]) % P;
+  return aa * P + bb;
 }
 // Function: mult
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int mult(int x, int y, int P){
+int mult(int x, int y, int P)
+{
 
-  int a=x/P;
-  int b=x%P;
-  int aa=y/P;
-  int bb=y%P;
-  int aaa=(a*aa)%P;
-  int bbb=(a*bb+b)%P;
-  return aaa*P+bbb;
+  int a = x / P;
+  int b = x % P;
+  int aa = y / P;
+  int bb = y % P;
+  int aaa = (a * aa) % P;
+  int bbb = (a * bb + b) % P;
+  return aaa * P + bbb;
 }
 // Function: mult_apm
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int mult_apm(int x,int y,int P){
-  return mult(x,y,P);
+int mult_apm(int x, int y, int P)
+{
+  return mult(x, y, P);
 }
 // Function: print_apm
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void print_apm(int x,int P){
+void print_apm(int x, int P)
+{
   // Conditional branch.
-  if(x)
-  cout << setw(log10(P)+1) << x/P << "X+" << setw(log10(P)+1) << x%P << " ";
+  if (x)
+    cout << setw(log10(P) + 1) << x / P << "X+" << setw(log10(P) + 1) << x % P << " ";
   else
-  cout << setw(log10(P)+1) << "" << "  " << setw(log10(P)+1) << "" << " ";
+    cout << setw(log10(P) + 1) << "" << "  " << setw(log10(P) + 1) << "" << " ";
 }
 // Function: inv_apm
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int inv_apm(int x, int P){
+int inv_apm(int x, int P)
+{
 
-  int a=x/P;
-  int b=x%P;
-  int aa=inv_ZP[a];
-  int bb=((P-b)*inv_ZP[a])%P;
+  int a = x / P;
+  int b = x % P;
+  int aa = inv_ZP[a];
+  int bb = ((P - b) * inv_ZP[a]) % P;
   // Conditional branch.
-  if(aa<0 || bb<0){
-    print_apm(aa*P+bb,P);exit(0);
+  if (aa < 0 || bb < 0)
+  {
+    print_apm(aa * P + bb, P);
+    exit(0);
   }
-  return aa*P+bb;
+  return aa * P + bb;
 }
 // Function: extended_gcd
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int extended_gcd(int a, int b, int &x, int &y) {
+int extended_gcd(int a, int b, int &x, int &y)
+{
   // Conditional branch.
-  if (a == 0) {
+  if (a == 0)
+  {
     x = 0;
     y = 1;
     return b;
@@ -2084,44 +5931,53 @@ int extended_gcd(int a, int b, int &x, int &y) {
 // Function: mod_inverse
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int mod_inverse(int a, int P) {
+int mod_inverse(int a, int P)
+{
   int x, y;
   int gcd = extended_gcd(a, P, x, y);
   // Conditional branch.
-  if (gcd != 1) {
+  if (gcd != 1)
+  {
     throw invalid_argument("No modular inverse exists");
-  } else {
-  return (x % P + P) % P;
-}
+  }
+  else
+  {
+    return (x % P + P) % P;
+  }
 }
 // Function: construct_inv_ZP
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void construct_inv_ZP(int P){
+void construct_inv_ZP(int P)
+{
 
   cout << "constructing inv_ZP" << endl;
-  inv_ZP= vector<int>(P);
-  inv_ZP[1]=1;
+  inv_ZP = vector<int>(P);
+  inv_ZP[1] = 1;
   // Loop: iterate over a range/collection.
-  for(int a=0;a<P;a++){
+  for (int a = 0; a < P; a++)
+  {
     // Conditional branch.
-    if(gcd(a,P)==1){
+    if (gcd(a, P) == 1)
+    {
       inv_ZP[a] = mod_inverse(a, P);
-
     }
   }
   cout << "Verify that z = x * invx equals 1 in Z_P." << endl;
   // Loop: iterate over a range/collection.
-  for(unsigned int x=0;x<P;x++){
+  for (unsigned int x = 0; x < P; x++)
+  {
 
     // Conditional branch.
-    if(gcd(x/P,P)==1){
-      int invx=inv_apm(x,P);
-      int z=mult(x,invx,P);
+    if (gcd(x / P, P) == 1)
+    {
+      int invx = inv_apm(x, P);
+      int z = mult(x, invx, P);
       // Conditional branch.
-      if(z!=P){
+      if (z != P)
+      {
         cout << "error" << endl;
-        cout<< x << " " << invx << " " << z << endl;
+        cout << x << " " << invx << " " << z << endl;
         exit(0);
       }
     }
@@ -2131,42 +5987,50 @@ void construct_inv_ZP(int P){
 // Function: commute
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool commute(int x, int y, int P){
-  int a=x/P;
-  int b=x%P;
-  int c=y/P;
-  int d=y%P;
-  return ((c*b+d)%P==(a*d+b)%P);
+bool commute(int x, int y, int P)
+{
+  int a = x / P;
+  int b = x % P;
+  int c = y / P;
+  int d = y % P;
+  return ((c * b + d) % P == (a * d + b) % P);
 }
 // Function: print_commute_matrix_ff_gg
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void print_commute_matrix_ff_gg(vector<int>& ff,vector<int>& gg,int P){
+void print_commute_matrix_ff_gg(vector<int> &ff, vector<int> &gg, int P)
+{
   cout << "@print_commute_matrix_ff_gg" << endl;
   cout << "commute matrix ff,ff" << endl;
   // Loop: iterate over a range/collection.
-  for(int i=0;i<ff.size();i++){
+  for (int i = 0; i < ff.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int j=0;j<ff.size();j++){
-      cout << commute(ff[i],ff[j],P);
+    for (int j = 0; j < ff.size(); j++)
+    {
+      cout << commute(ff[i], ff[j], P);
     }
     cout << endl;
   }
   cout << "commute matrix ff,gg" << endl;
   // Loop: iterate over a range/collection.
-  for(int i=0;i<ff.size();i++){
+  for (int i = 0; i < ff.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int j=0;j<gg.size();j++){
-      cout << commute(ff[i],gg[j],P);
+    for (int j = 0; j < gg.size(); j++)
+    {
+      cout << commute(ff[i], gg[j], P);
     }
     cout << endl;
   }
   cout << "commute matrix gg,gg" << endl;
   // Loop: iterate over a range/collection.
-  for(int i=0;i<gg.size();i++){
+  for (int i = 0; i < gg.size(); i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int j=0;j<gg.size();j++){
-      cout << commute(gg[i],gg[j],P);
+    for (int j = 0; j < gg.size(); j++)
+    {
+      cout << commute(gg[i], gg[j], P);
     }
     cout << endl;
   }
@@ -2174,32 +6038,46 @@ void print_commute_matrix_ff_gg(vector<int>& ff,vector<int>& gg,int P){
 // Function: print_ff_gg
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void print_ff_gg(vector<int> ff,vector<int> gg,int P){
-  cout << "ff=";for(int i=0;i<ff.size();i++){cout << setw(5) << ff[i]/P << "X+" << setw(5) << ff[i]%P << " ";}cout << endl;
-  cout << "gg=";for(int i=0;i<gg.size();i++){cout << setw(5) << gg[i]/P << "X+" << setw(5) << gg[i]%P << " ";}cout << endl;
+void print_ff_gg(vector<int> ff, vector<int> gg, int P)
+{
+  cout << "ff=";
+  for (int i = 0; i < ff.size(); i++)
+  {
+    cout << setw(5) << ff[i] / P << "X+" << setw(5) << ff[i] % P << " ";
+  }
+  cout << endl;
+  cout << "gg=";
+  for (int i = 0; i < gg.size(); i++)
+  {
+    cout << setw(5) << gg[i] / P << "X+" << setw(5) << gg[i] % P << " ";
+  }
+  cout << endl;
 }
 // Function: print_Hc_pair
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void print_Hc_pair(vector<vector<int>> HcA,vector<vector<int>>  HcB, int P){
+void print_Hc_pair(vector<vector<int>> HcA, vector<vector<int>> HcB, int P)
+{
 
   cout << "HcA=" << endl;
   // Loop: iterate over a range/collection.
-  for(int j=0;j<HcA.size();j++){
+  for (int j = 0; j < HcA.size(); j++)
+  {
     // Loop: iterate over a range/collection.
-    for(int l=0;l<HcA[0].size();l++){
-      print_apm(HcA[j][l],P);
-
+    for (int l = 0; l < HcA[0].size(); l++)
+    {
+      print_apm(HcA[j][l], P);
     }
     cout << endl;
   }
   cout << "HcB=" << endl;
   // Loop: iterate over a range/collection.
-  for(int j=0;j<HcB.size();j++){
+  for (int j = 0; j < HcB.size(); j++)
+  {
     // Loop: iterate over a range/collection.
-    for(int l=0;l<HcB[0].size();l++){
-      print_apm(HcB[j][l],P);
-
+    for (int l = 0; l < HcB[0].size(); l++)
+    {
+      print_apm(HcB[j][l], P);
     }
     cout << endl;
   }
@@ -2207,48 +6085,63 @@ void print_Hc_pair(vector<vector<int>> HcA,vector<vector<int>>  HcB, int P){
 // Function: construct_HcA_HcB_from_ff_gg
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void construct_HcA_HcB_from_ff_gg(vector<vector<int>> &HcA,vector<vector<int>> &HcB,vector<int> ff,vector<int> gg, int J, int L, int P){
-  int L2=L/2;
+void construct_HcA_HcB_from_ff_gg(vector<vector<int>> &HcA, vector<vector<int>> &HcB, vector<int> ff, vector<int> gg, int J, int L, int P)
+{
+  int L2 = L / 2;
 
-  HcA=vector<vector<int>>(J);
-  HcB=vector<vector<int>>(J);
+  HcA = vector<vector<int>>(J);
+  HcB = vector<vector<int>>(J);
   // Loop: iterate over a range/collection.
-  for(int j=0;j<J;j++){HcA[j]=vector<int>(L,0);}
+  for (int j = 0; j < J; j++)
+  {
+    HcA[j] = vector<int>(L, 0);
+  }
   // Loop: iterate over a range/collection.
-  for(int j=0;j<J;j++){HcB[j]=vector<int>(L,0);}
+  for (int j = 0; j < J; j++)
+  {
+    HcB[j] = vector<int>(L, 0);
+  }
   // Loop: iterate over a range/collection.
-  for(int i=0;i<J;i++){
+  for (int i = 0; i < J; i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int l=0;l<L/2;l++){
-      int j=i;
-      HcA[i][l]    =ff[(l-j+L/2)%(L/2)];
-      HcA[i][l+L/2]=gg[(l-j+L/2)%(L/2)];
+    for (int l = 0; l < L / 2; l++)
+    {
+      int j = i;
+      HcA[i][l] = ff[(l - j + L / 2) % (L / 2)];
+      HcA[i][l + L / 2] = gg[(l - j + L / 2) % (L / 2)];
     }
   }
   // Loop: iterate over a range/collection.
-  for(int i=0;i<J;i++){
+  for (int i = 0; i < J; i++)
+  {
     // Loop: iterate over a range/collection.
-    for(int l=0;l<L/2;l++){
-      int k=i;
-      HcB[i][l]    =inv(gg[(k-l+L/2)%(L/2)],P);
-      HcB[i][l+L/2]=inv(ff[(k-l+L/2)%(L/2)],P);
+    for (int l = 0; l < L / 2; l++)
+    {
+      int k = i;
+      HcB[i][l] = inv(gg[(k - l + L / 2) % (L / 2)], P);
+      HcB[i][l + L / 2] = inv(ff[(k - l + L / 2) % (L / 2)], P);
     }
   }
 
-  print_Hc_pair(HcA,HcB,P);
+  print_Hc_pair(HcA, HcB, P);
   cout << "Verify orthogonality of HcA and HcB" << endl;
   // Loop: iterate over a range/collection.
-  for(int k=0;k<J;k++){
+  for (int k = 0; k < J; k++)
+  {
     // Loop: iterate over a range/collection.
-    for(int j=0;j<J;j++){
+    for (int j = 0; j < J; j++)
+    {
       // Loop: iterate over a range/collection.
-      for(int i=0;i<L/2;i++){
-        cout << setw(3) << mult(ff[(i-j+L2)%L2],gg[(k-i+L2)%L2],P) << " ";
+      for (int i = 0; i < L / 2; i++)
+      {
+        cout << setw(3) << mult(ff[(i - j + L2) % L2], gg[(k - i + L2) % L2], P) << " ";
       }
       cout << "|";
       // Loop: iterate over a range/collection.
-      for(int i=0;i<L/2;i++){
-        cout << setw(3) << mult(gg[(i-j+L2)%L2],ff[(k-i+L2)%L2],P) << " ";
+      for (int i = 0; i < L / 2; i++)
+      {
+        cout << setw(3) << mult(gg[(i - j + L2) % L2], ff[(k - i + L2) % L2], P) << " ";
       }
       cout << endl;
     }
@@ -2258,26 +6151,29 @@ void construct_HcA_HcB_from_ff_gg(vector<vector<int>> &HcA,vector<vector<int>> &
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void make_JatI_IatJ(
-vector<vector<int>> Hc,
-vector<vector<int>>& JatI,
-vector<vector<int>>& IatJ,
-int J,int L, int P
-){
-  JatI = vector<vector<int>>(P*Hc.size());
-  IatJ = vector<vector<int>>(P*Hc[0].size());
+    vector<vector<int>> Hc,
+    vector<vector<int>> &JatI,
+    vector<vector<int>> &IatJ,
+    int J, int L, int P)
+{
+  JatI = vector<vector<int>>(P * Hc.size());
+  IatJ = vector<vector<int>>(P * Hc[0].size());
 
   // Loop: iterate over a range/collection.
-  for(int j=0;j<Hc.size();j++){
+  for (int j = 0; j < Hc.size(); j++)
+  {
 
     // Loop: iterate over a range/collection.
-    for(int l=0;l<Hc[0].size();l++){
-      int a=Hc[j][l]/P;
-      int b=Hc[j][l]%P;
+    for (int l = 0; l < Hc[0].size(); l++)
+    {
+      int a = Hc[j][l] / P;
+      int b = Hc[j][l] % P;
       // Loop: iterate over a range/collection.
-      for(int y=0;y<P;y++){
-        int x=(a*y+b)%P;
-        JatI[j*P+x].push_back(l*P+y);
-        IatJ[l*P+y].push_back(j*P+x);
+      for (int y = 0; y < P; y++)
+      {
+        int x = (a * y + b) % P;
+        JatI[j * P + x].push_back(l * P + y);
+        IatJ[l * P + y].push_back(j * P + x);
       }
     }
   }
@@ -2286,28 +6182,29 @@ int J,int L, int P
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void make_full_JatI_IatJ(
-vector<vector<int>>& full_JatI_A,
-vector<vector<int>>& full_IatJ_A,
-vector<vector<int>>& full_JatI_B,
-vector<vector<int>>& full_IatJ_B,
-vector<int>& ff,
-vector<int>& gg,
-int P){
-  int L2=ff.size();
-  int L=L2*2;
+    vector<vector<int>> &full_JatI_A,
+    vector<vector<int>> &full_IatJ_A,
+    vector<vector<int>> &full_JatI_B,
+    vector<vector<int>> &full_IatJ_B,
+    vector<int> &ff,
+    vector<int> &gg,
+    int P)
+{
+  int L2 = ff.size();
+  int L = L2 * 2;
   vector<vector<int>> HcA, HcB;
-  construct_HcA_HcB_from_ff_gg(HcA,HcB,ff,gg, L2, L,P);
+  construct_HcA_HcB_from_ff_gg(HcA, HcB, ff, gg, L2, L, P);
 
   make_JatI_IatJ(HcA, full_JatI_A, full_IatJ_A, L2, L, P);
   make_JatI_IatJ(HcB, full_JatI_B, full_IatJ_B, L2, L, P);
-
 }
 // Function: load_matrix
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void load_matrix(const char* MatrixFilePrefix_X, int& N_X, int& M_X, int P_X, int L, vector<vector<int>>& Mat_X, vector<vector<int>>& MatValue_X, vector<int>& ColDeg_X, vector<int>& RowDeg_X, vector<vector<int>>& JatI_X, vector<vector<int>>& IatJ_X, vector<vector<int>>& full_JatI_X, vector<vector<int>>& full_IatJ_X) {
+void load_matrix(const char *MatrixFilePrefix_X, int &N_X, int &M_X, int P_X, int L, vector<vector<int>> &Mat_X, vector<vector<int>> &MatValue_X, vector<int> &ColDeg_X, vector<int> &RowDeg_X, vector<vector<int>> &JatI_X, vector<vector<int>> &IatJ_X, vector<vector<int>> &full_JatI_X, vector<vector<int>> &full_IatJ_X)
+{
   char FileName[500];
-  FILE* f;
+  FILE *f;
 
   ColDeg_X = vector<int>(N_X);
   RowDeg_X = vector<int>(M_X);
@@ -2315,176 +6212,226 @@ void load_matrix(const char* MatrixFilePrefix_X, int& N_X, int& M_X, int P_X, in
   strcat(FileName, "_row");
   f = fopen(FileName, "r");
   // Loop: iterate over a range/collection.
-  for (size_t m = 0; m < M_X; m++) {
-    fscanf(f, "%d", &RowDeg_X[m]);
+  for (size_t m = 0; m < M_X; m++)
+  {
+    if (fscanf(f, "%d", &RowDeg_X[m]) != 1)
+    {
+      fprintf(stderr, "Failed to read RowDeg for row %zu\n", m);
+      fclose(f);
+      return;
+    }
   }
   fclose(f);
 
   Mat_X = vector<vector<int>>(M_X);
   // Loop: iterate over a range/collection.
-  for (size_t m = 0; m < M_X; m++) {
+  for (size_t m = 0; m < M_X; m++)
+  {
     Mat_X[m] = vector<int>(RowDeg_X[m]);
   }
 
   strcpy(FileName, MatrixFilePrefix_X);
   f = fopen(FileName, "r");
   // Loop: iterate over a range/collection.
-  for (size_t m = 0; m < M_X; m++) {
+  for (size_t m = 0; m < M_X; m++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t k = 0; k < RowDeg_X[m]; k++) {
-      fscanf(f, "%d", &Mat_X[m][k]);
+    for (size_t k = 0; k < RowDeg_X[m]; k++)
+    {
+      if (fscanf(f, "%d", &Mat_X[m][k]) != 1)
+      {
+        fprintf(stderr, "Failed to read Mat entry (%zu,%zu)\n", m, k);
+        fclose(f);
+        return;
+      }
     }
   }
   fclose(f);
 
   JatI_X = vector<vector<int>>(M_X);
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < M_X; i++) {
+  for (size_t i = 0; i < M_X; i++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t k = 0; k < RowDeg_X[i]; k++) {
+    for (size_t k = 0; k < RowDeg_X[i]; k++)
+    {
       JatI_X[i].push_back(Mat_X[i][k]);
     }
   }
   IatJ_X = vector<vector<int>>(N_X);
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < M_X; i++) {
+  for (size_t i = 0; i < M_X; i++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t k = 0; k < JatI_X[i].size(); k++) {
+    for (size_t k = 0; k < JatI_X[i].size(); k++)
+    {
       int j = JatI_X[i][k];
       IatJ_X[j].push_back(i);
     }
   }
-  int P=P_X;
-  printf("P=%d L=%d\n",P,L);
-  vector<int> ff(L/2);
+  int P = P_X;
+  printf("P=%d L=%d\n", P, L);
+  vector<int> ff(L / 2);
   // Loop: iterate over a range/collection.
-  for(int l=0;l<L/2;l++){
-    vector<int> a(L/2);
-    vector<int> b(L/2);
-    int j0=0;
-    int i0=IatJ_X[P*l+j0][0];
+  for (int l = 0; l < L / 2; l++)
+  {
+    vector<int> a(L / 2);
+    vector<int> b(L / 2);
+    int j0 = 0;
+    int i0 = IatJ_X[P * l + j0][0];
 
-    b[l]=i0;
-    int j1=1;
-    int i1=IatJ_X[P*l+j1][0];
+    b[l] = i0;
+    int j1 = 1;
+    int i1 = IatJ_X[P * l + j1][0];
 
-    a[l]=(i1-b[l]+P)%P;
-    ff[l]=a[l]*P+b[l];
+    a[l] = (i1 - b[l] + P) % P;
+    ff[l] = a[l] * P + b[l];
   }
-  vector<int> gg(L/2);
+  vector<int> gg(L / 2);
   // Loop: iterate over a range/collection.
-  for(int l=0;l<L/2;l++){
-    vector<int> a(L/2);
-    vector<int> b(L/2);
-    int j0=0;
-    int i0=IatJ_X[P*(l+L/2)+j0][0];
+  for (int l = 0; l < L / 2; l++)
+  {
+    vector<int> a(L / 2);
+    vector<int> b(L / 2);
+    int j0 = 0;
+    int i0 = IatJ_X[P * (l + L / 2) + j0][0];
 
-    b[l]=i0;
-    int j1=1;
-    int i1=IatJ_X[P*(l+L/2)+j1][0];
+    b[l] = i0;
+    int j1 = 1;
+    int i1 = IatJ_X[P * (l + L / 2) + j1][0];
 
-    a[l]=(i1-b[l]+P)%P;
-    gg[l]=a[l]*P+b[l];
+    a[l] = (i1 - b[l] + P) % P;
+    gg[l] = a[l] * P + b[l];
   }
-  print_ff_gg(ff,gg,P);
+  print_ff_gg(ff, gg, P);
 
   strcpy(FileName, MatrixFilePrefix_X);
   strcat(FileName, "_blockcycleminusone");
   f = fopen(FileName, "r");
   // Conditional branch.
-  if (f == NULL) {
+  if (f == NULL)
+  {
     printf("Error: File %s not found.\n", FileName);
-  }else{
-  full_JatI_X = vector<vector<int>>(M_X+P_X);
-  full_IatJ_X = vector<vector<int>>(N_X);
-  // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < M_X; i++) {
+  }
+  else
+  {
+    full_JatI_X = vector<vector<int>>(M_X + P_X);
+    full_IatJ_X = vector<vector<int>>(N_X);
     // Loop: iterate over a range/collection.
-    for(size_t j:JatI_X[i]){
-      full_JatI_X[i].push_back(j);
-      full_IatJ_X[j].push_back(i);
+    for (size_t i = 0; i < M_X; i++)
+    {
+      // Loop: iterate over a range/collection.
+      for (size_t j : JatI_X[i])
+      {
+        full_JatI_X[i].push_back(j);
+        full_IatJ_X[j].push_back(i);
+      }
+    }
+    // Loop: iterate over a range/collection.
+    for (size_t i = M_X; i < M_X + P_X; i++)
+    {
+      // Loop: iterate over a range/collection.
+      for (size_t k = 0; k < L; k++)
+      {
+        int j;
+        if (fscanf(f, "%d", &j) != 1)
+        {
+          fprintf(stderr, "Failed to read blockcycleminusone entry (%zu,%zu)\n", i, k);
+          fclose(f);
+          return;
+        }
+        full_JatI_X[i].push_back(j);
+      }
+    }
+    // Loop: iterate over a range/collection.
+    for (int i = 0; i < M_X + P_X; i++)
+    {
+      std::sort(full_JatI_X[i].begin(), full_JatI_X[i].end());
+    }
+    // Loop: iterate over a range/collection.
+    for (int j = 0; j < N_X; j++)
+    {
+      std::sort(full_IatJ_X[j].begin(), full_IatJ_X[j].end());
+    }
+    printf("Success: File %s loaded.\n", FileName);
+    fclose(f);
+  }
+  printf("000\n");
+
+  // Loop: iterate over a range/collection.
+  for (size_t m = 0; m < M_X; m++)
+  {
+    // Loop: iterate over a range/collection.
+    for (size_t i = 0; i < RowDeg_X[m]; i++)
+    {
+      ColDeg_X[Mat_X[m][i]]++;
     }
   }
+  printf("001\n");
+
+  MatValue_X = vector<vector<int>>(M_X);
   // Loop: iterate over a range/collection.
-  for (size_t i = M_X; i < M_X+P_X; i++) {
+  for (size_t m = 0; m < M_X; m++)
+  {
+    MatValue_X[m] = vector<int>(RowDeg_X[m]);
+  }
+  printf("002\n");
+  strcpy(FileName, MatrixFilePrefix_X);
+  strcat(FileName, "_value");
+  f = fopen(FileName, "r");
+  // Loop: iterate over a range/collection.
+  for (size_t m = 0; m < M_X; m++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t k = 0; k < L; k++) {
-      int j;
-      fscanf(f, "%d", &j);
-      full_JatI_X[i].push_back(j);
+    for (size_t i = 0; i < RowDeg_X[m]; i++)
+    {
+      if (fscanf(f, "%d", &MatValue_X[m][i]) != 1)
+      {
+        fprintf(stderr, "Failed to read MatValue entry (%zu,%zu)\n", m, i);
+        fclose(f);
+        return;
+      }
     }
   }
-  // Loop: iterate over a range/collection.
-  for(int i=0;i<M_X+P_X;i++){
-    std::sort(full_JatI_X[i].begin(), full_JatI_X[i].end());
-  }
-  // Loop: iterate over a range/collection.
-  for(int j=0;j<N_X;j++){
-    std::sort(full_IatJ_X[j].begin(), full_IatJ_X[j].end());
-  }
-  printf("Success: File %s loaded.\n", FileName);
   fclose(f);
-}
-printf("000\n");
-
-// Loop: iterate over a range/collection.
-for (size_t m = 0; m < M_X; m++) {
-  // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < RowDeg_X[m]; i++) {
-    ColDeg_X[Mat_X[m][i]]++;
-  }
-}
-printf("001\n");
-
-MatValue_X = vector<vector<int>>(M_X);
-// Loop: iterate over a range/collection.
-for (size_t m = 0; m < M_X; m++) {
-  MatValue_X[m] = vector<int>(RowDeg_X[m]);
-}
-printf("002\n");
-strcpy(FileName, MatrixFilePrefix_X);
-strcat(FileName, "_value");
-f = fopen(FileName, "r");
-// Loop: iterate over a range/collection.
-for (size_t m = 0; m < M_X; m++) {
-  // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < RowDeg_X[m]; i++) {
-    fscanf(f, "%d", &MatValue_X[m][i]);
-  }
-}
-fclose(f);
-printf("003\n");
+  printf("003\n");
 }
 // Function: initializeUTCBC_Rows
 // Purpose: TODO - describe the function's responsibility succinctly.
 void initializeUTCBC_Rows(int M, int P,
-vector<vector<int>>& UTCBC_Rows_C_orthogonal_D,
-vector<vector<int>>& UTCBC_Rows_D_orthogonal_C,
-vector<vector<int>>& full_JatI_C, vector<vector<int>>& IatJ_D,
-vector<vector<int>>& full_JatI_D, vector<vector<int>>& IatJ_C
-) {
+                          vector<vector<int>> &UTCBC_Rows_C_orthogonal_D,
+                          vector<vector<int>> &UTCBC_Rows_D_orthogonal_C,
+                          vector<vector<int>> &full_JatI_C, vector<vector<int>> &IatJ_D,
+                          vector<vector<int>> &full_JatI_D, vector<vector<int>> &IatJ_C)
+{
   printf("@@@initializeUTCBC_Rows\n");
 
-  UTCBC_Rows_C_orthogonal_D = vector<vector<int>>(M+P);
+  UTCBC_Rows_C_orthogonal_D = vector<vector<int>>(M + P);
   // Loop: iterate over a range/collection.
-  for (int iD = 0; iD < M+P; iD++) {
+  for (int iD = 0; iD < M + P; iD++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j : full_JatI_D[iD]) {
+    for (int j : full_JatI_D[iD])
+    {
       // Loop: iterate over a range/collection.
-      for (int iC : IatJ_C[j]) {
+      for (int iC : IatJ_C[j])
+      {
         addIfNotIncluded(UTCBC_Rows_C_orthogonal_D[iD], iC);
       }
     }
     std::sort(UTCBC_Rows_C_orthogonal_D[iD].begin(), UTCBC_Rows_C_orthogonal_D[iD].end());
   }
 
-  UTCBC_Rows_D_orthogonal_C = vector<vector<int>>(M+P);
+  UTCBC_Rows_D_orthogonal_C = vector<vector<int>>(M + P);
   // Loop: iterate over a range/collection.
-  for (int iC = 0; iC < M+P; iC++) {
+  for (int iC = 0; iC < M + P; iC++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j : full_JatI_C[iC]) {
+    for (int j : full_JatI_C[iC])
+    {
       // Loop: iterate over a range/collection.
-      for (int iD : IatJ_D[j]) {
+      for (int iD : IatJ_D[j])
+      {
         addIfNotIncluded(UTCBC_Rows_D_orthogonal_C[iC], iD);
       }
     }
@@ -2495,86 +6442,91 @@ vector<vector<int>>& full_JatI_D, vector<vector<int>>& IatJ_C
 // Function: initializeUTCBC_Cols
 // Purpose: TODO - describe the function's responsibility succinctly.
 void initializeUTCBC_Cols(int M, int P,
-vector<vector<int>>& UTCBC_Cols_C_orthogonal_D,
-vector<vector<int>>& UTCBC_Cols_D_orthogonal_C,
-vector<vector<int>>& full_JatI_C,
-vector<vector<int>>& full_JatI_D
-) {
+                          vector<vector<int>> &UTCBC_Cols_C_orthogonal_D,
+                          vector<vector<int>> &UTCBC_Cols_D_orthogonal_C,
+                          vector<vector<int>> &full_JatI_C,
+                          vector<vector<int>> &full_JatI_D)
+{
   printf("@@@initializeUTCBC_Cols\n");
 
-  UTCBC_Cols_D_orthogonal_C = vector<vector<int>>(M+P);
+  UTCBC_Cols_D_orthogonal_C = vector<vector<int>>(M + P);
   // Loop: iterate over a range/collection.
-  for (int iC = 0; iC < M+P; iC++){
-    UTCBC_Cols_D_orthogonal_C[iC]=full_JatI_C[iC];
+  for (int iC = 0; iC < M + P; iC++)
+  {
+    UTCBC_Cols_D_orthogonal_C[iC] = full_JatI_C[iC];
   }
 
-  UTCBC_Cols_C_orthogonal_D = vector<vector<int>>(M+P);
+  UTCBC_Cols_C_orthogonal_D = vector<vector<int>>(M + P);
   // Loop: iterate over a range/collection.
-  for (int iD = 0; iD < M+P; iD++) {
-    UTCBC_Cols_C_orthogonal_D[iD]=full_JatI_D[iD];
+  for (int iD = 0; iD < M + P; iD++)
+  {
+    UTCBC_Cols_C_orthogonal_D[iD] = full_JatI_D[iD];
   }
   printf("***initializeUTCBC_Cols***\n");
 }
 // Function: initialize_decoding_arrays
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void initialize_decoding_arrays(int N, int logGF, int NumEdge_C, int GF,
-vector<int>& TrueNoise_C,
-vector<vector<double>>& CNtoVNxxx_C,
-vector<vector<double>>& VNtoCNxxx_C,
-vector<vector<double>>& ChNtoVN_CD,
-vector<vector<double>>& APP_C,
-vector<int>& EstmNoise_C,
-vector<vector<double>>& VNtoChN_CD) {
+void initialize_decoding_arrays(int N,
+                                int logGF,
+                                int NumEdge_C,
+                                int GF,
+                                vector<int> &TrueNoise_C,
+                                FlatMatrix &CNtoVNxxx_C,
+                                FlatMatrix &VNtoCNxxx_C,
+                                FlatMatrix &ChNtoVN_CD,
+                                FlatMatrix &APP_C,
+                                vector<int> &EstmNoise_C,
+                                FlatMatrix &VNtoChN_CD)
+{
   cout << "@@@ initialize_decoding_arrays" << endl;
   TrueNoise_C.resize(N);
-  CNtoVNxxx_C.resize(NumEdge_C);
-  // Loop: iterate over a range/collection.
-  for(size_t l=0;l<NumEdge_C;l++) { CNtoVNxxx_C[l].resize(GF); }
-  VNtoCNxxx_C.resize(NumEdge_C);
-  // Loop: iterate over a range/collection.
-  for(size_t l=0;l<NumEdge_C;l++) { VNtoCNxxx_C[l].resize(GF); }
-  ChNtoVN_CD.resize(N);
-  // Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++) { ChNtoVN_CD[n].resize(GF); }
-  APP_C.resize(N);
-  // Loop: iterate over a range/collection.
-  for(size_t n=0;n<N;n++) { APP_C[n].resize(GF); }
+  CNtoVNxxx_C.resize(NumEdge_C, GF);
+  VNtoCNxxx_C.resize(NumEdge_C, GF);
+  ChNtoVN_CD.resize(N, GF);
+  APP_C.resize(N, GF);
   EstmNoise_C.resize(N);
-  VNtoChN_CD.resize(N);
-  // Loop: iterate over a range/collection.
-  for (size_t n = 0; n < N; n++) {
-    VNtoChN_CD[n].resize(GF);
-  }
+  VNtoChN_CD.resize(N, GF);
   cout << "*** initialize_decoding_arrays" << endl;
 }
 // Function: initialize_interleaver
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void initialize_interleaver(int N, int M, int*& ColDeg_C, int*& RowDeg_C, int**& Mat_C, int**& NtoB_C, vector<int>& Interleaver_C, int& NumEdge_C) {
+void initialize_interleaver(int N, int M, int *&ColDeg_C, int *&RowDeg_C, int **&Mat_C, int **&NtoB_C, vector<int> &Interleaver_C, int &NumEdge_C)
+{
   cout << "@@@ initialize_interleaver" << endl;
   vector<int> ind(N, 0);
   NumEdge_C = 0;
   // Loop: iterate over a range/collection.
-  for(size_t m = 0; m < M; m++) { NumEdge_C += RowDeg_C[m]; }
-  NtoB_C = (int**)calloc(N, sizeof(int*));
+  for (size_t m = 0; m < M; m++)
+  {
+    NumEdge_C += RowDeg_C[m];
+  }
+  NtoB_C = (int **)calloc(N, sizeof(int *));
   // Loop: iterate over a range/collection.
-  for(size_t n = 0; n < N; n++) { NtoB_C[n] = (int*)calloc(ColDeg_C[n], sizeof(int)); }
+  for (size_t n = 0; n < N; n++)
+  {
+    NtoB_C[n] = (int *)calloc(ColDeg_C[n], sizeof(int));
+  }
   Interleaver_C.resize(NumEdge_C);
   int e = 0;
   // Loop: iterate over a range/collection.
-  for(size_t m = 0; m < M; m++) {
+  for (size_t m = 0; m < M; m++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t k = 0; k < RowDeg_C[m]; k++) {
+    for (size_t k = 0; k < RowDeg_C[m]; k++)
+    {
       int n = Mat_C[m][k];
       NtoB_C[n][ind[n]++] = e++;
     }
   }
   e = 0;
   // Loop: iterate over a range/collection.
-  for(size_t n = 0; n < N; n++) {
+  for (size_t n = 0; n < N; n++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t k = 0; k < ColDeg_C[n]; k++) {
+    for (size_t k = 0; k < ColDeg_C[n]; k++)
+    {
       Interleaver_C[e++] = NtoB_C[n][k];
     }
   }
@@ -2584,30 +6536,41 @@ void initialize_interleaver(int N, int M, int*& ColDeg_C, int*& RowDeg_C, int**&
 // Function: initialize_interleaver
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void initialize_interleaver(int N, int M, vector<int>& ColDeg_C, vector<int>& RowDeg_C, vector<vector<int>>& Mat_C, vector<vector<int>>& NtoB_C, vector<int>& Interleaver_C, int& NumEdge_C) {
+void initialize_interleaver(int N, int M, vector<int> &ColDeg_C, vector<int> &RowDeg_C, vector<vector<int>> &Mat_C, vector<vector<int>> &NtoB_C, vector<int> &Interleaver_C, int &NumEdge_C)
+{
   cout << "@@@ initialize_interleaver" << endl;
   vector<int> ind(N, 0);
   NumEdge_C = 0;
   // Loop: iterate over a range/collection.
-  for(size_t m = 0; m < M; m++) { NumEdge_C += RowDeg_C[m]; }
+  for (size_t m = 0; m < M; m++)
+  {
+    NumEdge_C += RowDeg_C[m];
+  }
   NtoB_C = vector<vector<int>>(N);
   // Loop: iterate over a range/collection.
-  for(size_t n = 0; n < N; n++) { NtoB_C[n] = vector<int>(ColDeg_C[n]); }
+  for (size_t n = 0; n < N; n++)
+  {
+    NtoB_C[n] = vector<int>(ColDeg_C[n]);
+  }
   Interleaver_C.resize(NumEdge_C);
   int e = 0;
   // Loop: iterate over a range/collection.
-  for(size_t m = 0; m < M; m++) {
+  for (size_t m = 0; m < M; m++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t k = 0; k < RowDeg_C[m]; k++) {
+    for (size_t k = 0; k < RowDeg_C[m]; k++)
+    {
       int n = Mat_C[m][k];
       NtoB_C[n][ind[n]++] = e++;
     }
   }
   e = 0;
   // Loop: iterate over a range/collection.
-  for(size_t n = 0; n < N; n++) {
+  for (size_t n = 0; n < N; n++)
+  {
     // Loop: iterate over a range/collection.
-    for(size_t k = 0; k < ColDeg_C[n]; k++) {
+    for (size_t k = 0; k < ColDeg_C[n]; k++)
+    {
       Interleaver_C[e++] = NtoB_C[n][k];
     }
   }
@@ -2616,7 +6579,8 @@ void initialize_interleaver(int N, int M, vector<int>& ColDeg_C, vector<int>& Ro
 // Function: initialize_syndrome_and_channel
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void initialize_syndrome_and_channel(int M, vector<int>& TrueNoiseSynd_C, vector<int>& EstmNoiseSynd_C) {
+void initialize_syndrome_and_channel(int M, vector<int> &TrueNoiseSynd_C, vector<int> &EstmNoiseSynd_C)
+{
   cout << "@@@ initialize_syndrome_and_channel" << endl;
   TrueNoiseSynd_C = vector<int>(M, 0);
   EstmNoiseSynd_C = vector<int>(M, 0);
@@ -2626,43 +6590,58 @@ void initialize_syndrome_and_channel(int M, vector<int>& TrueNoiseSynd_C, vector
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void load_GF_tables(
-int GF, int logGF,
-vector<vector<int>>& BINGF, vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF, vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ) {
+    int GF, int logGF,
+    vector<vector<int>> &BINGF, vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF, vector<vector<int>> &DIVGF, vector<vector<int>> &FFTSQ)
+{
   char FileName[100], name[10];
-  FILE* f;
+  FILE *f;
   BINGF = vector<vector<int>>(GF, vector<int>(logGF));
   ADDGF = vector<vector<int>>(GF, vector<int>(GF));
   MULGF = vector<vector<int>>(GF, vector<int>(GF));
   DIVGF = vector<vector<int>>(GF, vector<int>(GF));
   FFTSQ = vector<vector<int>>(logGF * GF / 2, vector<int>(2));
   // Loop: iterate over a range/collection.
-  for (size_t k = 0; k < GF; k++) {
+  for (size_t k = 0; k < GF; k++)
+  {
     BINGF[k] = vector<int>(logGF);
     ADDGF[k] = vector<int>(GF);
     MULGF[k] = vector<int>(GF);
     DIVGF[k] = vector<int>(GF);
   }
   // Loop: iterate over a range/collection.
-  for (size_t k = 0; k < logGF * GF / 2; k++) {
+  for (size_t k = 0; k < logGF * GF / 2; k++)
+  {
     FFTSQ[k] = vector<int>(2);
   }
   sprintf(name, "%d", GF);
-  std::vector<std::pair<const char*, vector<vector<int>>*>> files = {
-    {"data/Tables/BINGF", &BINGF},
-    {"data/Tables/ADDGF", &ADDGF},
-    {"data/Tables/MULGF", &MULGF},
-    {"data/Tables/DIVGF", &DIVGF}
-  };
+  std::vector<std::pair<const char *, vector<vector<int>> *>> files = {
+      {"data/Tables/BINGF", &BINGF},
+      {"data/Tables/ADDGF", &ADDGF},
+      {"data/Tables/MULGF", &MULGF},
+      {"data/Tables/DIVGF", &DIVGF}};
   // Loop: iterate over a range/collection.
-  for (auto& file : files) {
+  for (auto &file : files)
+  {
     strcpy(FileName, file.first);
     strcat(FileName, name);
     f = fopen(FileName, "r");
+    if (f == nullptr)
+    {
+      fprintf(stderr, "Failed to open %s\n", FileName);
+      return;
+    }
     // Loop: iterate over a range/collection.
-    for (size_t k = 0; k < GF; k++) {
+    for (size_t k = 0; k < GF; k++)
+    {
       // Loop: iterate over a range/collection.
-      for (size_t n = 0; n < ((file.first == "data/Tables/BINGF") ? logGF : GF); n++) {
-        fscanf(f, "%d", &(*file.second)[k][n]);
+      for (size_t n = 0; n < ((file.first == "data/Tables/BINGF") ? logGF : GF); n++)
+      {
+        if (fscanf(f, "%d", &(*file.second)[k][n]) != 1)
+        {
+          fprintf(stderr, "Failed to read GF table %s (%zu,%zu)\n", FileName, k, n);
+          fclose(f);
+          return;
+        }
       }
     }
     fclose(f);
@@ -2670,10 +6649,26 @@ vector<vector<int>>& BINGF, vector<vector<int>>& ADDGF, vector<vector<int>>& MUL
   strcpy(FileName, "data/Tables/TENSORFFT");
   strcat(FileName, name);
   f = fopen(FileName, "r");
+  if (f == nullptr)
+  {
+    fprintf(stderr, "Failed to open %s\n", FileName);
+    return;
+  }
   // Loop: iterate over a range/collection.
-  for (size_t k = 0; k < logGF * GF / 2; k++) {
-    fscanf(f, "%d", &FFTSQ[k][0]);
-    fscanf(f, "%d", &FFTSQ[k][1]);
+  for (size_t k = 0; k < logGF * GF / 2; k++)
+  {
+    if (fscanf(f, "%d", &FFTSQ[k][0]) != 1)
+    {
+      fprintf(stderr, "Failed to read FFTSQ[%zu][0]\n", k);
+      fclose(f);
+      return;
+    }
+    if (fscanf(f, "%d", &FFTSQ[k][1]) != 1)
+    {
+      fprintf(stderr, "Failed to read FFTSQ[%zu][1]\n", k);
+      fclose(f);
+      return;
+    }
   }
   fclose(f);
   cout << "GF table loaded" << endl;
@@ -2682,9 +6677,9 @@ vector<vector<int>>& BINGF, vector<vector<int>>& ADDGF, vector<vector<int>>& MUL
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void load_transpose_GF_tables(
-int GF, int logGF,
-vector<vector<int>>& BINGF, vector<vector<int>>& FFTSQ,
-vector<vector<int>>& TBINGF, vector<vector<int>>& TFFTSQ)
+    int GF, int logGF,
+    vector<vector<int>> &BINGF, vector<vector<int>> &FFTSQ,
+    vector<vector<int>> &TBINGF, vector<vector<int>> &TFFTSQ)
 {
 
   TBINGF = vector<vector<int>>(GF, vector<int>(logGF));
@@ -2693,37 +6688,46 @@ vector<vector<int>>& TBINGF, vector<vector<int>>& TFFTSQ)
   vector<vector<vector<int>>> C(GF, vector<vector<int>>(logGF, vector<int>(logGF, 0)));
   vector<vector<vector<int>>> TC(GF, vector<vector<int>>(logGF, vector<int>(logGF, 0)));
   // Loop: iterate over a range/collection.
-  for (size_t A = 0; A < GF; A++) {
+  for (size_t A = 0; A < GF; A++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t e = 1; e <= logGF; e++) {
+    for (size_t e = 1; e <= logGF; e++)
+    {
       int Ae = MULGF[A][e];
       // Loop: iterate over a range/collection.
-      for (size_t j = 0; j < logGF; j++) {
+      for (size_t j = 0; j < logGF; j++)
+      {
         C[A][j][e - 1] = BINGF[Ae][j];
       }
     }
   }
   // Loop: iterate over a range/collection.
-  for (size_t A = 0; A < GF; A++) {
+  for (size_t A = 0; A < GF; A++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t i = 0; i < logGF; i++) {
+    for (size_t i = 0; i < logGF; i++)
+    {
       // Loop: iterate over a range/collection.
-      for (size_t j = 0; j < logGF; j++) {
+      for (size_t j = 0; j < logGF; j++)
+      {
         TC[A][i][j] = C[A][j][i];
       }
     }
   }
 
   // Loop: iterate over a range/collection.
-  for (size_t g = 0; g < GF; g++) {
+  for (size_t g = 0; g < GF; g++)
+  {
     // Loop: iterate over a range/collection.
-    for (size_t l = 0; l < logGF; l++) {
+    for (size_t l = 0; l < logGF; l++)
+    {
       TBINGF[g][l] = TC[g][l][0];
     }
   }
 
   // Loop: iterate over a range/collection.
-  for (size_t i = 0; i < logGF * GF / 2; i++) {
+  for (size_t i = 0; i < logGF * GF / 2; i++)
+  {
     TFFTSQ[i][0] = GF2GF(FFTSQ[i][0], GF, logGF, BINGF, TBINGF);
     TFFTSQ[i][1] = GF2GF(FFTSQ[i][1], GF, logGF, BINGF, TBINGF);
   }
@@ -2733,61 +6737,75 @@ vector<vector<int>>& TBINGF, vector<vector<int>>& TFFTSQ)
 // Function: simulateTransmissionErrors
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void simulateTransmissionErrors(int N,  int logGF, int GF, double pD,
-vector<int>& TrueNoise_C, vector<int>& TrueNoise_D,
-vector<vector<int>>& BINGF, vector<vector<int>>& TBINGF, int &num_X, int &num_Z) {
+void simulateTransmissionErrors(int N, int logGF, int GF, double pD,
+                                vector<int> &TrueNoise_C, vector<int> &TrueNoise_D,
+                                vector<vector<int>> &BINGF, vector<vector<int>> &TBINGF, int &num_X, int &num_Z)
+{
   num_X = 0;
   num_Z = 0;
   // Loop: iterate over a range/collection.
-  for (size_t n = 0; n < N; n++) {
-    vector<int> ZBIN_C(logGF,0);
-    vector<int> ZBIN_D(logGF,0);
+  for (size_t n = 0; n < N; n++)
+  {
+    vector<int> ZBIN_C(logGF, 0);
+    vector<int> ZBIN_D(logGF, 0);
     // Loop: iterate over a range/collection.
-    for (size_t i = 0; i < logGF; i++) {
+    for (size_t i = 0; i < logGF; i++)
+    {
       // Conditional branch.
-      if (drand48() < 1.0 - pD) {
+      if (drand48() < 1.0 - pD)
+      {
         ZBIN_C[i] = 0;
         ZBIN_D[i] = 0;
-      } else {
-      int r = lrand48() % 3;
-      // Conditional branch.
-      if (r == 0) {
-        num_X++;
-        ZBIN_C[i] = 1;
-        ZBIN_D[i] = 0;
-      } else if (r == 1) {
-      num_Z++;
-      ZBIN_C[i] = 0;
-      ZBIN_D[i] = 1;
-    } else if (r == 2) {
-    num_X++;
-    num_Z++;
-    ZBIN_C[i] = 1;
-    ZBIN_D[i] = 1;
+      }
+      else
+      {
+        int r = lrand48() % 3;
+        // Conditional branch.
+        if (r == 0)
+        {
+          num_X++;
+          ZBIN_C[i] = 1;
+          ZBIN_D[i] = 0;
+        }
+        else if (r == 1)
+        {
+          num_Z++;
+          ZBIN_C[i] = 0;
+          ZBIN_D[i] = 1;
+        }
+        else if (r == 2)
+        {
+          num_X++;
+          num_Z++;
+          ZBIN_C[i] = 1;
+          ZBIN_D[i] = 1;
+        }
+      }
+    }
+    std::vector<int> s_C(logGF);
+    std::vector<int> s_D(logGF);
+    // Loop: iterate over a range/collection.
+    for (size_t i = 0; i < logGF; i++)
+    {
+      s_C[i] = ZBIN_C[i];
+      s_D[i] = ZBIN_D[i];
+    }
+    TrueNoise_C[n] = Bin2GF(s_C, GF, logGF, BINGF);
+    TrueNoise_D[n] = Bin2GF(s_D, GF, logGF, TBINGF);
   }
-}
-}
-std::vector<int> s_C(logGF);
-std::vector<int> s_D(logGF);
-// Loop: iterate over a range/collection.
-for (size_t i = 0; i < logGF; i++) {
-  s_C[i] = ZBIN_C[i];
-  s_D[i] = ZBIN_D[i];
-}
-TrueNoise_C[n] = Bin2GF(s_C, GF, logGF, BINGF);
-TrueNoise_D[n] = Bin2GF(s_D, GF, logGF, TBINGF);
-}
 }
 // Function: extractValueFromFilename
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-int extractValueFromFilename(const std::string& filename, const std::string& pattern_char) {
+int extractValueFromFilename(const std::string &filename, const std::string &pattern_char)
+{
   int value = 0;
-  std::regex pattern("_"+pattern_char+"(\\d+)");
+  std::regex pattern("_" + pattern_char + "(\\d+)");
   std::smatch match;
 
   // Conditional branch.
-  if (std::regex_search(filename, match, pattern)) {
+  if (std::regex_search(filename, match, pattern))
+  {
     value = std::stoi(match[1].str());
   }
   return value;
@@ -2796,20 +6814,21 @@ int extractValueFromFilename(const std::string& filename, const std::string& pat
 // Purpose: TODO - describe the function's responsibility succinctly.
 
 void DecodeIteration(
-int &SyndromeIsSatisfied,
-vector<vector<double>>& VNtoCNxxx, vector<vector<double>>& CNtoVNxxx,
-vector<vector<double>>& VNtoChN, vector<vector<double>>& ChNtoVN,
-vector<vector<double>>& APP,
-vector<int>& Interleaver, vector<int>& ColDeg,
-int N, int M, int GF, int logGF,
-vector<vector<int>>& MatValue, vector<int>& RowDeg,
-vector<int> &TrueNoiseSynd, vector<int>& Synd,
-vector<int> &USS,
-vector<int> &UpdatedDecision,
-vector<int> &EstmNoise,
-vector<vector<int>> Mat,
-vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF,
-vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
+    int &SyndromeIsSatisfied,
+    FlatMatrix &VNtoCNxxx, FlatMatrix &CNtoVNxxx,
+    FlatMatrix &VNtoChN, FlatMatrix &ChNtoVN,
+    FlatMatrix &APP,
+    vector<int> &Interleaver, vector<int> &ColDeg,
+    int N, int M, int GF, int logGF,
+    vector<vector<int>> &MatValue, vector<int> &RowDeg,
+    vector<int> &TrueNoiseSynd, vector<int> &Synd,
+    vector<int> &USS,
+    vector<int> &UpdatedDecision,
+    vector<int> &EstmNoise,
+    vector<vector<int>> Mat,
+    vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF,
+    vector<vector<int>> &DIVGF, vector<vector<int>> &FFTSQ)
+{
 
   DataPass(VNtoCNxxx, CNtoVNxxx, VNtoChN, Interleaver, ColDeg, N, GF);
   CheckPass(CNtoVNxxx, VNtoCNxxx, MatValue, M, RowDeg, MULGF, DIVGF, FFTSQ, GF, TrueNoiseSynd);
@@ -2818,31 +6837,53 @@ vector<vector<int>>& DIVGF, vector<vector<int>>& FFTSQ){
   Decision(EstmNoise, UpdatedDecision, VNtoChN, N, GF);
   SyndromeIsSatisfied = IsSyndromeSatisfied(TrueNoiseSynd, Synd, USS, M, EstmNoise, MatValue, RowDeg, ADDGF, MULGF, Mat);
   // Conditional branch.
-  if (SyndromeIsSatisfied) {
+  if (SyndromeIsSatisfied)
+  {
     // Loop: iterate over a range/collection.
-    for (int n = 0; n < N; n++) {
+    for (int n = 0; n < N; n++)
+    {
       // Loop: iterate over a range/collection.
-      for (int g = 0; g < GF; g++) { ChNtoVN[n][g] = 0; }
+      for (int g = 0; g < GF; g++)
+      {
+        ChNtoVN[n][g] = 0;
+      }
       int g_hat = EstmNoise[n];
       ChNtoVN[n][g_hat] = 1;
     }
+#if GD_CSS_ENABLE_CUDA
+    ChNtoVN.markDeviceDataInvalid();
+#endif
   }
 }
 // Function: load_size
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-bool load_size(const char* baseFileName, int& M, int& N, int& GF,  int& logGF) {
+bool load_size(const char *baseFileName, int &M, int &N, int &GF, int &logGF)
+{
   char FileName[256];
   sprintf(FileName, "%s_size", baseFileName);
-  FILE* f = fopen(FileName, "r");
+  FILE *f = fopen(FileName, "r");
   // Conditional branch.
-  if (!f) {
+  if (!f)
+  {
     perror("Failed to open size file");
     return false;
   }
-  fscanf(f, "%d", &M);
-  fscanf(f, "%d", &N);
-  fscanf(f, "%d", &GF);
+  if (fscanf(f, "%d", &M) != 1)
+  {
+    fclose(f);
+    return false;
+  }
+  if (fscanf(f, "%d", &N) != 1)
+  {
+    fclose(f);
+    return false;
+  }
+  if (fscanf(f, "%d", &GF) != 1)
+  {
+    fclose(f);
+    return false;
+  }
   fclose(f);
   logGF = rint(log2(GF));
   return true;
@@ -2850,15 +6891,17 @@ bool load_size(const char* baseFileName, int& M, int& N, int& GF,  int& logGF) {
 // Function: check_code_parameters_equal
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-void check_code_parameters_equal(const char* MatrixFilePrefix_C, const char* MatrixFilePrefix_D, int &M, int &N, int &GF, int &logGF){
-  int M_C, N_C,  GF_C, logGF_C;
-  int M_D, N_D,  GF_D, logGF_D;
+void check_code_parameters_equal(const char *MatrixFilePrefix_C, const char *MatrixFilePrefix_D, int &M, int &N, int &GF, int &logGF)
+{
+  int M_C, N_C, GF_C, logGF_C;
+  int M_D, N_D, GF_D, logGF_D;
 
-  bool okC = load_size(MatrixFilePrefix_C, M_C, N_C, GF_C,  logGF_C);
+  bool okC = load_size(MatrixFilePrefix_C, M_C, N_C, GF_C, logGF_C);
 
-  bool okD = load_size(MatrixFilePrefix_D, M_D, N_D, GF_D,  logGF_D);
+  bool okD = load_size(MatrixFilePrefix_D, M_D, N_D, GF_D, logGF_D);
   // Conditional branch.
-  if (!okC || !okD) {
+  if (!okC || !okD)
+  {
     cerr << "Failed to read the size file." << endl;
     exit(1);
   }
@@ -2867,113 +6910,138 @@ void check_code_parameters_equal(const char* MatrixFilePrefix_C, const char* Mat
   assert(logGF_C == logGF_D);
   assert(N_C == N_D);
   assert(M_C == M_D);
-  N=N_C;
-  M=M_C;
-  GF=GF_C;
-  logGF=logGF_C;
+  N = N_C;
+  M = M_C;
+  GF = GF_C;
+  logGF = logGF_C;
 }
 // Function: extract_ff_gg
 // Purpose: TODO - describe the function's responsibility succinctly.
-void extract_ff_gg(vector<int>& ff,vector<int>& gg,
-vector<vector<int>>& JatI_X,
-vector<vector<int>>& IatJ_X,
-vector<vector<int>>& JatI_Z,
-vector<vector<int>>& IatJ_Z,
-int L, int P){
-  printf("P=%d L=%d\n",P,L);
-  ff=vector<int>(L/2);
+void extract_ff_gg(vector<int> &ff, vector<int> &gg,
+                   vector<vector<int>> &JatI_X,
+                   vector<vector<int>> &IatJ_X,
+                   vector<vector<int>> &JatI_Z,
+                   vector<vector<int>> &IatJ_Z,
+                   int L, int P)
+{
+  printf("P=%d L=%d\n", P, L);
+  ff = vector<int>(L / 2);
   // Loop: iterate over a range/collection.
-  for(int l=0;l<L/2;l++){
-    vector<int> a(L/2);
-    vector<int> b(L/2);
-    int j0=0;
-    int i0=IatJ_X[P*l+j0][0];
+  for (int l = 0; l < L / 2; l++)
+  {
+    vector<int> a(L / 2);
+    vector<int> b(L / 2);
+    int j0 = 0;
+    int i0 = IatJ_X[P * l + j0][0];
 
-    b[l]=i0;
-    int j1=1;
-    int i1=IatJ_X[P*l+j1][0];
+    b[l] = i0;
+    int j1 = 1;
+    int i1 = IatJ_X[P * l + j1][0];
 
-    a[l]=(i1-b[l]+P)%P;
-    ff[l]=a[l]*P+b[l];
+    a[l] = (i1 - b[l] + P) % P;
+    ff[l] = a[l] * P + b[l];
   }
-  gg=vector<int>(L/2);
+  gg = vector<int>(L / 2);
   // Loop: iterate over a range/collection.
-  for(int l=0;l<L/2;l++){
-    vector<int> a(L/2);
-    vector<int> b(L/2);
-    int j0=0;
-    int i0=IatJ_X[P*(l+L/2)+j0][0];
+  for (int l = 0; l < L / 2; l++)
+  {
+    vector<int> a(L / 2);
+    vector<int> b(L / 2);
+    int j0 = 0;
+    int i0 = IatJ_X[P * (l + L / 2) + j0][0];
 
-    b[l]=i0;
-    int j1=1;
-    int i1=IatJ_X[P*(l+L/2)+j1][0];
+    b[l] = i0;
+    int j1 = 1;
+    int i1 = IatJ_X[P * (l + L / 2) + j1][0];
 
-    a[l]=(i1-b[l]+P)%P;
-    gg[l]=a[l]*P+b[l];
+    a[l] = (i1 - b[l] + P) % P;
+    gg[l] = a[l] * P + b[l];
   }
-  print_ff_gg(ff,gg,P);
-  print_commute_matrix_ff_gg(ff,gg,P);
+  print_ff_gg(ff, gg, P);
+  print_commute_matrix_ff_gg(ff, gg, P);
 }
 // Function: printDecodingDebugInfo
 // Purpose: TODO - describe the function's responsibility succinctly.
 void printDecodingDebugInfo(
-bool SyndromeIsSatisfied_C,
-vector<int>& IncorrectJ_C,
-vector<int>& SuspectJ_C,
-vector<int>& USS_C,
-vector<int>& RUSS_C,
-vector<vector<int>>& JatI_C,
-vector<vector<int>>& MatValue_C,
-int itr,
-int HistoryLength,
-int P
-) {
+    bool SyndromeIsSatisfied_C,
+    vector<int> &IncorrectJ_C,
+    vector<int> &SuspectJ_C,
+    vector<int> &USS_C,
+    vector<int> &RUSS_C,
+    vector<vector<int>> &JatI_C,
+    vector<vector<int>> &MatValue_C,
+    int itr,
+    int HistoryLength,
+    int P)
+{
   printf("@@@printDecodingDebugInfo\n");
-  printf("MatValue_C[0][0]=%3x\n",MatValue_C[0][0]);
+  printf("MatValue_C[0][0]=%3x\n", MatValue_C[0][0]);
   // Conditional branch.
-  if (!SyndromeIsSatisfied_C) {
-    printf("IncorrectJ_C<%d>=",IncorrectJ_C.size());for (int j : IncorrectJ_C) {printf("%5d(%d) ", j, j / P);}  printf("\n");
-    printf("SuspectJ_C<%d>=",SuspectJ_C.size());  for (int j : SuspectJ_C) {  printf("%5d(%d) ", j, j / P);}  printf("\n");
+  if (!SyndromeIsSatisfied_C)
+  {
+    printf("IncorrectJ_C<%zu>=", IncorrectJ_C.size());
+    for (int j : IncorrectJ_C)
+    {
+      printf("%5d(%d) ", j, j / P);
+    }
+    printf("\n");
+    printf("SuspectJ_C<%zu>=", SuspectJ_C.size());
+    for (int j : SuspectJ_C)
+    {
+      printf("%5d(%d) ", j, j / P);
+    }
+    printf("\n");
 
     // Loop: iterate over a range/collection.
-    for (int j : IncorrectJ_C) {
+    for (int j : IncorrectJ_C)
+    {
       // Conditional branch.
-      if (find(SuspectJ_C.begin(), SuspectJ_C.end(), j) == SuspectJ_C.end()) {
+      if (find(SuspectJ_C.begin(), SuspectJ_C.end(), j) == SuspectJ_C.end())
+      {
         printf("  Error: %d is not in SuspectJ_C\n", j);
       }
     }
-    printf("USS_C<%d>=",USS_C.size());
+    printf("USS_C<%zu>=", USS_C.size());
     // Loop: iterate over a range/collection.
-    for (int i : USS_C) {printf("%5d(%d) ", i, i / P);}printf("\n");
-    // Loop: iterate over a range/collection.
-    for (int i : USS_C) {
-      printf("%5d(%d):", i, i / P);
-      // Loop: iterate over a range/collection.
-      for (int j : JatI_C[i]) {
-        printf("%s%5d(%d) ",
-        find(SuspectJ_C.begin(), SuspectJ_C.end(), j) != SuspectJ_C.end() ? "*" : " ",
-        j, j / P);
-      }
-      printf("\n");
-    }
-    printf("RUSS_C<%d>=",RUSS_C.size());
-    // Loop: iterate over a range/collection.
-    for (int i : RUSS_C) {
+    for (int i : USS_C)
+    {
       printf("%5d(%d) ", i, i / P);
     }
     printf("\n");
     // Loop: iterate over a range/collection.
-    for (int i : RUSS_C) {
+    for (int i : USS_C)
+    {
       printf("%5d(%d):", i, i / P);
       // Loop: iterate over a range/collection.
-      for (int j : JatI_C[i]) {
+      for (int j : JatI_C[i])
+      {
         printf("%s%5d(%d) ",
-        find(SuspectJ_C.begin(), SuspectJ_C.end(), j) != SuspectJ_C.end() ? "*" : " ",
-        j, j / P);
+               find(SuspectJ_C.begin(), SuspectJ_C.end(), j) != SuspectJ_C.end() ? "*" : " ",
+               j, j / P);
       }
       printf("\n");
     }
-    int rank=computeRankGF( RUSS_C, SuspectJ_C,JatI_C, MatValue_C);
+    printf("RUSS_C<%zu>=", RUSS_C.size());
+    // Loop: iterate over a range/collection.
+    for (int i : RUSS_C)
+    {
+      printf("%5d(%d) ", i, i / P);
+    }
+    printf("\n");
+    // Loop: iterate over a range/collection.
+    for (int i : RUSS_C)
+    {
+      printf("%5d(%d):", i, i / P);
+      // Loop: iterate over a range/collection.
+      for (int j : JatI_C[i])
+      {
+        printf("%s%5d(%d) ",
+               find(SuspectJ_C.begin(), SuspectJ_C.end(), j) != SuspectJ_C.end() ? "*" : " ",
+               j, j / P);
+      }
+      printf("\n");
+    }
+    int rank = computeRankGF(RUSS_C, SuspectJ_C, JatI_C, MatValue_C);
     printf("rank=%d\n", rank);
   }
   printf("***printDecodingDebugInfo\n");
@@ -2981,111 +7049,155 @@ int P
 // Function: TryDecodeSmallErrors
 // Purpose: TODO - describe the function's responsibility succinctly.
 void TryDecodeSmallErrors(
-int& SyndromeIsSatisfied_C,
-vector<int>& SuspectJ_C,
-vector<int>& RowDeg_C,
-vector<int>& RUSS_C,
-vector<vector<int>>& UTCBC_Rows_C_orthogonal_D,
-vector<vector<int>>& UTCBC_Cols_C_orthogonal_D,
-vector<vector<int>>& USSHistory_C,
-int itr,
-int HistoryLength,
-vector<vector<int>>& JatI_C,
-vector<vector<int>>& IatJ_C,
-vector<vector<int>>& full_JatI_C,
-vector<vector<int>>& full_IatJ_C,
-vector<vector<int>>& full_JatI_D,
-vector<vector<int>>& full_IatJ_D,
-vector<int>& Candidate_Covering_Normal_Rows_C,
-vector<int>& EstmNoiseSynd_C,
-vector<int>& TrueNoiseSynd_C,
-vector<int>& TrueNoise_C,
-int M,
-int N,
-vector<int>& EstmNoise_C,
-vector<vector<int>>& Mat_C,
-vector<vector<int>>& MatValue_C,
-vector<vector<int>>& MULGF,
-vector<vector<int>>& ADDGF,
-vector<vector<int>>& DIVGF,
-vector<vector<int>>& BINGF,
-int L) {
+    int &SyndromeIsSatisfied_C,
+    vector<int> &SuspectJ_C,
+    vector<int> &RowDeg_C,
+    vector<int> &RUSS_C,
+    vector<vector<int>> &UTCBC_Rows_C_orthogonal_D,
+    vector<vector<int>> &UTCBC_Cols_C_orthogonal_D,
+    vector<vector<int>> &USSHistory_C,
+    int itr,
+    int HistoryLength,
+    vector<vector<int>> &JatI_C,
+    vector<vector<int>> &IatJ_C,
+    vector<vector<int>> &full_JatI_C,
+    vector<vector<int>> &full_IatJ_C,
+    vector<vector<int>> &full_JatI_D,
+    vector<vector<int>> &full_IatJ_D,
+    vector<int> &Candidate_Covering_Normal_Rows_C,
+    vector<int> &EstmNoiseSynd_C,
+    vector<int> &TrueNoiseSynd_C,
+    vector<int> &TrueNoise_C,
+    int M,
+    int N,
+    vector<int> &EstmNoise_C,
+    vector<vector<int>> &Mat_C,
+    vector<vector<int>> &MatValue_C,
+    vector<vector<int>> &MULGF,
+    vector<vector<int>> &ADDGF,
+    vector<vector<int>> &DIVGF,
+    vector<vector<int>> &BINGF,
+    int L)
+{
   printf("@@@TryDecodeSmallErrors\n");
-  printf("MatValue_C[0][0]=%3x\n",MatValue_C[0][0]);
+  printf("MatValue_C[0][0]=%3x\n", MatValue_C[0][0]);
   EF_LOG.clear();
-  vector<int> USS_C=USSHistory_C[itr % HistoryLength];
+  vector<int> USS_C = USSHistory_C[itr % HistoryLength];
   // Conditional branch.
-  if (!SyndromeIsSatisfied_C ){
+  if (!SyndromeIsSatisfied_C)
+  {
     vector<int> cols_C;
     vector<int> rows_C;
     // Loop: repeat while condition holds.
-    while(1){
+    while (1)
+    {
       // Conditional branch.
-      if (RUSS_C.size() <= 2*L && SuspectJ_C.size()<=2*L) {
+      if (RUSS_C.size() <= 2 * L && SuspectJ_C.size() <= 2 * L)
+      {
         EF_LOG = "Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols";
         printf("#########case: Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols#####################\n");
         // Conditional branch.
-        if(Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(cols_C, rows_C, SuspectJ_C, UTCBC_Rows_C_orthogonal_D, UTCBC_Cols_C_orthogonal_D, full_IatJ_D)){break;}
+        if (Find_Normal_Rows_Covering_SuspectJ_By_UTCBC_Cols(cols_C, rows_C, SuspectJ_C, UTCBC_Rows_C_orthogonal_D, UTCBC_Cols_C_orthogonal_D, full_IatJ_D))
+        {
+          break;
+        }
       }
       // Conditional branch.
-      if (SuspectJ_C.size()<=L && RUSS_C.size()<=L) {
+      if (SuspectJ_C.size() <= L && RUSS_C.size() <= L)
+      {
         EF_LOG = "Rows_eq_RUSS_Cols_eq_SuspectJ";
         printf("###########case: Rows_eq_RUSS_Cols_eq_SuspectJ#####################\n");
         // Conditional branch.
-        if(Rows_eq_RUSS_Cols_eq_SuspectJ(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C)) {break;}
+        if (Rows_eq_RUSS_Cols_eq_SuspectJ(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C))
+        {
+          break;
+        }
       }
       // Conditional branch.
-      if (true){
+      if (true)
+      {
         EF_LOG = "Find_Cycle_of_Length_L";
         printf("###########case: Find_Cycle_of_Length_L#####################\n");
         // Conditional branch.
-        if (Find_Cycle_of_Length_L(cols_C, rows_C, SuspectJ_C, JatI_C, IatJ_C, MatValue_C)) {break;}
+        if (Find_Cycle_of_Length_L(cols_C, rows_C, SuspectJ_C, JatI_C, IatJ_C, MatValue_C))
+        {
+          break;
+        }
       }
       // Conditional branch.
-      if (true){
+      if (true)
+      {
         EF_LOG = "Find_Nonsingular_Cycle_of_Length_Larger_thatn_L";
         printf("###########case: Find_Nonsingular_Cycle_of_Length_Larger_thatn_L#####################\n");
         // Conditional branch.
-        if (Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(cols_C, rows_C, SuspectJ_C, JatI_C, IatJ_C, MatValue_C)) {break;}
+        if (Find_Nonsingular_Cycle_of_Length_Larger_thatn_L(cols_C, rows_C, SuspectJ_C, JatI_C, IatJ_C, MatValue_C))
+        {
+          break;
+        }
       }
 
       // Conditional branch.
-      if (SuspectJ_C.size()<=2*L && RUSS_C.size() % 2 == 0 && (RUSS_C.size() == L || RUSS_C.size()  == L + 1)) {
+      if (SuspectJ_C.size() <= 2 * L && RUSS_C.size() % 2 == 0 && (RUSS_C.size() == L || RUSS_C.size() == L + 1))
+      {
         EF_LOG = "Find_Covering_Cycles_By_RUSS";
         printf("########case: Find_Covering_Cycles_By_RUSS#####################\n");
         // Conditional branch.
-        if (Find_Covering_Cycles_By_RUSS(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C)) {break;}
+        if (Find_Covering_Cycles_By_RUSS(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C))
+        {
+          break;
+        }
       }
       // Conditional branch.
-      if (SuspectJ_C.size()<=2*L && USS_C.size() < L) {
+      if (SuspectJ_C.size() <= 2 * L && USS_C.size() < L)
+      {
         EF_LOG = "Find_Rows_Coverintg_SuspectJ_From_RUSS";
         printf("########case: Find_Rows_Coverintg_SuspectJ_From_RUSS#####################\n");
         // Conditional branch.
-        if (Find_Rows_Coverintg_SuspectJ_From_RUSS(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C)) {break;}
+        if (Find_Rows_Coverintg_SuspectJ_From_RUSS(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C))
+        {
+          break;
+        }
       }
       // Conditional branch.
-      if(SuspectJ_C.size()<=2*L && USS_C.size() < L) {
+      if (SuspectJ_C.size() <= 2 * L && USS_C.size() < L)
+      {
         EF_LOG = "Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap";
         printf("########case: Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap#####################\n");
         // Conditional branch.
-        if (Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C)) {break;}
+        if (Find_Unique_Solution_Noise_From_RUSS_Plus_Overlap(cols_C, rows_C, SuspectJ_C, RUSS_C, JatI_C, IatJ_C, MatValue_C))
+        {
+          break;
+        }
       }
       cols_C.clear();
       rows_C.clear();
       break;
     }
-    printf("cols_C=");for(int j : cols_C) {printf("%5d(%d) ", j, j / P);}printf("\n");
-    printf("rows_C=");for(int i : rows_C) {printf("%5d(%d) ", i, i / P);}printf("\n");
+    printf("cols_C=");
+    for (int j : cols_C)
+    {
+      printf("%5d(%d) ", j, j / P);
+    }
+    printf("\n");
+    printf("rows_C=");
+    for (int i : rows_C)
+    {
+      printf("%5d(%d) ", i, i / P);
+    }
+    printf("\n");
     // Conditional branch.
-    if (!cols_C.empty() && !rows_C.empty()) {
+    if (!cols_C.empty() && !rows_C.empty())
+    {
       // Loop: iterate over a range/collection.
-      for (int i : rows_C) {
+      for (int i : rows_C)
+      {
         printf("%5d(%d) ", i, i / P);
         // Loop: iterate over a range/collection.
-        for (int j : JatI_C[i]) {
+        for (int j : JatI_C[i])
+        {
           printf("%s%5d(%d):",
-          find(cols_C.begin(), cols_C.end(), j) != cols_C.end() ? "*" : " ",
-          j, j / P);
+                 find(cols_C.begin(), cols_C.end(), j) != cols_C.end() ? "*" : " ",
+                 j, j / P);
         }
         printf("\n");
       }
@@ -3096,40 +7208,48 @@ int L) {
 }
 // Function: check_orthogonality
 // Purpose: TODO - describe the function's responsibility succinctly.
-void check_orthogonality(vector<vector<int>>& MatValue_C, vector<vector<int>>& MatValue_D, vector<vector<int>>& JatI_C, vector<vector<int>>& JatI_D, int M, vector<vector<int>>& ADDGF, vector<vector<int>>& MULGF) {
+void check_orthogonality(vector<vector<int>> &MatValue_C, vector<vector<int>> &MatValue_D, vector<vector<int>> &JatI_C, vector<vector<int>> &JatI_D, int M, vector<vector<int>> &ADDGF, vector<vector<int>> &MULGF)
+{
   printf("@@@ check_orthogonality\n");
   // Loop: iterate over a range/collection.
-  for (int i = 0; i < M ; i++) {
+  for (int i = 0; i < M; i++)
+  {
     // Loop: iterate over a range/collection.
-    for (int j = 0; j < M ; j++) {
+    for (int j = 0; j < M; j++)
+    {
       // Conditional branch.
-      if (i == j) continue;
+      if (i == j)
+        continue;
       int dot_product = 0;
       // Loop: iterate over a range/collection.
-      for (int k=0;k< JatI_C[i].size();k++) {
+      for (int k = 0; k < JatI_C[i].size(); k++)
+      {
         int jc = JatI_C[i][k];
         int value_C = MatValue_C[i][k];
 
         int l = -1;
         // Loop: iterate over a range/collection.
-        for (int c = 0; c < JatI_D[j].size(); c++) {
+        for (int c = 0; c < JatI_D[j].size(); c++)
+        {
           // Conditional branch.
-          if (JatI_D[j][c] == jc) {
+          if (JatI_D[j][c] == jc)
+          {
             l = c;
             break;
           }
         }
         // Conditional branch.
-        if (l == -1) continue;
+        if (l == -1)
+          continue;
         int value_D = MatValue_D[j][l];
 
-        int prod=MULGF[value_C][value_D];
+        int prod = MULGF[value_C][value_D];
         dot_product = ADDGF[dot_product][prod];
-
       }
 
       // Conditional branch.
-      if (dot_product != 0) {
+      if (dot_product != 0)
+      {
         printf("Orthogonality check failed for rows %d and %d: dot product = %d\n", i, j, dot_product);
         exit(1);
       }
@@ -3141,82 +7261,121 @@ void check_orthogonality(vector<vector<int>>& MatValue_C, vector<vector<int>>& M
 // Function: main
 // Purpose: TODO - describe the function's responsibility succinctly.
 
-
 // ======= Wrapper: TryDecodeSmallErrorsRef (short signature) ====================
 static inline void TryDecodeSmallErrorsRef(
     SM_StateRef s,
-    const SM_CodeRef& code,
-    const SM_UtcBcRef& bc,
-    const SM_GFTablesRef& gf,
-    int M, int N, int L, int itr, int HistoryLength) {
+    const SM_CodeRef &code,
+    const SM_UtcBcRef &bc,
+    const SM_GFTablesRef &gf,
+    int M, int N, int L, int itr, int HistoryLength)
+{
 
   TryDecodeSmallErrors(
-    s.SyndromeIsSatisfied,
-    s.SuspectJ,
-    code.RowDeg,
-    s.RUSS,
-    bc.UTCBC_Rows_C_orthogonal_D,
-    bc.UTCBC_Cols_C_orthogonal_D,
-    s.USSHistory,
-    itr,
-    HistoryLength,
-    code.JatI,
-    code.IatJ,
-    bc.full_JatI_C,
-    bc.full_IatJ_C,
-    bc.full_JatI_D,
-    bc.full_IatJ_D,
-    s.Candidate_Covering_Normal_Rows,
-    s.EstmNoiseSynd,
-    s.TrueNoiseSynd,
-    s.TrueNoise,
-    M,
-    N,
-    s.EstmNoise,
-    code.Mat,
-    code.MatValue,
-    gf.MULGF,
-    gf.ADDGF,
-    gf.DIVGF,
-    gf.BINGF,
-    L
-  );
+      s.SyndromeIsSatisfied,
+      s.SuspectJ,
+      code.RowDeg,
+      s.RUSS,
+      bc.UTCBC_Rows_C_orthogonal_D,
+      bc.UTCBC_Cols_C_orthogonal_D,
+      s.USSHistory,
+      itr,
+      HistoryLength,
+      code.JatI,
+      code.IatJ,
+      bc.full_JatI_C,
+      bc.full_IatJ_C,
+      bc.full_JatI_D,
+      bc.full_IatJ_D,
+      s.Candidate_Covering_Normal_Rows,
+      s.EstmNoiseSynd,
+      s.TrueNoiseSynd,
+      s.TrueNoise,
+      M,
+      N,
+      s.EstmNoise,
+      code.Mat,
+      code.MatValue,
+      gf.MULGF,
+      gf.ADDGF,
+      gf.DIVGF,
+      gf.BINGF,
+      L);
 }
 // ==============================================================================
 
-int main(int argc, char * argv[]){
+int main(int argc, char *argv[])
+{
 
-  char *FileName  =(char *)malloc(500);
-  char *FileResult=(char *)malloc(500);
-  char *name      =(char *)malloc(500);
+  char *FileName = (char *)malloc(500);
+  char *FileResult = (char *)malloc(500);
+  char *name = (char *)malloc(500);
   int max_num_iteration;
-  int max_num_error;
-  printf("argc=%d\n",argc);
+  int measurement_runs = -1;
+  printf("argc=%d\n", argc);
   // Conditional branch.
-  if(argc!=8){cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed" << endl; exit(0);}
-  max_num_iteration=atoi(argv[1]);
-  strcpy(MatrixFilePrefix_C,argv[2]);
-  strcpy(MatrixFilePrefix_D,argv[3]);
-  strcpy(FileResult,argv[4]);
-  f_m=atof(argv[5]);
-  DEBUG_transmission=atoi(argv[6]);
-  unsigned seed = (unsigned) atoi(argv[7]);
+  if (argc < 8 || argc > 10)
+  {
+    cout << "usage: gd_css max_iter filename_C filename_D logfile f_m  DEBUG_transmission seed [timing_debug] [measurement_runs]" << endl;
+    exit(0);
+  }
+  max_num_iteration = atoi(argv[1]);
+  strcpy(MatrixFilePrefix_C, argv[2]);
+  strcpy(MatrixFilePrefix_D, argv[3]);
+  strcpy(FileResult, argv[4]);
+  f_m = atof(argv[5]);
+  DEBUG_transmission = atoi(argv[6]);
+  unsigned seed = (unsigned)atoi(argv[7]);
+  if (argc >= 9)
+  {
+    g_enable_timing_output = atoi(argv[8]) != 0;
+  }
+  if (argc == 10)
+  {
+    measurement_runs = atoi(argv[9]);
+  }
+  if (g_enable_timing_output)
+  {
+    std::cout << "Timing debug output enabled." << std::endl;
+  }
+  if (measurement_runs == 0)
+  {
+    std::cout << "Measurement mode disabled." << std::endl;
+  }
+  else if (measurement_runs > 0)
+  {
+    std::cout << "Measurement mode: timing " << measurement_runs
+              << " decode run(s)." << std::endl;
+  }
+  else
+  {
+    std::cout << "Measurement mode: timing decode runs until stopped." << std::endl;
+  }
   srand48(seed);
   const int USS_error_floor_threshold = 100;
   const int USS_stagnation_check_interval = 50;
   check_code_parameters_equal(MatrixFilePrefix_C, MatrixFilePrefix_D, M, N, GF, logGF);
 
+  const bool measurement_mode = measurement_runs != 0;
+  const bool measurement_infinite = measurement_runs < 0;
+  std::vector<double> measurement_durations;
+  if (measurement_mode && !measurement_infinite && measurement_runs > 0)
+  {
+    measurement_durations.reserve(measurement_runs);
+  }
+  double measurement_total_seconds = 0.0;
+  size_t measurement_completed_runs = 0;
+
   P = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'P'));
   L = extractValueFromFilename(MatrixFilePrefix_C, std::string(1, 'L'));
-  printf("P=%d,L=%d\n",P,L);
+  printf("P=%d,L=%d\n", P, L);
   construct_inv_ZP(P);
   load_GF_tables(GF, logGF, BINGF, ADDGF, MULGF, DIVGF, FFTSQ);
-  load_transpose_GF_tables(GF, logGF, BINGF,  FFTSQ, TBINGF,  TFFTSQ);
+  load_transpose_GF_tables(GF, logGF, BINGF, FFTSQ, TBINGF, TFFTSQ);
 
-  pD=3.0*f_m/2.0;
-  VNtoChN_init(ChFactorMatrix_CD,pD,GF,logGF, BINGF,TBINGF);
+  pD = 3.0 * f_m / 2.0;
+  VNtoChN_init(ChFactorMatrix_CD, pD, GF, logGF, BINGF, TBINGF);
   printf("VNtoChN_init -> done\n");
-  VNtoChN_init(ChFactorMatrix_DC,pD,GF,logGF,TBINGF, BINGF);
+  VNtoChN_init(ChFactorMatrix_DC, pD, GF, logGF, TBINGF, BINGF);
   printf("VNtoChN_init <- done\n");
 
   load_matrix(MatrixFilePrefix_C, N, M, P, L, Mat_C, MatValue_C, ColDeg_C, RowDeg_C, JatI_C, IatJ_C, full_JatI_C, full_IatJ_C);
@@ -3225,88 +7384,136 @@ int main(int argc, char * argv[]){
   load_matrix(MatrixFilePrefix_D, N, M, P, L, Mat_D, MatValue_D, ColDeg_D, RowDeg_D, JatI_D, IatJ_D, full_JatI_D, full_IatJ_D);
   printf("D loaded\n");
   check_orthogonality(MatValue_C, MatValue_D, JatI_C, JatI_D, M, ADDGF, MULGF);
-  vector<int> ff(L/2),gg(L/2);
-  extract_ff_gg(ff,gg,JatI_C,IatJ_C,JatI_D,IatJ_D,L,P);
-  make_full_JatI_IatJ(full_JatI_C,full_IatJ_C,full_JatI_D,full_IatJ_D,ff,gg,P);
+  vector<int> ff(L / 2), gg(L / 2);
+  extract_ff_gg(ff, gg, JatI_C, IatJ_C, JatI_D, IatJ_D, L, P);
+  make_full_JatI_IatJ(full_JatI_C, full_IatJ_C, full_JatI_D, full_IatJ_D, ff, gg, P);
 
   initializeUTCBC_Rows(M, P,
-  UTCBC_Rows_C_orthogonal_D,
-  UTCBC_Rows_D_orthogonal_C,
-  full_JatI_C, IatJ_D,
-  full_JatI_D, IatJ_C
-  );
+                       UTCBC_Rows_C_orthogonal_D,
+                       UTCBC_Rows_D_orthogonal_C,
+                       full_JatI_C, IatJ_D,
+                       full_JatI_D, IatJ_C);
 
   initializeUTCBC_Cols(M, P,
-  UTCBC_Cols_C_orthogonal_D,
-  UTCBC_Cols_D_orthogonal_C,
-  full_JatI_C,
-  full_JatI_D
-  );
+                       UTCBC_Cols_C_orthogonal_D,
+                       UTCBC_Cols_D_orthogonal_C,
+                       full_JatI_C,
+                       full_JatI_D);
 
   initialize_interleaver(N, M, ColDeg_C, RowDeg_C, Mat_C, NtoB_C, Interleaver_C, NumEdge_C);
   initialize_interleaver(N, M, ColDeg_D, RowDeg_D, Mat_D, NtoB_D, Interleaver_D, NumEdge_D);
 
   initialize_decoding_arrays(N, logGF, NumEdge_C, GF,
-  TrueNoise_C,
-  CNtoVNxxx_C, VNtoCNxxx_C, ChNtoVN_CD, APP_C,
-  EstmNoise_C, VNtoChN_CD);
+                             TrueNoise_C,
+                             CNtoVNxxx_C, VNtoCNxxx_C, ChNtoVN_CD, APP_C,
+                             EstmNoise_C, VNtoChN_CD);
   initialize_decoding_arrays(N, logGF, NumEdge_D, GF,
-  TrueNoise_D,
-  CNtoVNxxx_D, VNtoCNxxx_D, ChNtoVN_DC, APP_D,
-  EstmNoise_D, VNtoChN_DC);
+                             TrueNoise_D,
+                             CNtoVNxxx_D, VNtoCNxxx_D, ChNtoVN_DC, APP_D,
+                             EstmNoise_D, VNtoChN_DC);
   initialize_syndrome_and_channel(M, TrueNoiseSynd_C, EstmNoiseSynd_C);
   initialize_syndrome_and_channel(M, TrueNoiseSynd_D, EstmNoiseSynd_D);
 
-  NbUndetectedErrors=0;
+  NbUndetectedErrors = 0;
   vector<int> fail_transmission;
   vector<int> degenerate_success_transmission;
-  transmission=0;
+  transmission = 0;
+  const double code_rate = (N > 0) ? (static_cast<double>(M) / static_cast<double>(N)) : 0.0;
+  const double logical_qubits_per_decode = logGF * static_cast<double>(P) * static_cast<double>(L) * code_rate;
 
   // Conditional branch.
-  if(DEBUG_transmission){
+  if (DEBUG_transmission)
+  {
     cout << "DEBUG MODE" << endl;
     // Loop: iterate over a range/collection.
-    for(transmission=0;transmission<DEBUG_transmission-1;transmission++){
+    for (transmission = 0; transmission < DEBUG_transmission - 1; transmission++)
+    {
       // Loop: iterate over a range/collection.
-      for(size_t k=0;k<N;k++){
+      for (size_t k = 0; k < N; k++)
+      {
         // Loop: iterate over a range/collection.
-        for(size_t q=0;q<logGF;q++){
+        for (size_t q = 0; q < logGF; q++)
+        {
           // Conditional branch.
-          if(drand48()<1.0-pD){}
-          else{int r=lrand48()%3;}
+          if (drand48() < 1.0 - pD)
+          {
+          }
+          else
+          {
+            int r = lrand48() % 3;
+          }
         }
       }
     }
   }
   // Loop: repeat while condition holds.
-  while(1) {
+  while (1)
+  {
 
     transmission++;
-    cout << "transmission=" << transmission << endl;cout.flush();
+    cout << "transmission=" << transmission << endl;
+    cout.flush();
+    auto decode_start = std::chrono::steady_clock::now();
 
-    int num_X=0,num_Z=0;
+    int num_X = 0, num_Z = 0;
     simulateTransmissionErrors(N, logGF, GF, pD, TrueNoise_C, TrueNoise_D, BINGF, TBINGF, num_X, num_Z);
-    cout << "fm_X=" << dec << num_X << "/" << (N*logGF) << "=" << (double)num_X/(N*logGF) << endl;
-    cout << "fm_Z=" << dec << num_Z << "/" << (N*logGF) << "=" << (double)num_Z/(N*logGF) << endl;
+    cout << "fm_X=" << dec << num_X << "/" << (N * logGF) << "=" << (double)num_X / (N * logGF) << endl;
+    cout << "fm_Z=" << dec << num_Z << "/" << (N * logGF) << "=" << (double)num_Z / (N * logGF) << endl;
 
-    calcSyndrome(TrueNoiseSynd_C, M,TrueNoise_C,MatValue_C,RowDeg_C,ADDGF, MULGF,Mat_C);
+    calcSyndrome(TrueNoiseSynd_C, M, TrueNoise_C, MatValue_C, RowDeg_C, ADDGF, MULGF, Mat_C);
 
-    calcSyndrome(TrueNoiseSynd_D, M,TrueNoise_D,MatValue_D,RowDeg_D,ADDGF, MULGF,Mat_D);
-
-    // Loop: iterate over a range/collection.
-    for(size_t l=0;l<NumEdge_C;l++) { for(size_t g=0;g<GF;g++) CNtoVNxxx_C[l][g]=1.0/GF; }
-    // Loop: iterate over a range/collection.
-    for(size_t l=0;l<N;l++) { for(size_t g=0;g<GF;g++){ VNtoChN_CD[l][g]=1.0/GF;ChNtoVN_CD[l][g]=1.0; }}
+    calcSyndrome(TrueNoiseSynd_D, M, TrueNoise_D, MatValue_D, RowDeg_D, ADDGF, MULGF, Mat_D);
 
     // Loop: iterate over a range/collection.
-    for(size_t l=0;l<NumEdge_D;l++) { for(size_t g=0;g<GF;g++) CNtoVNxxx_D[l][g]=1.0/GF; }
+    for (size_t l = 0; l < NumEdge_C; l++)
+    {
+      for (size_t g = 0; g < GF; g++)
+        CNtoVNxxx_C[l][g] = 1.0 / GF;
+    }
+#if GD_CSS_ENABLE_CUDA
+    CNtoVNxxx_C.markDeviceDataInvalid();
+#endif
     // Loop: iterate over a range/collection.
-    for(size_t l=0;l<N;l++) { for(size_t g=0;g<GF;g++){ VNtoChN_DC[l][g]=1.0/GF;ChNtoVN_DC[l][g]=1.0; }}
+    for (size_t l = 0; l < N; l++)
+    {
+      for (size_t g = 0; g < GF; g++)
+      {
+        VNtoChN_CD[l][g] = 1.0 / GF;
+        ChNtoVN_CD[l][g] = 1.0;
+      }
+    }
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN_CD.markDeviceDataInvalid();
+    ChNtoVN_CD.markDeviceDataInvalid();
+#endif
+
+    // Loop: iterate over a range/collection.
+    for (size_t l = 0; l < NumEdge_D; l++)
+    {
+      for (size_t g = 0; g < GF; g++)
+        CNtoVNxxx_D[l][g] = 1.0 / GF;
+    }
+#if GD_CSS_ENABLE_CUDA
+    CNtoVNxxx_D.markDeviceDataInvalid();
+#endif
+    // Loop: iterate over a range/collection.
+    for (size_t l = 0; l < N; l++)
+    {
+      for (size_t g = 0; g < GF; g++)
+      {
+        VNtoChN_DC[l][g] = 1.0 / GF;
+        ChNtoVN_DC[l][g] = 1.0;
+      }
+    }
+#if GD_CSS_ENABLE_CUDA
+    VNtoChN_DC.markDeviceDataInvalid();
+    ChNtoVN_DC.markDeviceDataInvalid();
+#endif
 
     cout << "Decoding Iteration" << endl;
-    itr=0;
-    SyndromeIsSatisfied_C=0;
-    SyndromeIsSatisfied_D=0;
+    itr = 0;
+    SyndromeIsSatisfied_C = 0;
+    SyndromeIsSatisfied_D = 0;
     vector<int> USS_history;
     vector<int> Candidate_Covering_Normal_Rows_C;
     vector<int> Candidate_Covering_Normal_Rows_D;
@@ -3314,222 +7521,307 @@ int main(int argc, char * argv[]){
     vector<int> Candidate_Covering_Cycle_Rows_D;
     bool stagnated = false;
     EF_LOG.clear();
-    do{
+    do
+    {
       // Conditional branch.
-      if(itr==0){
-        ChannelPass_zero(VNtoChN_DC,N,GF,logGF,f_m,  BINGF);
-        ChannelPass_zero(VNtoChN_CD,N,GF,logGF,f_m, TBINGF);
-      }else {
-      // Conditional branch.
+      if (itr == 0)
+      {
+        ChannelPass_zero(VNtoChN_DC, N, GF, logGF, f_m, BINGF);
+        ChannelPass_zero(VNtoChN_CD, N, GF, logGF, f_m, TBINGF);
+      }
+      else
+      {
+        // Conditional branch.
         ChannelPass(VNtoChN_CD, ChFactorMatrix_CD, ChNtoVN_CD, N, GF);
         ChannelPass(VNtoChN_DC, ChFactorMatrix_DC, ChNtoVN_DC, N, GF);
-    }
-
-    DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
-                    VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
-    N, M, GF, logGF, MatValue_C, RowDeg_C,
-    TrueNoiseSynd_C, EstmNoiseSynd_C,
-    USSHistory_C[itr%HistoryLength],
-    Updated_EstmNoise_History_C[itr%HistoryLength],
-    EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
-    DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
-                    VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
-    N, M, GF, logGF, MatValue_D, RowDeg_D,
-    TrueNoiseSynd_D, EstmNoiseSynd_D,
-    USSHistory_D[itr%HistoryLength],
-    Updated_EstmNoise_History_D[itr%HistoryLength],
-    EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
-    // Conditional branch.
-    if(itr==0){
-      Updated_EstmNoise_History_C[0].clear();
-      Updated_EstmNoise_History_D[0].clear();
-    }
-
-    count_errors(N,M,EstmNoise_C,EstmNoise_D,TrueNoise_C,TrueNoise_D,EstmNoiseSynd_C,TrueNoiseSynd_C,EstmNoiseSynd_D,TrueNoiseSynd_D,IncorrectJ_C,IncorrectJ_D,eS,eS_C,eS_D,NumUSS_C,NumUSS_D);
-    vector<int> SuspectJ_C;
-    vector<int> RUSS_C;
-    vector<int> SuspectJ_D;
-    vector<int> RUSS_D;
-    SuspectJ_C=computeUnion(Updated_EstmNoise_History_C);
-    RUSS_C=computeUnion(USSHistory_C);
-    SuspectJ_D=computeUnion(Updated_EstmNoise_History_D);
-    RUSS_D=computeUnion(USSHistory_D);
-
-    // Conditional branch.
-    if(stagnated){
-      printf("########################################################################################################################################\n");
-      printDecodingDebugInfo(SyndromeIsSatisfied_C,
-      IncorrectJ_C,
-      SuspectJ_C,
-      USSHistory_C[itr%HistoryLength],
-      RUSS_C,
-      JatI_C,
-      MatValue_C,
-      itr,
-      HistoryLength,
-      P);
-      {
-  SM_StateRef sC{SyndromeIsSatisfied_C, SuspectJ_C, RUSS_C, USSHistory_C,
-                 EstmNoiseSynd_C, TrueNoiseSynd_C, TrueNoise_C, EstmNoise_C,
-                 Candidate_Covering_Normal_Rows_C};
-  SM_CodeRef codeC{JatI_C, IatJ_C, Mat_C, MatValue_C, RowDeg_C};
-  SM_UtcBcRef utcbcC{UTCBC_Rows_C_orthogonal_D, UTCBC_Cols_C_orthogonal_D,
-                     full_JatI_C, full_IatJ_C, full_JatI_D, full_IatJ_D};
-  SM_GFTablesRef gfC{MULGF, ADDGF, DIVGF, BINGF};
-  TryDecodeSmallErrorsRef(sC, codeC, utcbcC, gfC, M, N, L, itr, HistoryLength);
-}
-      printf("---------------------------------------------------------------------------------------\n");
-      printDecodingDebugInfo(SyndromeIsSatisfied_D,
-      IncorrectJ_D,
-      SuspectJ_D,
-      USSHistory_D[itr%HistoryLength],
-      RUSS_D,
-      JatI_D,
-      MatValue_D,
-      itr,
-      HistoryLength,
-      P);
-      {
-  SM_StateRef sD{SyndromeIsSatisfied_D, SuspectJ_D, RUSS_D, USSHistory_D,
-                 EstmNoiseSynd_D, TrueNoiseSynd_D, TrueNoise_D, EstmNoise_D,
-                 Candidate_Covering_Normal_Rows_D};
-  SM_CodeRef codeD{JatI_D, IatJ_D, Mat_D, MatValue_D, RowDeg_D};
-  SM_UtcBcRef utcbcD{UTCBC_Rows_D_orthogonal_C, UTCBC_Cols_D_orthogonal_C,
-                     full_JatI_D, full_IatJ_D, full_JatI_C, full_IatJ_C};
-  SM_GFTablesRef gfD{MULGF, ADDGF, DIVGF, BINGF};
-  TryDecodeSmallErrorsRef(sD, codeD, utcbcD, gfD, M, N, L, itr, HistoryLength);
-}
-    }
-
-    SyndromeIsSatisfied_C=IsSyndromeSatisfied(TrueNoiseSynd_C,EstmNoiseSynd_C,USSHistory_C[itr%HistoryLength], M,EstmNoise_C,MatValue_C,RowDeg_C,ADDGF, MULGF, Mat_C);
-    SyndromeIsSatisfied_D=IsSyndromeSatisfied(TrueNoiseSynd_D,EstmNoiseSynd_D,USSHistory_D[itr%HistoryLength], M,EstmNoise_D,MatValue_D,RowDeg_D,ADDGF, MULGF, Mat_D);
-
-    SuspectJ_C=computeUnion(Updated_EstmNoise_History_C);
-    RUSS_C=computeUnion(USSHistory_C);
-    SuspectJ_D=computeUnion(Updated_EstmNoise_History_D);
-    RUSS_D=computeUnion(USSHistory_D);
-
-    count_errors(N,M,EstmNoise_C,EstmNoise_D,TrueNoise_C,TrueNoise_D,EstmNoiseSynd_C,TrueNoiseSynd_C,EstmNoiseSynd_D,TrueNoiseSynd_D,IncorrectJ_C,IncorrectJ_D,eS,eS_C,eS_D,NumUSS_C,NumUSS_D);
-
-    printf("#itr=%3d (%d,%d) | eS=%5d | eS_C=%5d SuspectJ_C=%5d USS_C=%5d RUSS_C=%5d | eS_D=%5d SuspectJ_D=%5d USS_D=%5d RUSS_D=%5d |%d %d %d\n",
-    itr,
-    SyndromeIsSatisfied_C, SyndromeIsSatisfied_D,
-    eS,
-    eS_C,SuspectJ_C.size(), NumUSS_C,RUSS_C.size(),
-    eS_D,SuspectJ_D.size(), NumUSS_D,RUSS_D.size(),
-    stagnated,transmission,seed);
-
-    // Conditional branch.
-    if(SyndromeIsSatisfied_C && SyndromeIsSatisfied_D){
-      // Conditional branch.
-      if(eS){
-        cout << "error in C:";for(size_t k=0;k<N;k++){if ( EstmNoise_C[k]!=TrueNoise_C[k]){ printf("%d ",k);}}cout << endl;
-        cout << "error in D:";for(size_t k=0;k<N;k++){if ( EstmNoise_D[k]!=TrueNoise_D[k]){ printf("%d ",k);}}cout << endl;
       }
+
+      DecodeIteration(SyndromeIsSatisfied_C, VNtoCNxxx_C, CNtoVNxxx_C,
+                      VNtoChN_DC, ChNtoVN_CD, APP_C, Interleaver_C, ColDeg_C,
+                      N, M, GF, logGF, MatValue_C, RowDeg_C,
+                      TrueNoiseSynd_C, EstmNoiseSynd_C,
+                      USSHistory_C[itr % HistoryLength],
+                      Updated_EstmNoise_History_C[itr % HistoryLength],
+                      EstmNoise_C, Mat_C, ADDGF, MULGF, DIVGF, FFTSQ);
+      DecodeIteration(SyndromeIsSatisfied_D, VNtoCNxxx_D, CNtoVNxxx_D,
+                      VNtoChN_CD, ChNtoVN_DC, APP_D, Interleaver_D, ColDeg_D,
+                      N, M, GF, logGF, MatValue_D, RowDeg_D,
+                      TrueNoiseSynd_D, EstmNoiseSynd_D,
+                      USSHistory_D[itr % HistoryLength],
+                      Updated_EstmNoise_History_D[itr % HistoryLength],
+                      EstmNoise_D, Mat_D, ADDGF, MULGF, DIVGF, TFFTSQ);
+      // Conditional branch.
+      if (itr == 0)
+      {
+        Updated_EstmNoise_History_C[0].clear();
+        Updated_EstmNoise_History_D[0].clear();
+      }
+
+      count_errors(N, M, EstmNoise_C, EstmNoise_D, TrueNoise_C, TrueNoise_D, EstmNoiseSynd_C, TrueNoiseSynd_C, EstmNoiseSynd_D, TrueNoiseSynd_D, IncorrectJ_C, IncorrectJ_D, eS, eS_C, eS_D, NumUSS_C, NumUSS_D);
+      vector<int> SuspectJ_C;
+      vector<int> RUSS_C;
+      vector<int> SuspectJ_D;
+      vector<int> RUSS_D;
+      SuspectJ_C = computeUnion(Updated_EstmNoise_History_C);
+      RUSS_C = computeUnion(USSHistory_C);
+      SuspectJ_D = computeUnion(Updated_EstmNoise_History_D);
+      RUSS_D = computeUnion(USSHistory_D);
+
+      // Conditional branch.
+      if (stagnated)
+      {
+        printf("########################################################################################################################################\n");
+        printDecodingDebugInfo(SyndromeIsSatisfied_C,
+                               IncorrectJ_C,
+                               SuspectJ_C,
+                               USSHistory_C[itr % HistoryLength],
+                               RUSS_C,
+                               JatI_C,
+                               MatValue_C,
+                               itr,
+                               HistoryLength,
+                               P);
+        {
+          SM_StateRef sC{SyndromeIsSatisfied_C, SuspectJ_C, RUSS_C, USSHistory_C,
+                         EstmNoiseSynd_C, TrueNoiseSynd_C, TrueNoise_C, EstmNoise_C,
+                         Candidate_Covering_Normal_Rows_C};
+          SM_CodeRef codeC{JatI_C, IatJ_C, Mat_C, MatValue_C, RowDeg_C};
+          SM_UtcBcRef utcbcC{UTCBC_Rows_C_orthogonal_D, UTCBC_Cols_C_orthogonal_D,
+                             full_JatI_C, full_IatJ_C, full_JatI_D, full_IatJ_D};
+          SM_GFTablesRef gfC{MULGF, ADDGF, DIVGF, BINGF};
+          TryDecodeSmallErrorsRef(sC, codeC, utcbcC, gfC, M, N, L, itr, HistoryLength);
+        }
+        printf("---------------------------------------------------------------------------------------\n");
+        printDecodingDebugInfo(SyndromeIsSatisfied_D,
+                               IncorrectJ_D,
+                               SuspectJ_D,
+                               USSHistory_D[itr % HistoryLength],
+                               RUSS_D,
+                               JatI_D,
+                               MatValue_D,
+                               itr,
+                               HistoryLength,
+                               P);
+        {
+          SM_StateRef sD{SyndromeIsSatisfied_D, SuspectJ_D, RUSS_D, USSHistory_D,
+                         EstmNoiseSynd_D, TrueNoiseSynd_D, TrueNoise_D, EstmNoise_D,
+                         Candidate_Covering_Normal_Rows_D};
+          SM_CodeRef codeD{JatI_D, IatJ_D, Mat_D, MatValue_D, RowDeg_D};
+          SM_UtcBcRef utcbcD{UTCBC_Rows_D_orthogonal_C, UTCBC_Cols_D_orthogonal_C,
+                             full_JatI_D, full_IatJ_D, full_JatI_C, full_IatJ_C};
+          SM_GFTablesRef gfD{MULGF, ADDGF, DIVGF, BINGF};
+          TryDecodeSmallErrorsRef(sD, codeD, utcbcD, gfD, M, N, L, itr, HistoryLength);
+        }
+      }
+
+      SyndromeIsSatisfied_C = IsSyndromeSatisfied(TrueNoiseSynd_C, EstmNoiseSynd_C, USSHistory_C[itr % HistoryLength], M, EstmNoise_C, MatValue_C, RowDeg_C, ADDGF, MULGF, Mat_C);
+      SyndromeIsSatisfied_D = IsSyndromeSatisfied(TrueNoiseSynd_D, EstmNoiseSynd_D, USSHistory_D[itr % HistoryLength], M, EstmNoise_D, MatValue_D, RowDeg_D, ADDGF, MULGF, Mat_D);
+
+      SuspectJ_C = computeUnion(Updated_EstmNoise_History_C);
+      RUSS_C = computeUnion(USSHistory_C);
+      SuspectJ_D = computeUnion(Updated_EstmNoise_History_D);
+      RUSS_D = computeUnion(USSHistory_D);
+
+      count_errors(N, M, EstmNoise_C, EstmNoise_D, TrueNoise_C, TrueNoise_D, EstmNoiseSynd_C, TrueNoiseSynd_C, EstmNoiseSynd_D, TrueNoiseSynd_D, IncorrectJ_C, IncorrectJ_D, eS, eS_C, eS_D, NumUSS_C, NumUSS_D);
+
+      printf("#itr=%3d (%d,%d) | eS=%5d | eS_C=%5d SuspectJ_C=%5zu USS_C=%5d RUSS_C=%5zu | eS_D=%5d SuspectJ_D=%5zu USS_D=%5d RUSS_D=%5zu |%d %d %d\n",
+             itr,
+             SyndromeIsSatisfied_C, SyndromeIsSatisfied_D,
+             eS,
+             eS_C, SuspectJ_C.size(), NumUSS_C, RUSS_C.size(),
+             eS_D, SuspectJ_D.size(), NumUSS_D, RUSS_D.size(),
+             stagnated, transmission, seed);
+
+      // Conditional branch.
+      if (SyndromeIsSatisfied_C && SyndromeIsSatisfied_D)
+      {
+        // Conditional branch.
+        if (eS)
+        {
+          cout << "error in C:";
+          for (size_t k = 0; k < N; k++)
+          {
+            if (EstmNoise_C[k] != TrueNoise_C[k])
+            {
+              printf("%zu ", k);
+            }
+          }
+          cout << endl;
+          cout << "error in D:";
+          for (size_t k = 0; k < N; k++)
+          {
+            if (EstmNoise_D[k] != TrueNoise_D[k])
+            {
+              printf("%zu ", k);
+            }
+          }
+          cout << endl;
+        }
+        break;
+      }
+
+      // Conditional branch.
+      if (USS_history.size() >= USS_stagnation_check_interval)
+      {
+        // Conditional branch.
+        if (NumUSS_C + NumUSS_D >= USS_history[USS_history.size() - USS_stagnation_check_interval])
+        {
+          printf("USS has not decreased compared to %d iterations ago: %d >= %d\n",
+                 USS_stagnation_check_interval, NumUSS_C + NumUSS_D, USS_history[USS_history.size() - USS_stagnation_check_interval]);
+          stagnated = true;
+        }
+      }
+
+      USS_history.push_back(NumUSS_C + NumUSS_D);
+      // Conditional branch.
+      if (stagnated && NumUSS_C + NumUSS_D > USS_error_floor_threshold)
+      {
+        break;
+      }
+      itr++;
+    } while (itr < max_num_iteration);
+    int decoding_success = false;
+
+    // Conditional branch.
+    if (eS == 0)
+    {
+      decoding_success = true;
+    }
+    else if (SyndromeIsSatisfied_C && SyndromeIsSatisfied_D)
+    {
+      bool fC, fD;
+      fC = check_degenerate_decoding_success(EstmNoise_C, TrueNoise_C, JatI_C, JatI_D, MatValue_D, N, M);
+      fD = check_degenerate_decoding_success(EstmNoise_D, TrueNoise_D, JatI_D, JatI_C, MatValue_C, N, M);
+      decoding_success = fC & fD;
+    }
+
+    printf("decoding_success=%d\n", decoding_success);
+    // Conditional branch.
+    if (!decoding_success)
+    {
+      count_errors(N, M, EstmNoise_C, EstmNoise_D, TrueNoise_C, TrueNoise_D, EstmNoiseSynd_C, TrueNoiseSynd_C, EstmNoiseSynd_D, TrueNoiseSynd_D, IncorrectJ_C, IncorrectJ_D, eS, eS_C, eS_D, NumUSS_C, NumUSS_D);
+      TeF++;
+      TeS += eS;
+      fail_transmission.push_back(transmission);
+    }
+    else
+    {
+      // Conditional branch.
+      if (eS != 0)
+      {
+        TdS++;
+        degenerate_success_transmission.push_back(transmission);
+      }
+    }
+    printf("#transmission=%d #f_m=%f TeF=%3d TeS=%5d FER=%f SER=%f itr=%3d eS=%5d TdS=%5d seed=%d\n",
+           transmission, f_m,
+           TeF, TeS,
+           (double)TeF / transmission, (double)TeS / (transmission * (N + N)),
+           itr, eS, TdS, seed);
+    auto decode_end = std::chrono::steady_clock::now();
+    if (measurement_mode)
+    {
+      double seconds = std::chrono::duration<double>(decode_end - decode_start).count();
+      measurement_total_seconds += seconds;
+      if (!measurement_infinite && measurement_runs > 0)
+      {
+        measurement_durations.push_back(seconds);
+      }
+      measurement_completed_runs++;
+    }
+
+    // Conditional branch.
+    if (!EF_LOG.empty())
+    {
+      printf("EF_LOG=%s\n", EF_LOG.c_str());
+      FILE *f;
+      sprintf(name, "EF_LOG_%s_TRANS%d_EPS%f_SEED%d", FileResult, transmission, f_m, seed);
+      f = fopen(name, "w");
+      // Conditional branch.
+      if (f == NULL)
+      {
+        perror("Failed to open file");
+        return 1;
+      }
+      fprintf(f, "%s %d %f %d %d %d \n",
+              EF_LOG.c_str(), itr, f_m, transmission, itr, seed);
+      fclose(f);
+    }
+
+    // Conditional branch.
+    if (transmission % 1 == 0)
+    {
+      sprintf(FileName, "LOG_%s_ITR%d_GF%d_N%d_M%d_R%f_EPS%f_SEED%d", FileResult, max_num_iteration, GF, N, M, Rate_C, f_m, seed);
+      // Conditional branch.
+      if (DEBUG_transmission == 0)
+      {
+        f = fopen(FileName, "w");
+        // Conditional branch.
+        if (f == NULL)
+        {
+          perror("Failed to open file");
+          return 1;
+        }
+        fprintf(f, "%d %f %d %d %d %d %d %f %f %d  %d %d  %d ",
+                transmission, f_m,
+                N, logGF,
+                TeF, TeS, NbUndetectedErrors,
+                (double)TeF / transmission, (double)TeS / (transmission * N),
+                itr, eS, TdS, seed);
+        fprintf(f, "|");
+        printf("|");
+        // Loop: iterate over a range/collection.
+        for (int t : fail_transmission)
+        {
+          fprintf(f, " %d ", t);
+        }
+        fprintf(f, "|");
+        // Loop: iterate over a range/collection.
+        for (int t : fail_transmission)
+        {
+          printf(" %d ", t);
+        }
+        printf("|");
+        // Loop: iterate over a range/collection.
+        for (int t : degenerate_success_transmission)
+        {
+          fprintf(f, " %d ", t);
+        }
+        fprintf(f, "\n");
+        // Loop: iterate over a range/collection.
+        for (int t : degenerate_success_transmission)
+        {
+          printf(" %d ", t);
+        }
+        printf("\n");
+        fclose(f);
+      }
+    }
+    // Conditional branch.
+    if (DEBUG_transmission)
+    {
       break;
     }
-
-    // Conditional branch.
-    if (USS_history.size() >= USS_stagnation_check_interval ) {
-      // Conditional branch.
-      if (NumUSS_C+NumUSS_D >= USS_history[USS_history.size() - USS_stagnation_check_interval]) {
-        printf("USS has not decreased compared to %d iterations ago: %d >= %d\n",
-        USS_stagnation_check_interval, NumUSS_C+NumUSS_D, USS_history[USS_history.size() - USS_stagnation_check_interval]);
-        stagnated = true;
-      }
-    }
-
-    USS_history.push_back(NumUSS_C+NumUSS_D);
-    // Conditional branch.
-    if (stagnated  && NumUSS_C+NumUSS_D > USS_error_floor_threshold) {
+    if (measurement_mode && !measurement_infinite && measurement_completed_runs >= static_cast<size_t>(measurement_runs))
+    {
+      std::cout << "Measurement target reached (" << measurement_completed_runs
+                << " run(s))." << std::endl;
       break;
     }
-    itr++;
-  }while(itr<max_num_iteration);
-  int decoding_success=false;
-  int degenerate_success=false;
-
-  // Conditional branch.
-  if(eS==0){
-    decoding_success=true;
-  }else if(SyndromeIsSatisfied_C && SyndromeIsSatisfied_D){
-  bool fC,fD;
-  fC=check_degenerate_decoding_success(EstmNoise_C, TrueNoise_C, JatI_C, JatI_D, MatValue_D, N, M);
-  fD=check_degenerate_decoding_success(EstmNoise_D, TrueNoise_D, JatI_D, JatI_C, MatValue_C, N, M);
-  decoding_success=fC&fD;
-}
-
-printf("decoding_success=%d\n",decoding_success);
-// Conditional branch.
-if(!decoding_success){
-  count_errors(N,M,EstmNoise_C,EstmNoise_D,TrueNoise_C,TrueNoise_D,EstmNoiseSynd_C,TrueNoiseSynd_C,EstmNoiseSynd_D,TrueNoiseSynd_D,IncorrectJ_C,IncorrectJ_D,eS,eS_C,eS_D,NumUSS_C,NumUSS_D);
-  TeF++;
-  TeS+=eS;
-  fail_transmission.push_back(transmission);
-}else{
-// Conditional branch.
-if(eS!=0){
-  TdS++;
-  degenerate_success_transmission.push_back(transmission);
-}
-}
-printf("#transmission=%d #f_m=%f TeF=%3d TeS=%5d FER=%f SER=%f itr=%3d eS=%5d TdS=%5d seed=%d\n",
-transmission,f_m,
-TeF,TeS,
-(double)TeF/transmission,(double)TeS/(transmission*(N+N)),
-itr,eS,TdS,seed);
-
-// Conditional branch.
-if(!EF_LOG.empty()){
-  printf("EF_LOG=%s\n",EF_LOG.c_str());
-  FILE *f;
-  sprintf(name,"EF_LOG_%s_TRANS%d_EPS%f_SEED%d",FileResult,transmission,f_m,seed);
-  f=fopen(name,"w");
-  // Conditional branch.
-  if (f == NULL) {
-    perror("Failed to open file");
-    return 1;
   }
-  fprintf(f,"%s %d %f %d %d %d \n",
-  EF_LOG.c_str(),itr,f_m,transmission,itr,seed);
-  fclose(f);
-}
 
-// Conditional branch.
-if(transmission%1==0){
-  sprintf(FileName,"LOG_%s_ITR%d_GF%d_N%d_M%d_R%f_EPS%f_SEED%d",FileResult,max_num_iteration,GF,N,M,Rate_C,f_m,seed);
-  // Conditional branch.
-  if(DEBUG_transmission==0){
-    f=fopen(FileName,"w");
-    // Conditional branch.
-    if (f == NULL) {
-      perror("Failed to open file");
-      return 1;
-    }
-    fprintf(f,"%d %f %d %d %d %d %d %f %f %d  %d %d  %d ",
-    transmission,f_m,
-    N,logGF,
-    TeF,TeS,NbUndetectedErrors,
-    (double)TeF/transmission,(double)TeS/(transmission*N),
-    itr,eS,TdS,seed);
-    fprintf(f,"|");
-    printf(  "|");
-    // Loop: iterate over a range/collection.
-    for(int t:fail_transmission){fprintf(f," %d ",t);}fprintf(f,"|");
-    // Loop: iterate over a range/collection.
-    for(int t:fail_transmission){ printf(  " %d ",t);} printf(  "|");
-    // Loop: iterate over a range/collection.
-    for(int t:degenerate_success_transmission){fprintf(f," %d ",t);}fprintf(f,"\n");
-    // Loop: iterate over a range/collection.
-    for(int t:degenerate_success_transmission){ printf(  " %d ",t);} printf(  "\n");
-    fclose(f);
+  if (measurement_mode && measurement_completed_runs > 0 && measurement_total_seconds > 0.0)
+  {
+    double average_seconds = measurement_total_seconds / static_cast<double>(measurement_completed_runs);
+    double total_qubits = logical_qubits_per_decode * static_cast<double>(measurement_completed_runs);
+    double qbps = total_qubits / measurement_total_seconds;
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "Measurement summary: runs=" << measurement_completed_runs
+              << " total_time[s]=" << measurement_total_seconds
+              << " avg_per_run[s]=" << average_seconds
+              << " logical_qubits_per_run=" << logical_qubits_per_decode
+              << " QBPS=" << qbps << std::endl;
   }
-}
-// Conditional branch.
-if(DEBUG_transmission){
-  break;
-}
-}
 
-return 0;
+  return 0;
 }

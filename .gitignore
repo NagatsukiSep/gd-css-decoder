@@ -1,5 +1,7 @@
 gd_css
+gd_css_cuda
 *.o
 *.log
 *.tmp
 .DS_Store
+LOG_*
